@@ -1,0 +1,25 @@
+# Copyright 2026 JiaClaw contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+[package]
+name = "jiaclaw-core"
+description = "JiaClaw core domain types and contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# StateKnot dependencies - commented out until edition 2024 support
+# stateknot-core = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
