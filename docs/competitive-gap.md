@@ -143,18 +143,20 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
-| **Shell 命令** | ✅ 完整 | ✅ 完整 | ⏳ 计划中（M2） | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
-| **文件读写** | ✅ 完整 | ✅ 完整 | ⏳ 计划中（M2） | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
+| **Shell 命令** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
+| **文件读写** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
 | **浏览器控制** | ✅ Selenium/Playwright | ⏳ 部分 | ⏳ 计划中（M3） | P2 | MCP Browser Tool |
-| **网页抓取** | ✅ BeautifulSoup | ✅ 完整 | ⏳ 计划中（M2） | P1 | Rust reqwest + MCP |
-| **API 调用** | ✅ requests | ✅ httpx | ⏳ 计划中（M2） | P1 | Rust reqwest + MCP |
+| **网页抓取** | ✅ BeautifulSoup | ✅ 完整 | ✅ **已实现（HTTP）** | P1 | Rust reqwest + MCP |
+| **API 调用** | ✅ requests | ✅ httpx | ✅ **已实现（HTTP）** | P1 | Rust reqwest + MCP |
+| **JSON 处理** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | - |
+| **日期时间** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | - |
 | **工具超时** | ✅ 配置化 | ⏳ 简单 | ✅ **StateKnot 原生** | P0 | StateKnot 预算控制 |
 | **工具沙箱** | ⏳ Docker | ❌ 无 | ✅ **StateKnot 策略** | P1 | StateKnot 资源策略 |
 
 **JiaClaw 现状**:
-- ❌ 工具系统尚未实现
+- ✅ 基础本地工具已实现（Shell、File、HTTP、JSON、DateTime）
 - ✅ StateKnot 提供 `DurableInvocationExecutor` 支持持久化工具调用
-- ❌ 本地 Rust 工具注册 API 待文档化
+- ⏳ 更多工具类型待添加（浏览器控制等）
 
 **目标方案**:
 - **P1 本地工具**: 
