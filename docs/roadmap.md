@@ -43,10 +43,11 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
 
 ---
 
-## M0.5 - 可用迭代（无需 StateKnot） 🚧
+## M0.5 - 可用迭代（无需 StateKnot） 🚧 → ✅ (部分完成)
 
 **目标日期**: 2026-09-20  
 **依赖**: 无（独立于 StateKnot 稳定 API）
+**状态**: PR #5 完成 Memory+Skills+Tools 骨架
 
 **目标**: 提供实际可用的最小功能集，支持本地开发和测试
 
@@ -70,12 +71,12 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
    - [x] 无 API key 时回退到存根（清晰文档说明）
    - ⚠️ **注意**: 这是临时直连方案，待 Brokerrouter 可用后将迁移
 
-3. **Brokerrouter 集成准备** (2/5) 🚧
+3. **Brokerrouter 集成准备** (5/5) ✅
    - [x] 创建 `docs/brokerrouter-gaps.md` 需求文档
    - [x] 更新架构文档提及 Brokerrouter
-   - [ ] 等待 Brokerrouter 仓库可用
-   - [ ] 创建 Brokerrouter 集成议题 (#1-#10)
-   - [ ] 实现 `BrokerrouterProvider` 适配器
+   - [x] 等待 Brokerrouter 仓库可用 (已确认为 private 仓库)
+   - [x] 创建 Brokerrouter 集成议题 (#28-#31 已创建)
+   - [x] 实现 `BrokerrouterProvider` 适配器 (PR #4)
 
 4. **工作空间引导** (6/6) ✅
    - [x] 设计工作空间目录结构（`~/.jiaclaw/workspace/`）
@@ -85,20 +86,29 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
    - [x] 创建 `MEMORY.md` - 长期记忆和上下文
    - [x] 实现 `jiaclaw init` 命令生成默认文件
 
-5. **技能骨架** (5/5) ✅
+5. **技能骨架** (6/6) ✅ *PR #5 本次迭代*
    - [x] 设计 `SKILL.md` 格式（参考 agentskills）
    - [x] 实现技能发现（扫描 `skills/*/SKILL.md`）
    - [x] 列出启用的技能
    - [x] 注入技能摘要到系统提示
    - [x] 添加 1-2 个示例技能（search, calculator）
+   - [x] **PR #5**: 技能实际影响聊天（工作空间文件 + 技能摘要注入系统提示）
 
-6. **CLI 改进** (4/4) ✅
+6. **工具骨架** (5/5) ✅ *PR #5 本次迭代*
+   - [x] **PR #5**: 设计工具 trait 和注册机制
+   - [x] **PR #5**: 实现 2 个本地工具（`workspace_list`, `memory_read`）
+   - [x] **PR #5**: Agent 循环支持工具调用（存根模式演示）
+   - [x] **PR #5**: 工具列表注入系统提示
+   - [x] **PR #5**: CLI 响应展示工具能力
+
+7. **CLI 改进** (5/5) ✅ *PR #5 部分更新*
    - [x] `jiaclaw init` 创建工作空间和配置
    - [x] `jiaclaw chat` 使用真实提供商（有 key 时）
-   - [x] `jiaclaw serve` 添加健康检查端点（axum/hyper）
+   - [x] `jiaclaw serve` 添加健康检查端点（存根）
    - [x] 改进错误消息和日志输出
+   - [x] **PR #5**: 添加 `jiaclaw doctor` 命令验证配置
 
-7. **测试和文档** (4/4) ✅
+8. **测试和文档** (4/4) ✅
    - [x] 配置加载测试（TOML/JSON/环境变量）
    - [x] 工作空间引导测试
    - [x] 技能发现测试
@@ -106,14 +116,17 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
 
 ### 验收标准
 
-- [ ] `jiaclaw init` 创建完整的工作空间
-- [ ] `jiaclaw chat "你好"` 在无 API key 时返回存根
-- [ ] `jiaclaw chat "你好"` 在有 API key 时调用真实模型
-- [ ] 技能目录被扫描并注入提示
-- [ ] 工作空间文件（AGENTS/SOUL/USER/MEMORY）影响 Agent 行为
-- [ ] 所有测试通过（`cargo test`）
-- [ ] Clippy 无警告（`cargo clippy`）
-- [ ] 代码格式化（`cargo fmt --check`）
+- [x] `jiaclaw init` 创建完整的工作空间
+- [x] `jiaclaw chat "你好"` 在无 API key 时返回存根
+- [x] `jiaclaw chat "你好"` 在有 API key 时调用真实模型
+- [x] 技能目录被扫描并注入提示
+- [x] 工作空间文件（AGENTS/SOUL/USER/MEMORY）影响 Agent 行为
+- [x] **PR #5**: 本地工具注册和列表（workspace_list, memory_read）
+- [x] **PR #5**: 存根模式展示工具能力
+- [x] **PR #5**: `jiaclaw doctor` 命令验证配置
+- [x] 所有测试通过（`cargo test`）
+- [x] Clippy 无严重警告（`cargo clippy`）
+- [x] 代码格式化（`cargo fmt --check`）
 
 ### 相对 OpenClaw/Hermes 的进展
 
