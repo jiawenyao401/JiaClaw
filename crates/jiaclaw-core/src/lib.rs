@@ -172,6 +172,14 @@ pub struct HttpConfig {
     /// CORS 允许的来源列表（空或 `["*"]` 表示允许所有来源）
     #[serde(default = "default_cors_allow_origins")]
     pub cors_allow_origins: Vec<String>,
+
+    /// 是否持久化 session 到磁盘
+    #[serde(default)]
+    pub persist: bool,
+
+    /// Session 持久化文件路径（相对于 `workspace_path`）
+    #[serde(default = "default_persist_path")]
+    pub persist_path: String,
 }
 
 fn default_http_bind() -> String {
@@ -182,12 +190,18 @@ fn default_cors_allow_origins() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+fn default_persist_path() -> String {
+    ".jiaclaw/sessions.json".to_string()
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             bind: default_http_bind(),
             webhook_secret: None,
             cors_allow_origins: default_cors_allow_origins(),
+            persist: false,
+            persist_path: default_persist_path(),
         }
     }
 }

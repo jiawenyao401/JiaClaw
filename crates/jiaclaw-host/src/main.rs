@@ -165,6 +165,8 @@ struct AppState {
     agent: Arc<JiaClawAgent>,
     sessions: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
     webhook_secret: Option<String>,
+    persist_enabled: bool,
+    persist_path: Arc<PathBuf>,
 }
 
 /// 健康检查响应
@@ -235,10 +237,28 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         .ok()
         .or(config.http.webhook_secret.clone());
     
+    // 解析持久化路径
+    let persist_path = if config.http.persist_path.starts_with('/') {
+        PathBuf::from(&config.http.persist_path)
+    } else {
+        config.workspace_path.join(&config.http.persist_path)
+    };
+    
+    // 加载持久化的 sessions（如果启用）
+    let sessions = if config.http.persist {
+        tracing::info!("Session 持久化已启用，路径: {}", persist_path.display());
+        load_sessions(&persist_path)
+    } else {
+        tracing::info!("Session 持久化未启用");
+        HashMap::new()
+    };
+    
     let state = AppState {
         agent: Arc::new(agent),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Arc::new(Mutex::new(sessions)),
         webhook_secret: webhook_secret.clone(),
+        persist_enabled: config.http.persist,
+        persist_path: Arc::new(persist_path),
     };
 
     // 配置 CORS
@@ -421,6 +441,13 @@ async fn chat_handler(
         sessions.insert(sid.clone(), request.messages.clone());
         sessions.entry(sid.clone()).or_default().push(response.message.clone());
         tracing::info!("更新 session {}, 当前消息数: {}", sid, sessions.get(sid).unwrap().len());
+        
+        // 持久化到磁盘（如果启用）
+        if state.persist_enabled {
+            if let Err(e) = save_sessions(&state.persist_path, &sessions) {
+                tracing::error!("保存 sessions 失败: {}", e);
+            }
+        }
     }
 
     tracing::info!(
@@ -500,6 +527,14 @@ async fn delete_session_handler(
 
     if existed {
         tracing::info!("删除 session: {}", session_id);
+        
+        // 持久化到磁盘（如果启用）
+        if state.persist_enabled {
+            if let Err(e) = save_sessions(&state.persist_path, &sessions) {
+                tracing::error!("保存 sessions 失败: {}", e);
+            }
+        }
+        
         Json(DeleteSessionResponse {
             success: true,
             message: format!("会话 {session_id} 已删除"),
@@ -673,6 +708,13 @@ async fn hooks_inbound_handler(
             session_id,
             sessions.get(&session_id).unwrap().len()
         );
+        
+        // 持久化到磁盘（如果启用）
+        if state.persist_enabled {
+            if let Err(e) = save_sessions(&state.persist_path, &sessions) {
+                tracing::error!("保存 sessions 失败: {}", e);
+            }
+        }
     }
 
     tracing::info!(
@@ -719,6 +761,53 @@ async fn shutdown_signal() {
         .await
         .expect("等待 Ctrl+C 信号失败");
     tracing::info!("收到关闭信号，正在停止服务器...");
+}
+
+/// 从磁盘加载 sessions
+fn load_sessions(path: &PathBuf) -> HashMap<String, Vec<ChatMessage>> {
+    if !path.exists() {
+        tracing::info!("Session 文件不存在，从空 map 开始");
+        return HashMap::new();
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            match serde_json::from_str::<HashMap<String, Vec<ChatMessage>>>(&content) {
+                Ok(sessions) => {
+                    tracing::info!("成功加载 {} 个 sessions", sessions.len());
+                    sessions
+                }
+                Err(e) => {
+                    tracing::warn!("Session 文件损坏，无法解析: {}。从空 map 开始", e);
+                    HashMap::new()
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("无法读取 session 文件: {}。从空 map 开始", e);
+            HashMap::new()
+        }
+    }
+}
+
+/// 保存 sessions 到磁盘（原子写入）
+fn save_sessions(path: &PathBuf, sessions: &HashMap<String, Vec<ChatMessage>>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建目录: {}", parent.display()))?;
+    }
+
+    let json = serde_json::to_string_pretty(sessions)
+        .context("序列化 sessions 失败")?;
+
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, json)
+        .with_context(|| format!("无法写入临时文件: {}", temp_path.display()))?;
+
+    std::fs::rename(&temp_path, path)
+        .with_context(|| format!("无法重命名文件: {} -> {}", temp_path.display(), path.display()))?;
+
+    Ok(())
 }
 
 async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()> {
@@ -1033,11 +1122,14 @@ mod tests {
 
     fn create_test_app_with_secret(webhook_secret: Option<String>) -> Router {
         let config = AgentConfig::default();
-        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
+        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             webhook_secret,
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
         };
 
         Router::new()
@@ -1335,11 +1427,14 @@ mod tests {
     #[tokio::test]
     async fn test_session_message_limit() {
         let config = AgentConfig::default();
-        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
+        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             webhook_secret: None,
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
         };
 
         let session_id = "test-limit-session".to_string();
@@ -1677,5 +1772,120 @@ mod tests {
 
         assert!(webhook_response2.ok);
         assert_eq!(webhook_response2.session_id, "webhook:persistent-chat");
+    }
+
+    #[tokio::test]
+    async fn test_session_persistence_disabled() {
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
+        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            webhook_secret: None,
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path.clone()),
+        };
+
+        let session_id = "test-session".to_string();
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: "测试消息".to_string(),
+            },
+        ];
+
+        {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.insert(session_id.clone(), messages.clone());
+        }
+
+        assert!(!persist_path.exists(), "persist=false 时不应该创建文件");
+    }
+
+    #[tokio::test]
+    async fn test_session_persistence_enabled() {
+        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        
+        let session_id = "test-session".to_string();
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: "测试消息".to_string(),
+            },
+        ];
+
+        {
+            let mut sessions_map = HashMap::new();
+            sessions_map.insert(session_id.clone(), messages.clone());
+            save_sessions(&persist_path, &sessions_map).expect("保存失败");
+        }
+
+        assert!(persist_path.exists(), "persist=true 时应该创建文件");
+
+        let loaded = load_sessions(&persist_path);
+        assert_eq!(loaded.len(), 1, "应该加载 1 个 session");
+        assert_eq!(loaded.get(&session_id).unwrap().len(), 1, "应该有 1 条消息");
+        assert_eq!(
+            loaded.get(&session_id).unwrap()[0].content,
+            "测试消息"
+        );
+
+        std::fs::remove_file(&persist_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_session_persistence_corrupted_file() {
+        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        
+        std::fs::write(&persist_path, "{ invalid json ").expect("写入失败");
+
+        let loaded = load_sessions(&persist_path);
+        assert_eq!(loaded.len(), 0, "损坏的文件应该返回空 map");
+
+        std::fs::remove_file(&persist_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_session_persistence_nonexistent_file() {
+        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        
+        let loaded = load_sessions(&persist_path);
+        assert_eq!(loaded.len(), 0, "不存在的文件应该返回空 map");
+    }
+
+    #[tokio::test]
+    async fn test_session_persistence_delete() {
+        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        
+        let session_id1 = "test-session-1".to_string();
+        let session_id2 = "test-session-2".to_string();
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: "测试消息".to_string(),
+            },
+        ];
+
+        {
+            let mut sessions_map = HashMap::new();
+            sessions_map.insert(session_id1.clone(), messages.clone());
+            sessions_map.insert(session_id2.clone(), messages.clone());
+            save_sessions(&persist_path, &sessions_map).expect("保存失败");
+        }
+
+        let mut loaded = load_sessions(&persist_path);
+        assert_eq!(loaded.len(), 2, "应该加载 2 个 sessions");
+
+        loaded.remove(&session_id1);
+        save_sessions(&persist_path, &loaded).expect("保存失败");
+
+        let loaded_after_delete = load_sessions(&persist_path);
+        assert_eq!(loaded_after_delete.len(), 1, "删除后应该剩 1 个 session");
+        assert!(loaded_after_delete.contains_key(&session_id2));
+        assert!(!loaded_after_delete.contains_key(&session_id1));
+
+        std::fs::remove_file(&persist_path).ok();
     }
 }

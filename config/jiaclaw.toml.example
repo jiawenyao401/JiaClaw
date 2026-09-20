@@ -54,6 +54,15 @@ bind = "127.0.0.1:8080"
 cors_allow_origins = ["*"]
 # cors_allow_origins = ["https://example.com"]
 
+# Session 持久化配置
+# 是否将 session 持久化到磁盘（默认 false）
+# 启用后，进程重启时可恢复多轮对话历史
+persist = false
+
+# Session 持久化文件路径（相对于 workspace_path）
+# 默认: .jiaclaw/sessions.json
+persist_path = ".jiaclaw/sessions.json"
+
 [logging]
 # 日志级别: trace, debug, info, warn, error
 level = "info"
