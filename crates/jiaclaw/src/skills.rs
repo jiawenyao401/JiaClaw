@@ -169,7 +169,7 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
-        let skill_content = r#"# Test Skill
+        let skill_content = r"# Test Skill
 
 ## Description
 
@@ -182,7 +182,7 @@ This is a test skill for testing purposes.
 ## Usage
 
 Use this for testing.
-"#;
+";
 
         fs::write(temp_dir.join("SKILL.md"), skill_content).unwrap();
 
