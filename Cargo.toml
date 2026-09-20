@@ -33,6 +33,12 @@ homepage = "https://github.com/jiawenyao401/JiaClaw"
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
 
+# HTTP client - using minreq for simplicity and Rust 1.83 compatibility
+minreq = { version = "2.12", features = ["json-using-serde"] }
+
+# Utilities
+dirs = "4.0"
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

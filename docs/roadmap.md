@@ -11,6 +11,17 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
 - 构建和共享自定义技能
 - 在本地或云端部署（保持隐私控制）
 
+## 相对竞品的定位
+
+与 [OpenClaw](https://github.com/openclaw/openclaw) 和 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 相比，JiaClaw 聚焦于：
+
+- **持久化优先**: 确定性图执行、检查点、崩溃恢复（at-least-once 语义）
+- **类型安全**: Rust + TypedAgent<I,O> 编译时保证
+- **生产治理**: 多租户、资源策略、预算控制、审计日志
+- **协议原生**: MCP 和 A2A 一等公民支持
+
+详见 [竞争差距分析](competitive-gap.md) 了解完整对比矩阵。
+
 ## 当前状态：M0 - 脚手架与架构 ✅
 
 **完成日期**: 2026-09-20
@@ -32,9 +43,94 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
 
 ---
 
+## M0.5 - 可用迭代（无需 StateKnot） 🚧
+
+**目标日期**: 2026-09-20  
+**依赖**: 无（独立于 StateKnot 稳定 API）
+
+**目标**: 提供实际可用的最小功能集，支持本地开发和测试
+
+**架构约束**: 
+- ✅ 通过 [Brokerrouter](https://github.com/StateKnot/Brokerrouter) 作为 AI Gateway（规划中）
+- ✅ 保持适配器边界清晰，支持离线存根模式
+- ✅ 临时直连模式仅用于早期开发（将废弃）
+
+### 任务
+
+1. **竞争差距分析** (3/3) ✅
+   - [x] 撰写 `docs/competitive-gap.md` 对比 OpenClaw/Hermes
+   - [x] 更新 README 添加相对竞品章节
+   - [x] 更新 roadmap.md 整合差距分析
+
+2. **OpenAI-compatible 提供商** (5/5) ✅ *临时方案*
+   - [x] 添加 `minreq` 依赖和 HTTP 客户端
+   - [x] 实现 OpenAI Chat Completions API 调用
+   - [x] 支持 `base_url` 配置（兼容 Ollama/LM Studio）
+   - [x] 环境变量 `JIACLAW_API_KEY` / 配置文件
+   - [x] 无 API key 时回退到存根（清晰文档说明）
+   - ⚠️ **注意**: 这是临时直连方案，待 Brokerrouter 可用后将迁移
+
+3. **Brokerrouter 集成准备** (2/5) 🚧
+   - [x] 创建 `docs/brokerrouter-gaps.md` 需求文档
+   - [x] 更新架构文档提及 Brokerrouter
+   - [ ] 等待 Brokerrouter 仓库可用
+   - [ ] 创建 Brokerrouter 集成议题 (#1-#10)
+   - [ ] 实现 `BrokerrouterProvider` 适配器
+
+4. **工作空间引导** (6/6) ✅
+   - [x] 设计工作空间目录结构（`~/.jiaclaw/workspace/`）
+   - [x] 创建 `AGENTS.md` - Agent 配置和元数据
+   - [x] 创建 `SOUL.md` - Agent 性格和指令
+   - [x] 创建 `USER.md` - 用户信息和偏好
+   - [x] 创建 `MEMORY.md` - 长期记忆和上下文
+   - [x] 实现 `jiaclaw init` 命令生成默认文件
+
+5. **技能骨架** (5/5) ✅
+   - [x] 设计 `SKILL.md` 格式（参考 agentskills）
+   - [x] 实现技能发现（扫描 `skills/*/SKILL.md`）
+   - [x] 列出启用的技能
+   - [x] 注入技能摘要到系统提示
+   - [x] 添加 1-2 个示例技能（search, calculator）
+
+6. **CLI 改进** (4/4) ✅
+   - [x] `jiaclaw init` 创建工作空间和配置
+   - [x] `jiaclaw chat` 使用真实提供商（有 key 时）
+   - [x] `jiaclaw serve` 添加健康检查端点（axum/hyper）
+   - [x] 改进错误消息和日志输出
+
+7. **测试和文档** (4/4) ✅
+   - [x] 配置加载测试（TOML/JSON/环境变量）
+   - [x] 工作空间引导测试
+   - [x] 技能发现测试
+   - [x] 存根 vs 真实提供商选择测试
+
+### 验收标准
+
+- [ ] `jiaclaw init` 创建完整的工作空间
+- [ ] `jiaclaw chat "你好"` 在无 API key 时返回存根
+- [ ] `jiaclaw chat "你好"` 在有 API key 时调用真实模型
+- [ ] 技能目录被扫描并注入提示
+- [ ] 工作空间文件（AGENTS/SOUL/USER/MEMORY）影响 Agent 行为
+- [ ] 所有测试通过（`cargo test`）
+- [ ] Clippy 无警告（`cargo clippy`）
+- [ ] 代码格式化（`cargo fmt --check`）
+
+### 相对 OpenClaw/Hermes 的进展
+
+| 功能 | OpenClaw | Hermes | JiaClaw M0.5 | 差距 |
+|------|----------|--------|--------------|------|
+| 真实模型调用 | ✅ | ✅ | 🚧 本阶段 | P0 |
+| 工作空间引导 | ✅ | ⏳ | 🚧 本阶段 | P1 |
+| 技能系统 | ✅ 完整 | ⏳ 部分 | 🚧 骨架 | P1（完整实现在 M3） |
+| 离线开发模式 | ✅ | ⏳ | 🚧 本阶段 | P1 |
+
+---
+
 ## M1 - StateKnot 集成（基础） ⏳
 
-**依赖**: StateKnot 稳定公共 API 发布
+**依赖**: 
+- StateKnot 稳定公共 API 发布
+- Brokerrouter 基础路由可用
 
 **目标**: 实现基本的持久化 Agent 执行
 
@@ -62,9 +158,10 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
    - [ ] 基本的 Agent 运行循环
 
 4. **模型提供者** (0/3)
-   - [ ] 配置 OpenAI 或 Anthropic API 密钥
-   - [ ] 注册模型适配器
-   - [ ] 测试基本的模型推理
+   - [ ] 迁移到 Brokerrouter Gateway（优先）
+   - [ ] 配置 Brokerrouter 端点和路由规则
+   - [ ] 集成 StateKnot Model Adapter（与 Brokerrouter 协同）
+   - [ ] 测试 Brokerrouter → OpenAI/Anthropic/Ollama
 
 5. **测试和文档** (0/3)
    - [ ] 端到端测试（提交 -> 执行 -> 结果）

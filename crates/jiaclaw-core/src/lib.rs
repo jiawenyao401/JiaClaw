@@ -9,6 +9,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// 外部依赖
+extern crate dirs;
+
 /// `JiaClaw` 错误类型
 #[derive(Debug, Error)]
 pub enum JiaClawError {
@@ -30,7 +33,7 @@ pub enum JiaClawError {
 pub struct ChatMessage {
     /// 消息角色（user/assistant/system）
     pub role: MessageRole,
-    
+
     /// 消息内容
     pub content: String,
 }
@@ -41,10 +44,10 @@ pub struct ChatMessage {
 pub enum MessageRole {
     /// 用户消息
     User,
-    
+
     /// 助手消息
     Assistant,
-    
+
     /// 系统消息
     System,
 }
@@ -54,11 +57,11 @@ pub enum MessageRole {
 pub struct ChatRequest {
     /// 会话历史
     pub messages: Vec<ChatMessage>,
-    
+
     /// 启用的工具列表（可选）
     #[serde(default)]
     pub enabled_tools: Vec<String>,
-    
+
     /// 启用的技能列表（可选）
     #[serde(default)]
     pub enabled_skills: Vec<String>,
@@ -69,11 +72,11 @@ pub struct ChatRequest {
 pub struct ChatResponse {
     /// 助手回复消息
     pub message: ChatMessage,
-    
+
     /// 使用的工具调用（可选）
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
-    
+
     /// 运行状态
     pub status: RunStatus,
 }
@@ -83,10 +86,10 @@ pub struct ChatResponse {
 pub struct ToolCall {
     /// 工具名称
     pub tool_name: String,
-    
+
     /// 工具参数
     pub arguments: serde_json::Value,
-    
+
     /// 工具结果
     pub result: Option<serde_json::Value>,
 }
@@ -97,13 +100,13 @@ pub struct ToolCall {
 pub enum RunStatus {
     /// 运行中
     Running,
-    
+
     /// 已完成
     Completed,
-    
+
     /// 失败
     Failed,
-    
+
     /// 需要人工介入
     RequiresHumanInput,
 }
@@ -113,15 +116,91 @@ pub enum RunStatus {
 pub struct AgentConfig {
     /// Agent 名称
     pub name: String,
-    
+
     /// Agent 描述
     pub description: String,
-    
+
     /// 系统指令
     pub system_instructions: String,
-    
+
     /// 最大对话轮次
     pub max_turns: usize,
+
+    /// 工作空间路径
+    #[serde(default = "default_workspace_path")]
+    pub workspace_path: std::path::PathBuf,
+
+    /// 模型提供商配置
+    #[serde(default)]
+    pub provider: ProviderConfig,
+}
+
+fn default_workspace_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".jiaclaw")
+        .join("workspace")
+}
+
+/// 模型提供商配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    /// 提供商类型（`openai_compatible`）
+    #[serde(default = "default_provider_type")]
+    pub provider_type: String,
+
+    /// API 基础 URL（支持 OpenAI、Ollama、LM Studio 等）
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+
+    /// API 密钥（可选，无密钥时回退到存根）
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// 模型名称
+    #[serde(default = "default_model")]
+    pub model: String,
+
+    /// 温度参数
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+
+    /// 最大 tokens
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_provider_type() -> String {
+    "openai_compatible".to_string()
+}
+
+fn default_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_temperature() -> f32 {
+    0.7
+}
+
+fn default_max_tokens() -> u32 {
+    4096
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            provider_type: default_provider_type(),
+            base_url: default_base_url(),
+            api_key: None,
+            model: default_model(),
+            temperature: default_temperature(),
+            max_tokens: default_max_tokens(),
+        }
+    }
 }
 
 impl Default for AgentConfig {
@@ -131,6 +210,8 @@ impl Default for AgentConfig {
             description: "Personal durable agent runtime".to_string(),
             system_instructions: "You are JiaClaw, a helpful personal assistant.".to_string(),
             max_turns: 10,
+            workspace_path: default_workspace_path(),
+            provider: ProviderConfig::default(),
         }
     }
 }
@@ -157,7 +238,7 @@ impl AgentConfig {
         struct ConfigFile {
             agent: AgentConfig,
         }
-        
+
         let config: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
         Ok(config.agent)
@@ -184,7 +265,7 @@ impl AgentConfig {
         struct ConfigFile {
             agent: AgentConfig,
         }
-        
+
         let config: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
         Ok(config.agent)
