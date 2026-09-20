@@ -21,12 +21,14 @@ jiaclaw-core = { version = "=0.1.0", path = "../jiaclaw-core" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 minreq = { workspace = true }
 tracing = { workspace = true }
 uuid = { version = "=1.7.0", features = ["v4"] }
 async-trait = "0.1"
+indexmap = { workspace = true }
 
 [dev-dependencies]
 mockito = "0.31"

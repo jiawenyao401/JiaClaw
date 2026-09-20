@@ -147,6 +147,10 @@ cargo run --bin jiaclaw -- init
 # 检查配置和环境
 cargo run --bin jiaclaw -- doctor
 
+# 列出已发现的技能
+cargo run --bin jiaclaw -- skills
+cargo run --bin jiaclaw -- skills --verbose  # 显示详细信息
+
 # 运行单次聊天（需要配置 API key）
 export JIACLAW_API_KEY=brk_live_...
 cargo run --bin jiaclaw -- chat "你好，JiaClaw"
