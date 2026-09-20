@@ -70,9 +70,17 @@ pub struct ChatRequest {
     #[serde(default)]
     pub enabled_skills: Vec<String>,
 
+    /// 是否启用技能自动激活（默认 true）
+    #[serde(default = "default_auto_skills")]
+    pub auto_skills: bool,
+
     /// 会话 ID（可选，用于多轮对话）
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+fn default_auto_skills() -> bool {
+    true
 }
 
 /// `JiaClaw` 聊天响应

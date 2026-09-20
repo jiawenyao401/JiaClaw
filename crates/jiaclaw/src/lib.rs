@@ -152,30 +152,35 @@ impl JiaClawAgent {
     ///
     /// 本方法会自动处理工具调用循环（最多 5 次迭代）。
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, JiaClawError> {
-        // 检查是否有技能应该被自动触发
+        // 检查是否有技能应该被自动触发（仅在 auto_skills 为 true 时）
         let mut enabled_skills = request.enabled_skills.clone();
         
-        if let Some(last_user_msg) = request
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, MessageRole::User))
-        {
-            let discovery = SkillDiscovery::new(&self.config.workspace_path);
-            let auto_triggered = discovery.auto_trigger_skills(&last_user_msg.content, &self.skills);
-            
-            for skill_name in auto_triggered {
-                if !enabled_skills.contains(&skill_name) {
-                    tracing::info!("自动激活技能: {}", skill_name);
-                    enabled_skills.push(skill_name);
+        if request.auto_skills {
+            if let Some(last_user_msg) = request
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, MessageRole::User))
+            {
+                let discovery = SkillDiscovery::new(&self.config.workspace_path);
+                let auto_triggered = discovery.auto_trigger_skills(&last_user_msg.content, &self.skills);
+                
+                for skill_name in auto_triggered {
+                    if !enabled_skills.contains(&skill_name) {
+                        tracing::info!("自动激活技能: {}", skill_name);
+                        enabled_skills.push(skill_name);
+                    }
                 }
             }
+        } else {
+            tracing::info!("技能自动激活已禁用");
         }
         
         let request_with_skills = ChatRequest {
             messages: request.messages.clone(),
             enabled_tools: request.enabled_tools.clone(),
             enabled_skills,
+            auto_skills: request.auto_skills,
             session_id: request.session_id.clone(),
         };
         
@@ -395,6 +400,7 @@ impl JiaClawAgent {
                     messages: messages.clone(),
                     enabled_tools: vec![],
                     enabled_skills: vec![],
+                    auto_skills: true,
                     session_id: None,
                 };
                 self.stub_chat(&request, system_prompt)
@@ -741,6 +747,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
@@ -761,6 +768,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
@@ -823,5 +831,75 @@ mod tests {
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0].tool_name, "datetime_now");
         assert_eq!(tool_calls[1].tool_name, "workspace_list");
+    }
+
+    #[tokio::test]
+    async fn test_auto_skills_disabled() {
+        // 测试禁用自动技能激活
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config).unwrap();
+
+        // 假设有一个技能会被 "搜索" 触发
+        // 但我们设置 auto_skills = false
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "搜索 OpenAI".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: false,
+            session_id: None,
+        };
+
+        let response = agent.chat(&request).await;
+        assert!(response.is_ok());
+        
+        // 即使内容可能触发技能，也不应该自动启用
+        // （因为默认工作空间没有技能，这个测试主要验证不会崩溃）
+    }
+
+    #[tokio::test]
+    async fn test_auto_skills_enabled() {
+        // 测试启用自动技能激活
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config).unwrap();
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "搜索信息".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        };
+
+        let response = agent.chat(&request).await;
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_explicit_skills_with_auto_disabled() {
+        // 测试显式指定技能 + 禁用自动激活
+        // 显式技能应该仍然生效
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config).unwrap();
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "你好".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec!["calculator".to_string()],
+            auto_skills: false,
+            session_id: None,
+        };
+
+        let response = agent.chat(&request).await;
+        assert!(response.is_ok());
+        // 显式指定的技能应该在系统提示中
     }
 }

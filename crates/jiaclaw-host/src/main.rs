@@ -744,6 +744,7 @@ async fn hooks_inbound_handler(
         }],
         enabled_tools: vec![],
         enabled_skills: vec![],
+        auto_skills: true,
         session_id: Some(session_id.clone()),
     };
 
@@ -976,22 +977,14 @@ async fn single_chat(
     session_id: Option<String>,
     no_auto_skill: bool,
 ) -> Result<()> {
-    let enabled_skills = if no_auto_skill {
-        // 如果禁用自动技能激活，清空技能列表
-        // TODO: 未来 API 应该直接支持 no_auto_skill 标志
-        tracing::info!("已禁用技能自动激活");
-        vec![]
-    } else {
-        skills.to_vec()
-    };
-
     let request = ChatRequest {
         messages: vec![ChatMessage {
             role: MessageRole::User,
             content: message.to_string(),
         }],
         enabled_tools: vec![],
-        enabled_skills,
+        enabled_skills: skills.to_vec(),
+        auto_skills: !no_auto_skill,
         session_id: session_id.clone(),
     };
 
@@ -1104,11 +1097,8 @@ async fn repl_chat(
                 let request = ChatRequest {
                     messages: history.clone(),
                     enabled_tools: vec![],
-                    enabled_skills: if no_auto_skill {
-                        vec![]
-                    } else {
-                        enabled_skills.clone()
-                    },
+                    enabled_skills: enabled_skills.clone(),
+                    auto_skills: !no_auto_skill,
                     session_id: session_id.clone(),
                 };
 
@@ -1548,6 +1538,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
@@ -1586,6 +1577,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
@@ -1656,6 +1648,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: Some(session_id.clone()),
         };
 
@@ -1692,6 +1685,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: Some(session_id.clone()),
         };
 
@@ -1843,6 +1837,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: Some(session_id.clone()),
         };
 
@@ -2276,6 +2271,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
@@ -2306,6 +2302,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
@@ -2337,6 +2334,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
@@ -2369,6 +2367,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
@@ -2401,6 +2400,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            auto_skills: true,
             session_id: None,
         };
 
