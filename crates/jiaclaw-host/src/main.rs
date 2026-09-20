@@ -204,6 +204,27 @@ async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()>
 
     let response = agent.chat(&request).await.context("聊天请求失败")?;
 
+    // 显示工具调用（如果有）
+    if !response.tool_calls.is_empty() {
+        println!("\n🔧 工具调用:");
+        for tool_call in &response.tool_calls {
+            println!("   • {}", tool_call.tool_name);
+            if let Some(ref result) = tool_call.result {
+                if let Some(result_str) = result.as_str() {
+                    // 结果是字符串，直接显示
+                    println!("     结果: {}", result_str.lines().take(3).collect::<Vec<_>>().join("\n     "));
+                    if result_str.lines().count() > 3 {
+                        println!("     ...");
+                    }
+                } else {
+                    // 结果是其他 JSON，格式化显示
+                    println!("     结果: {}", serde_json::to_string_pretty(result).unwrap_or_default());
+                }
+            }
+        }
+        println!();
+    }
+
     println!("\n助手回复:");
     println!("{}", response.message.content);
     println!("\n状态: {:?}", response.status);

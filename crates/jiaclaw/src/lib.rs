@@ -149,6 +149,8 @@ impl JiaClawAgent {
     /// 1. `brokerrouter` - 推荐的生产路径（通过 Brokerrouter Gateway）
     /// 2. `openai_compatible` - 已废弃的直连模式（仅作开发逃生舱）
     /// 3. 如果未配置 API key，回退到存根实现
+    ///
+    /// 本方法会自动处理工具调用循环（最多 5 次迭代）。
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, JiaClawError> {
         // 构建完整的系统提示（包含工作空间内容）
         let system_prompt = self.build_system_prompt(request);
@@ -162,44 +164,45 @@ impl JiaClawAgent {
             .as_deref()
             .or(env_key.as_deref());
 
-        // 选择提供商
-        match (api_key, self.config.provider.provider_type.as_str()) {
-            (Some(key), "brokerrouter") => {
-                // 推荐：Brokerrouter 提供商
-                let provider = BrokerrouterProvider::new(&self.config.provider.base_url, key);
-                provider
-                    .chat(
-                        &self.config.provider.model,
-                        &system_prompt,
-                        &request.messages,
-                        self.config.provider.temperature,
-                        self.config.provider.max_tokens,
-                    )
-                    .await
-            }
-            (Some(key), "openai_compatible") => {
-                // 已废弃：OpenAI-compatible 提供商
-                let provider = OpenAICompatibleProvider::new(&self.config.provider.base_url, key);
-                provider
-                    .chat(
-                        &self.config.provider.model,
-                        &system_prompt,
-                        &request.messages,
-                        self.config.provider.temperature,
-                        self.config.provider.max_tokens,
-                    )
-                    .await
+        // 根据提供商类型执行工具循环
+        let provider_type = self.config.provider.provider_type.as_str();
+        match (api_key, provider_type) {
+            (Some(key), "brokerrouter" | "openai_compatible") => {
+                // 使用工具执行循环
+                self.execute_tool_loop(
+                    request.messages.clone(),
+                    &system_prompt,
+                    provider_type,
+                    Some(key),
+                )
+                .await
             }
             (Some(_), unknown_type) => {
-                tracing::warn!("未知的提供商类型 '{}', 回退到存根模式", unknown_type);
-                Ok(self.stub_chat(request, &system_prompt))
+                tracing::warn!(
+                    "未知的提供商类型 '{}', 回退到存根模式",
+                    unknown_type
+                );
+                // 存根模式也支持工具执行
+                self.execute_tool_loop(
+                    request.messages.clone(),
+                    &system_prompt,
+                    "stub",
+                    None,
+                )
+                .await
             }
             (None, _) => {
-                // 回退到存根实现
+                // 存根模式也支持工具执行
                 tracing::warn!(
                     "未配置 API key（通过配置文件或 JIACLAW_API_KEY 环境变量），使用存根模式"
                 );
-                Ok(self.stub_chat(request, &system_prompt))
+                self.execute_tool_loop(
+                    request.messages.clone(),
+                    &system_prompt,
+                    "stub",
+                    None,
+                )
+                .await
             }
         }
     }
@@ -248,18 +251,180 @@ impl JiaClawAgent {
         let tool_list = self.tools.list();
         if !tool_list.is_empty() {
             prompt.push_str("\n\n## Available Tools\n\n");
-            prompt.push_str("你可以使用以下工具来完成任务：\n");
+            prompt.push_str("你可以使用以下工具来完成任务。每个工具的详细信息如下：\n\n");
             for tool_name in tool_list {
                 if let Some(tool) = self.tools.get(tool_name) {
-                    prompt.push_str(&format!("- **{}**: {}\n", tool.name(), tool.description()));
+                    prompt.push_str(&format!(
+                        "### {}\n{}\n\n参数 schema:\n```json\n{}\n```\n\n",
+                        tool.name(),
+                        tool.description(),
+                        serde_json::to_string_pretty(&tool.parameters_schema()).unwrap_or_default()
+                    ));
                 }
             }
             prompt.push_str(
-                "\n注意：工具调用功能目前处于存根模式，完整实现需要等待 StateKnot M2。\n",
+                "## Tool Calling Format\n\n\
+                 要调用工具，请在你的响应中使用以下 JSON 代码块格式：\n\n\
+                 ```tool\n\
+                 {\n\
+                   \"tool_name\": \"工具名称\",\n\
+                   \"arguments\": {\"参数名\": \"参数值\"}\n\
+                 }\n\
+                 ```\n\n\
+                 你可以在一条消息中调用多个工具，每个工具调用使用一个单独的 ```tool 代码块。\n\
+                 我会执行这些工具并将结果返回给你，然后你可以继续处理。\n\n"
             );
         }
 
         prompt
+    }
+
+    /// 解析 assistant 消息中的工具调用
+    fn parse_tool_calls(content: &str) -> Vec<ToolCall> {
+        let mut tool_calls = Vec::new();
+        
+        // 查找所有 ```tool ... ``` 代码块
+        let mut start_idx = 0;
+        while let Some(block_start) = content[start_idx..].find("```tool") {
+            let block_start = start_idx + block_start;
+            if let Some(block_end) = content[block_start + 7..].find("```") {
+                let block_end = block_start + 7 + block_end;
+                let json_str = content[block_start + 7..block_end].trim();
+                
+                // 尝试解析 JSON
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let (Some(tool_name), Some(arguments)) = (
+                        parsed.get("tool_name").and_then(|v| v.as_str()),
+                        parsed.get("arguments"),
+                    ) {
+                        tool_calls.push(ToolCall {
+                            tool_name: tool_name.to_string(),
+                            arguments: arguments.clone(),
+                            result: None,
+                        });
+                    }
+                }
+                
+                start_idx = block_end + 3;
+            } else {
+                break;
+            }
+        }
+        
+        tool_calls
+    }
+
+    /// 执行工具调用循环
+    async fn execute_tool_loop(
+        &self,
+        mut messages: Vec<ChatMessage>,
+        system_prompt: &str,
+        provider_type: &str,
+        api_key: Option<&str>,
+    ) -> Result<ChatResponse, JiaClawError> {
+        const MAX_ITERATIONS: usize = 5;
+        let mut iteration = 0;
+        let mut all_tool_calls = Vec::new();
+        
+        loop {
+            iteration += 1;
+            
+            // 调用 LLM
+            let response = if let Some(key) = api_key {
+                match provider_type {
+                    "brokerrouter" => {
+                        let provider = BrokerrouterProvider::new(&self.config.provider.base_url, key);
+                        provider
+                            .chat(
+                                &self.config.provider.model,
+                                system_prompt,
+                                &messages,
+                                self.config.provider.temperature,
+                                self.config.provider.max_tokens,
+                            )
+                            .await?
+                    }
+                    "openai_compatible" => {
+                        let provider = OpenAICompatibleProvider::new(&self.config.provider.base_url, key);
+                        provider
+                            .chat(
+                                &self.config.provider.model,
+                                system_prompt,
+                                &messages,
+                                self.config.provider.temperature,
+                                self.config.provider.max_tokens,
+                            )
+                            .await?
+                    }
+                    _ => {
+                        return Err(JiaClawError::Configuration(format!(
+                            "未知的提供商类型: {provider_type}"
+                        )));
+                    }
+                }
+            } else {
+                // 存根模式
+                let request = ChatRequest {
+                    messages: messages.clone(),
+                    enabled_tools: vec![],
+                    enabled_skills: vec![],
+                };
+                self.stub_chat(&request, system_prompt)
+            };
+            
+            // 解析工具调用
+            let tool_calls = Self::parse_tool_calls(&response.message.content);
+            
+            if tool_calls.is_empty() || iteration >= MAX_ITERATIONS {
+                // 没有工具调用或达到最大迭代次数，返回结果（包含所有已执行的工具调用）
+                return Ok(ChatResponse {
+                    message: response.message,
+                    tool_calls: all_tool_calls,
+                    status: response.status,
+                });
+            }
+            
+            // 执行工具调用
+            let mut executed_tool_calls = Vec::new();
+            let mut tool_results = Vec::new();
+            
+            for mut tool_call in tool_calls {
+                tracing::info!("执行工具: {} (迭代 {}/{})", tool_call.tool_name, iteration, MAX_ITERATIONS);
+                
+                match self.tools.execute(&tool_call).await {
+                    Ok(result) => {
+                        tool_call.result = Some(serde_json::json!(result.clone()));
+                        executed_tool_calls.push(tool_call.clone());
+                        tool_results.push(format!(
+                            "工具 {} 执行成功:\n{}",
+                            tool_call.tool_name,
+                            result
+                        ));
+                    }
+                    Err(e) => {
+                        let error_msg = format!("工具 {} 执行失败: {}", tool_call.tool_name, e);
+                        tool_call.result = Some(serde_json::json!({"error": error_msg.clone()}));
+                        executed_tool_calls.push(tool_call.clone());
+                        tool_results.push(error_msg);
+                    }
+                }
+            }
+            
+            // 将所有执行的工具调用添加到累积列表
+            all_tool_calls.extend(executed_tool_calls);
+            
+            // 将 assistant 的响应和工具结果添加到历史
+            messages.push(response.message.clone());
+            messages.push(ChatMessage {
+                role: MessageRole::User,
+                content: format!(
+                    "工具执行结果 (迭代 {}/{}):\n\n{}",
+                    iteration,
+                    MAX_ITERATIONS,
+                    tool_results.join("\n\n")
+                ),
+            });
+        }
     }
 
     /// 存根实现（无 API key 时使用）
@@ -295,6 +460,61 @@ impl JiaClawAgent {
     ) -> String {
         let user_lower = user_message.to_lowercase();
 
+        // 检查是否是工具执行结果反馈
+        if user_lower.contains("工具执行结果") || user_lower.contains("执行成功") {
+            // 工具已经执行完成，返回一个总结
+            return "根据工具执行结果，操作已完成。\n\n\
+                 如需了解更多信息，请查看上面的工具输出结果。".to_string();
+        }
+
+        // 检查是否应该触发工具调用（演示）
+        if user_lower.contains("列出工作空间") 
+            || user_lower.contains("list workspace")
+            || user_lower.contains("workspace files") {
+            return "好的,让我列出工作空间文件。\n\n\
+                 ```tool\n\
+                 {\n\
+                   \"tool_name\": \"workspace_list\",\n\
+                   \"arguments\": {}\n\
+                 }\n\
+                 ```".to_string();
+        }
+        
+        if user_lower.contains("读取记忆") 
+            || user_lower.contains("read memory")
+            || (user_lower.contains("memory") && user_lower.contains("read")) {
+            return "让我读取记忆文件。\n\n\
+                 ```tool\n\
+                 {\n\
+                   \"tool_name\": \"memory_read\",\n\
+                   \"arguments\": {\"file\": \"MEMORY\"}\n\
+                 }\n\
+                 ```".to_string();
+        }
+        
+        if user_lower.contains("当前时间") 
+            || user_lower.contains("current time")
+            || user_lower.contains("what time") {
+            return "让我获取当前时间。\n\n\
+                 ```tool\n\
+                 {\n\
+                   \"tool_name\": \"datetime_now\",\n\
+                   \"arguments\": {}\n\
+                 }\n\
+                 ```".to_string();
+        }
+        
+        if (user_lower.contains("列出") || user_lower.contains("list")) 
+            && user_lower.contains("文件") {
+            return "让我列出当前目录的文件。\n\n\
+                 ```tool\n\
+                 {\n\
+                   \"tool_name\": \"file_list\",\n\
+                   \"arguments\": {\"path\": \".\"}\n\
+                 }\n\
+                 ```".to_string();
+        }
+
         // 简单的关键词匹配响应
         if user_lower.contains("你好") || user_lower.contains("hello") || user_lower.contains("hi")
         {
@@ -306,7 +526,7 @@ impl JiaClawAgent {
                  • 工作空间已加载（{} 个文件）\n\
                  • 发现了 {} 个技能\n\
                  • 注册了 {} 个工具\n\n\
-                 试试问我：\"有什么工具\" 或 \"列出技能\"",
+                 试试问我：\"列出工作空间\" 或 \"读取记忆\" 来测试工具执行！",
                 self.config.name,
                 self.config.description,
                 self.config.max_turns,
@@ -329,8 +549,10 @@ impl JiaClawAgent {
                         ));
                     }
                 }
-                response.push_str("注意：完整的工具执行需要等待 StateKnot M2 集成。\n");
-                response.push_str("当前在存根模式下，我可以描述工具但无法真正执行它们。");
+                response.push_str("💡 试试说：\n");
+                response.push_str("• \"列出工作空间\" - 调用 workspace_list 工具\n");
+                response.push_str("• \"读取记忆\" - 调用 memory_read 工具\n");
+                response.push_str("• \"当前时间\" - 调用 datetime_now 工具\n");
                 response
             }
         } else if user_lower.contains("技能") || user_lower.contains("skill") {
@@ -492,5 +714,81 @@ mod tests {
 
         let response = agent.chat(&request).await;
         assert!(response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tool_execution_in_stub_mode() {
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config).unwrap();
+
+        // 测试工具调用触发
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "列出工作空间".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+        };
+
+        let response = agent.chat(&request).await;
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        
+        // 验证工具被执行了
+        assert!(
+            !response.tool_calls.is_empty(),
+            "工具应该被执行，tool_calls 不应为空"
+        );
+        assert_eq!(response.tool_calls[0].tool_name, "workspace_list");
+        assert!(response.tool_calls[0].result.is_some(), "工具应该有执行结果");
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_parsing() {
+        // 测试工具调用解析
+        let content = r#"
+让我列出工作空间文件。
+
+```tool
+{
+  "tool_name": "workspace_list",
+  "arguments": {}
+}
+```
+"#;
+
+        let tool_calls = JiaClawAgent::parse_tool_calls(content);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool_name, "workspace_list");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_tool_calls_parsing() {
+        // 测试多个工具调用解析
+        let content = r#"
+让我先获取时间，然后列出文件。
+
+```tool
+{
+  "tool_name": "datetime_now",
+  "arguments": {}
+}
+```
+
+然后
+
+```tool
+{
+  "tool_name": "workspace_list",
+  "arguments": {}
+}
+```
+"#;
+
+        let tool_calls = JiaClawAgent::parse_tool_calls(content);
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].tool_name, "datetime_now");
+        assert_eq!(tool_calls[1].tool_name, "workspace_list");
     }
 }
