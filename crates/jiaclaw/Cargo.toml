@@ -25,6 +25,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 minreq = { workspace = true }
 tracing = { workspace = true }
+uuid = { version = "=1.7.0", features = ["v4"] }
+
+[dev-dependencies]
+mockito = "0.31"
 
 [lints]
 workspace = true

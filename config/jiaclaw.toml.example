@@ -96,20 +96,22 @@ tool_timeout = 30
 # 模型调用超时（秒）
 model_timeout = 120
 
-[model]
-# 模型提供商配置（当 StateKnot 集成可用时）
+[provider]
+# 模型提供商配置
 #
-# # 提供商: openai, anthropic
-# provider = "openai"
-#
-# # API 密钥（建议使用环境变量 JIACLAW_MODEL_API_KEY）
-# # api_key = "sk-..."
-#
-# # 模型名称
-# model = "gpt-4"
-#
-# # 温度参数
+# 推荐: Brokerrouter (生产路径)
+type = "brokerrouter"
+base_url = "https://api.brokerrouter.dev"
+# API 密钥（建议使用环境变量 JIACLAW_API_KEY）
+# api_key = "brk_live_..."
+model = "claude-3-5-sonnet-20241022"
+temperature = 0.7
+max_tokens = 4096
+
+# 备选: OpenAI-compatible (已废弃，仅作开发逃生舱)
+# type = "openai_compatible"
+# base_url = "https://api.openai.com/v1"
+# api_key = "sk-..."
+# model = "gpt-4o-mini"
 # temperature = 0.7
-#
-# # 最大 tokens
 # max_tokens = 4096
