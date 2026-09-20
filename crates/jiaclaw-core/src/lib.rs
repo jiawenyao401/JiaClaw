@@ -26,6 +26,10 @@ pub enum JiaClawError {
     /// 无效请求
     #[error("无效请求: {0}")]
     InvalidRequest(String),
+
+    /// 工具执行错误
+    #[error("工具执行错误: {0}")]
+    ToolExecution(String),
 }
 
 /// 聊天消息

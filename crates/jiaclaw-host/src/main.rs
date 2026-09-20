@@ -54,6 +54,13 @@ enum Commands {
 
     /// 显示版本和构建信息
     Version,
+
+    /// 检查配置和连接状态
+    Doctor {
+        /// 配置文件路径
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -80,6 +87,9 @@ async fn main() -> Result<()> {
         }
         Commands::Version => {
             version_command();
+        }
+        Commands::Doctor { config } => {
+            doctor_command(config)?;
         }
     }
 
@@ -206,4 +216,155 @@ fn version_command() {
     println!("基于 StateKnot 框架构建");
     println!("许可证: Apache-2.0 OR MIT");
     println!("仓库: https://github.com/jiawenyao401/JiaClaw");
+}
+
+#[allow(clippy::too_many_lines)]
+fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
+    println!("🔍 JiaClaw 配置检查\n");
+
+    let config = if let Some(path) = config_path {
+        let path_str = path.to_string_lossy();
+        if path_str.ends_with(".toml") {
+            AgentConfig::from_toml_file(&path)?
+        } else if path_str.ends_with(".json") {
+            AgentConfig::from_json_file(&path)?
+        } else {
+            AgentConfig::from_toml_file(&path).or_else(|_| AgentConfig::from_json_file(&path))?
+        }
+    } else {
+        AgentConfig::default()
+    };
+
+    // 1. 检查工作空间
+    println!("📁 工作空间检查");
+    println!("   路径: {}", config.workspace_path.display());
+
+    if config.workspace_path.exists() {
+        println!("   状态: ✅ 存在");
+
+        let workspace = Workspace::load(&config.workspace_path)?;
+        let mut files = Vec::new();
+        if workspace.agents.is_some() {
+            files.push("AGENTS.md");
+        }
+        if workspace.soul.is_some() {
+            files.push("SOUL.md");
+        }
+        if workspace.user.is_some() {
+            files.push("USER.md");
+        }
+        if workspace.memory.is_some() {
+            files.push("MEMORY.md");
+        }
+
+        if files.is_empty() {
+            println!("   ⚠️  没有找到工作空间文件");
+            println!("   💡 运行 'jiaclaw init' 创建默认文件");
+        } else {
+            println!("   文件: {} 个已加载 ({})", files.len(), files.join(", "));
+        }
+
+        // 检查技能
+        let skills_dir = config.workspace_path.join("skills");
+        if skills_dir.exists() {
+            let discovery = jiaclaw::SkillDiscovery::new(&config.workspace_path);
+            match discovery.discover() {
+                Ok(skills) => {
+                    if skills.is_empty() {
+                        println!("   技能: 0 个");
+                    } else {
+                        println!("   技能: {} 个发现", skills.len());
+                        for skill in &skills {
+                            println!("         • {}", skill.name);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("   ⚠️  技能发现失败: {e}");
+                }
+            }
+        } else {
+            println!("   技能: 目录不存在");
+        }
+    } else {
+        println!("   状态: ❌ 不存在");
+        println!("   💡 运行 'jiaclaw init' 创建工作空间");
+    }
+
+    // 2. 检查提供商配置
+    println!("\n🔌 提供商配置");
+    println!("   类型: {}", config.provider.provider_type);
+    println!("   模型: {}", config.provider.model);
+    println!("   Base URL: {}", config.provider.base_url);
+
+    // 检查 API key
+    let env_key = std::env::var("JIACLAW_API_KEY").ok();
+    let has_key = config.provider.api_key.is_some() || env_key.is_some();
+
+    if has_key {
+        println!("   API Key: ✅ 已配置");
+
+        if config.provider.provider_type == "brokerrouter" {
+            println!("\n   🔍 Brokerrouter 连接测试");
+            println!("      注意: 完整的连接测试需要有效的虚拟密钥");
+            println!("      当前仅进行配置验证");
+
+            // 简单的 URL 格式检查
+            if config.provider.base_url.starts_with("http://")
+                || config.provider.base_url.starts_with("https://")
+            {
+                println!("      Base URL: ✅ 格式有效");
+            } else {
+                println!("      Base URL: ⚠️  格式可能无效（应以 http:// 或 https:// 开头）");
+            }
+
+            // 检查虚拟密钥格式
+            let key = config.provider.api_key.as_deref().or(env_key.as_deref());
+            if let Some(k) = key {
+                if k.starts_with("brk_") {
+                    println!("      Virtual Key: ✅ 格式正确（brk_ 前缀）");
+                } else {
+                    println!("      Virtual Key: ⚠️  格式可能不正确（应以 brk_ 开头）");
+                }
+            }
+        }
+    } else {
+        println!("   API Key: ⚠️  未配置");
+        println!("   💡 将使用存根模式（演示功能）");
+        println!("   💡 设置环境变量: export JIACLAW_API_KEY=your-key");
+    }
+
+    // 3. 工具系统
+    println!("\n🔧 工具系统");
+    let agent = JiaClawAgent::new(config.clone())?;
+    let tool_list = agent.tools().list();
+    println!("   本地工具: {} 个已注册", tool_list.len());
+    for tool_name in tool_list {
+        if let Some(tool) = agent.tools().get(tool_name) {
+            println!("      • {}: {}", tool.name(), tool.description());
+        }
+    }
+
+    // 4. StateKnot 集成状态
+    println!("\n⚙️  StateKnot 集成");
+    println!("   状态: ⏳ 等待稳定 API 发布");
+    println!("   持久化: ❌ 未启用");
+    println!("   PostgreSQL: ❌ 未配置");
+    println!("   💡 参见 docs/stateknot-gaps.md 了解详情");
+
+    // 5. 总结
+    println!("\n📊 总结");
+    if config.workspace_path.exists() && has_key {
+        println!("   ✅ 配置良好，可以开始使用");
+        println!("   💡 试试: jiaclaw chat \"你好\"");
+    } else if !config.workspace_path.exists() {
+        println!("   ⚠️  需要初始化工作空间");
+        println!("   💡 运行: jiaclaw init");
+    } else if !has_key {
+        println!("   ⚠️  未配置 API key，将使用存根模式");
+        println!("   💡 设置: export JIACLAW_API_KEY=your-key");
+        println!("   💡 或在存根模式下测试: jiaclaw chat \"你好\"");
+    }
+
+    Ok(())
 }

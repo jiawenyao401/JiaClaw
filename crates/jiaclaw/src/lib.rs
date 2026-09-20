@@ -15,9 +15,13 @@ pub use jiaclaw_core::{
 };
 
 mod provider;
+mod skills;
+mod tools;
 mod workspace;
 
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
+pub use skills::{Skill, SkillDiscovery};
+pub use tools::{MemoryReadTool, Tool, ToolRegistry, WorkspaceListTool};
 pub use workspace::Workspace;
 
 // StateKnot imports - commented out until edition 2024 support
@@ -31,6 +35,8 @@ pub use workspace::Workspace;
 pub struct JiaClawAgent {
     config: AgentConfig,
     workspace: Workspace,
+    skills: Vec<Skill>,
+    tools: ToolRegistry,
     // TODO: 当 StateKnot 发布稳定 API 后，添加 TypedAgent 字段
     // typed_agent: TypedAgent<ChatRequest, ChatResponse>,
 }
@@ -57,7 +63,30 @@ impl JiaClawAgent {
         // 加载工作空间文件
         let workspace = Workspace::load(&config.workspace_path)?;
 
-        Ok(Self { config, workspace })
+        // 发现技能
+        let skill_discovery = SkillDiscovery::new(&config.workspace_path);
+        let skills = skill_discovery.discover().unwrap_or_else(|e| {
+            tracing::warn!("技能发现失败: {e}");
+            Vec::new()
+        });
+
+        if !skills.is_empty() {
+            tracing::info!("发现 {} 个技能", skills.len());
+        }
+
+        // 初始化工具注册表
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(WorkspaceListTool::new(&config.workspace_path)));
+        tools.register(Box::new(MemoryReadTool::new(&config.workspace_path)));
+
+        tracing::info!("注册了 {} 个本地工具", tools.list().len());
+
+        Ok(Self {
+            config,
+            workspace,
+            skills,
+            tools,
+        })
     }
 
     /// 获取 Agent 配置
@@ -70,6 +99,18 @@ impl JiaClawAgent {
     #[must_use]
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    /// 获取技能列表
+    #[must_use]
+    pub fn skills(&self) -> &[Skill] {
+        &self.skills
+    }
+
+    /// 获取工具注册表
+    #[must_use]
+    pub fn tools(&self) -> &ToolRegistry {
+        &self.tools
     }
 
     /// 处理聊天请求
@@ -129,10 +170,7 @@ impl JiaClawAgent {
                     .await
             }
             (Some(_), unknown_type) => {
-                tracing::warn!(
-                    "未知的提供商类型 '{}', 回退到存根模式",
-                    unknown_type
-                );
+                tracing::warn!("未知的提供商类型 '{}', 回退到存根模式", unknown_type);
                 Ok(self.stub_chat(request, &system_prompt))
             }
             (None, _) => {
@@ -166,11 +204,38 @@ impl JiaClawAgent {
         }
 
         // 添加技能摘要
-        if !request.enabled_skills.is_empty() {
-            prompt.push_str("\n\n## Enabled Skills\n");
-            for skill in &request.enabled_skills {
-                prompt.push_str(&format!("- {skill}\n"));
+        if !self.skills.is_empty() {
+            prompt.push_str("\n\n## Available Skills\n\n");
+            for skill in &self.skills {
+                prompt.push_str(&format!("- {}\n", skill.summary()));
             }
+
+            // 如果用户请求了特定技能，添加详细信息
+            if !request.enabled_skills.is_empty() {
+                prompt.push_str("\n### Enabled Skills (详细)\n");
+                for skill_name in &request.enabled_skills {
+                    if let Some(skill) = self.skills.iter().find(|s| &s.name == skill_name) {
+                        prompt.push_str(&format!("\n#### {}\n", skill.name));
+                        prompt.push_str(&skill.content);
+                        prompt.push('\n');
+                    }
+                }
+            }
+        }
+
+        // 添加可用工具列表
+        let tool_list = self.tools.list();
+        if !tool_list.is_empty() {
+            prompt.push_str("\n\n## Available Tools\n\n");
+            prompt.push_str("你可以使用以下工具来完成任务：\n");
+            for tool_name in tool_list {
+                if let Some(tool) = self.tools.get(tool_name) {
+                    prompt.push_str(&format!("- **{}**: {}\n", tool.name(), tool.description()));
+                }
+            }
+            prompt.push_str(
+                "\n注意：工具调用功能目前处于存根模式，完整实现需要等待 StateKnot M2。\n",
+            );
         }
 
         prompt
@@ -216,22 +281,61 @@ impl JiaClawAgent {
                 "你好！我是 {}。{}\n\n\
                  我目前运行在存根模式下，等待 StateKnot 框架集成。\n\
                  当前配置的最大对话轮次为 {} 轮。\n\n\
-                 你可以继续与我对话，我会尽力回应（虽然功能有限）。",
-                self.config.name, self.config.description, self.config.max_turns
+                 💡 可用功能（演示）：\n\
+                 • 工作空间已加载（{} 个文件）\n\
+                 • 发现了 {} 个技能\n\
+                 • 注册了 {} 个工具\n\n\
+                 试试问我：\"有什么工具\" 或 \"列出技能\"",
+                self.config.name,
+                self.config.description,
+                self.config.max_turns,
+                self.count_workspace_files(),
+                self.skills.len(),
+                self.tools.list().len()
             )
+        } else if user_lower.contains("工具") || user_lower.contains("tool") {
+            let tool_list = self.tools.list();
+            if tool_list.is_empty() {
+                "目前没有注册任何工具。".to_string()
+            } else {
+                let mut response = format!("🔧 已注册 {} 个本地工具：\n\n", tool_list.len());
+                for tool_name in tool_list {
+                    if let Some(tool) = self.tools.get(tool_name) {
+                        response.push_str(&format!(
+                            "• **{}**\n  {}\n\n",
+                            tool.name(),
+                            tool.description()
+                        ));
+                    }
+                }
+                response.push_str("注意：完整的工具执行需要等待 StateKnot M2 集成。\n");
+                response.push_str("当前在存根模式下，我可以描述工具但无法真正执行它们。");
+                response
+            }
+        } else if user_lower.contains("技能") || user_lower.contains("skill") {
+            if self.skills.is_empty() {
+                "目前没有发现任何技能。\n\n运行 'jiaclaw init' 会创建示例技能。".to_string()
+            } else {
+                let mut response = format!("🎯 发现 {} 个技能：\n\n", self.skills.len());
+                for skill in &self.skills {
+                    response.push_str(&format!("• {}\n\n", skill.summary()));
+                }
+                response.push_str("完整的技能系统将在 M3 实现。");
+                response
+            }
         } else if user_lower.contains("功能")
             || user_lower.contains("能力")
             || user_lower.contains("what can you do")
         {
             let tools_str = if request.enabled_tools.is_empty() {
-                "无".to_string()
+                format!("{} 个本地工具", self.tools.list().len())
             } else {
                 request.enabled_tools.join(", ")
             };
-            let skills_str = if request.enabled_skills.is_empty() {
+            let skills_str = if self.skills.is_empty() {
                 "无".to_string()
             } else {
-                request.enabled_skills.join(", ")
+                format!("{} 个技能", self.skills.len())
             };
 
             format!(
@@ -243,16 +347,22 @@ impl JiaClawAgent {
                  • 💾 持久化运行 - 支持重启后恢复\n\n\
                  ⚙️ 当前状态：\n\
                  • 存根实现，等待 StateKnot 集成\n\
-                 • 已启用工具：{}\n\
-                 • 已启用技能：{}\n\n\
+                 • 已注册工具：{}\n\
+                 • 已发现技能：{}\n\
+                 • 工作空间文件：{} 个已加载\n\n\
                  查看文档了解更多：docs/architecture.md",
-                self.config.name, tools_str, skills_str
+                self.config.name,
+                tools_str,
+                skills_str,
+                self.count_workspace_files()
             )
         } else if user_lower.contains("帮助") || user_lower.contains("help") {
             "📖 JiaClaw 帮助\n\n\
              命令:\n\
+             • `jiaclaw init` - 初始化工作空间\n\
              • `jiaclaw version` - 显示版本信息\n\
              • `jiaclaw chat <消息>` - 发送单次聊天消息\n\
+             • `jiaclaw doctor` - 检查配置和连接\n\
              • `jiaclaw serve` - 启动 HTTP 服务（计划中）\n\n\
              配置:\n\
              • 使用 `--config <文件>` 指定配置文件\n\
@@ -272,24 +382,36 @@ impl JiaClawAgent {
                  • 最大轮次: {}\n\n\
                  会话信息:\n\
                  • 历史消息数: {}\n\
-                 • 启用工具数: {}\n\
-                 • 启用技能数: {}\n\n\
+                 • 工作空间文件: {} 个\n\
+                 • 发现技能: {} 个\n\
+                 • 注册工具: {} 个\n\n\
                  系统状态:\n\
                  • 运行模式: 存根（Stub）\n\
                  • StateKnot 集成: 等待中\n\
-                 • 持久化: 未启用",
+                 • 持久化: 未启用\n\n\
+                 💡 提示：运行 'jiaclaw doctor' 检查配置",
                 self.config.name,
                 self.config.name,
                 self.config.description,
                 self.config.max_turns,
                 request.messages.len(),
-                request.enabled_tools.len(),
-                request.enabled_skills.len()
+                self.count_workspace_files(),
+                self.skills.len(),
+                self.tools.list().len()
             )
         } else if user_message.trim().is_empty() {
             "请发送一条消息开始对话。你可以说\"你好\"或询问\"你有什么功能\"。".to_string()
         } else {
             // 默认响应
+            let workspace_hint = if self.count_workspace_files() > 0 {
+                format!(
+                    "\n\n💡 我已加载了你的工作空间配置（{} 个文件），包括你的偏好和记忆。",
+                    self.count_workspace_files()
+                )
+            } else {
+                "\n\n💡 运行 'jiaclaw init' 创建工作空间以个性化我的行为。".to_string()
+            };
+
             format!(
                 "我收到了你的消息：\"{user_message}\"\n\n\
                  目前我运行在存根模式下，无法进行实际的自然语言理解或生成。\
@@ -297,10 +419,29 @@ impl JiaClawAgent {
                  • 理解复杂的自然语言输入\n\
                  • 使用模型生成智能回复\n\
                  • 调用工具完成实际任务\n\
-                 • 保持持久化的对话上下文\n\n\
-                 试试说\"帮助\"了解更多命令。"
+                 • 保持持久化的对话上下文{}\n\n\
+                 试试说\"帮助\"了解更多命令。",
+                workspace_hint
             )
         }
+    }
+
+    /// 统计工作空间文件数量
+    fn count_workspace_files(&self) -> usize {
+        let mut count = 0;
+        if self.workspace.agents.is_some() {
+            count += 1;
+        }
+        if self.workspace.soul.is_some() {
+            count += 1;
+        }
+        if self.workspace.user.is_some() {
+            count += 1;
+        }
+        if self.workspace.memory.is_some() {
+            count += 1;
+        }
+        count
     }
 }
 

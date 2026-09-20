@@ -258,16 +258,14 @@ mod tests {
 
     #[test]
     fn test_provider_creation() {
-        let provider =
-            BrokerrouterProvider::new("https://api.brokerrouter.dev", "brk_test_key");
+        let provider = BrokerrouterProvider::new("https://api.brokerrouter.dev", "brk_test_key");
         assert_eq!(provider.base_url, "https://api.brokerrouter.dev");
         assert_eq!(provider.virtual_key, "brk_test_key");
     }
 
     #[test]
     fn test_provider_trims_slash() {
-        let provider =
-            BrokerrouterProvider::new("https://api.brokerrouter.dev/", "brk_test_key");
+        let provider = BrokerrouterProvider::new("https://api.brokerrouter.dev/", "brk_test_key");
         assert_eq!(provider.base_url, "https://api.brokerrouter.dev");
     }
 
@@ -374,9 +372,7 @@ mod tests {
         // 验证错误
         assert!(response.is_err());
         let err = response.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Brokerrouter 返回错误状态 401"));
+        assert!(err.to_string().contains("Brokerrouter 返回错误状态 401"));
     }
 
     #[tokio::test]
