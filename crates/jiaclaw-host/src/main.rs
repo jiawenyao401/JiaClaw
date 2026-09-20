@@ -4,10 +4,19 @@
 //! `JiaClaw` 可执行宿主
 
 use anyhow::{Context, Result};
+use axum::{
+    extract::State,
+    http::{Method, StatusCode},
+    response::{IntoResponse, Json},
+    routing::{get, post},
+    Router,
+};
 use clap::{Parser, Subcommand};
 use jiaclaw::{JiaClawAgent, Workspace};
-use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, MessageRole};
-use std::path::PathBuf;
+use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole};
+use serde::{Deserialize, Serialize};
+use std::{path::PathBuf, sync::Arc};
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Parser)]
 #[command(name = "jiaclaw")]
@@ -141,26 +150,137 @@ fn init_command(path: Option<PathBuf>, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn serve_command(_config: Option<PathBuf>, bind: String) -> Result<()> {
+/// HTTP 服务的共享状态
+#[derive(Clone)]
+struct AppState {
+    agent: Arc<JiaClawAgent>,
+}
+
+/// 健康检查响应
+#[derive(Debug, Serialize, Deserialize)]
+struct HealthResponse {
+    status: String,
+    agent_name: String,
+    version: String,
+}
+
+async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()> {
     tracing::info!("正在启动 JiaClaw Agent 服务于 {}", bind);
 
-    tracing::warn!(
-        "服务模式尚未完全实现。StateKnot AgentHost 和 HTTP 服务需要：\n\
-         - 稳定的 AgentHost API\n\
-         - PostgreSQL 连接配置\n\
-         - 身份验证和授权集成\n\
-         参见 docs/stateknot-gaps.md 了解详细信息。"
+    // 加载配置
+    let config = if let Some(path) = config_path {
+        let path_str = path.to_string_lossy();
+        if path_str.ends_with(".toml") {
+            AgentConfig::from_toml_file(&path)?
+        } else if path_str.ends_with(".json") {
+            AgentConfig::from_json_file(&path)?
+        } else {
+            AgentConfig::from_toml_file(&path).or_else(|_| AgentConfig::from_json_file(&path))?
+        }
+    } else {
+        AgentConfig::default()
+    };
+
+    tracing::info!("使用 Agent 配置: {}", config.name);
+
+    // 创建 agent
+    let agent = JiaClawAgent::new(config).context("创建 JiaClawAgent 失败")?;
+    let state = AppState {
+        agent: Arc::new(agent),
+    };
+
+    // 配置 CORS（允许所有来源，生产环境应该更严格）
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(Any);
+
+    // 构建路由
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/api/chat", post(chat_handler))
+        .layer(cors)
+        .with_state(state);
+
+    // 绑定地址
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("无法绑定到地址: {bind}"))?;
+
+    tracing::info!("✅ HTTP 服务已启动于 http://{}", bind);
+    tracing::info!("   • GET  /health    - 健康检查");
+    tracing::info!("   • POST /api/chat  - 聊天端点");
+    tracing::info!("\n💡 试试：curl http://{}/health", bind);
+    tracing::info!("按 Ctrl+C 停止服务");
+
+    // 启动服务器
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("服务器运行失败")?;
+
+    tracing::info!("服务器已关闭");
+    Ok(())
+}
+
+/// 健康检查处理器
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let response = HealthResponse {
+        status: "ok".to_string(),
+        agent_name: state.agent.config().name.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    Json(response)
+}
+
+/// 聊天处理器
+async fn chat_handler(
+    State(state): State<AppState>,
+    Json(request): Json<ChatRequest>,
+) -> Result<Json<ChatResponse>, AppError> {
+    tracing::info!("收到聊天请求，消息数: {}", request.messages.len());
+
+    let response = state
+        .agent
+        .chat(&request)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    tracing::info!(
+        "聊天响应生成，状态: {:?}, 工具调用数: {}",
+        response.status,
+        response.tool_calls.len()
     );
 
-    tracing::info!("服务存根已创建。按 Ctrl+C 退出。");
+    Ok(Json(response))
+}
 
-    // 等待 Ctrl+C
+/// 应用错误类型
+#[derive(Debug)]
+enum AppError {
+    Internal(String),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, message) = match self {
+            Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        };
+
+        let body = serde_json::json!({
+            "error": message,
+        });
+
+        (status, Json(body)).into_response()
+    }
+}
+
+/// 优雅关闭信号
+async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
-        .context("等待 Ctrl+C 信号失败")?;
-
-    tracing::info!("正在关闭...");
-    Ok(())
+        .expect("等待 Ctrl+C 信号失败");
+    tracing::info!("收到关闭信号，正在停止服务器...");
 }
 
 async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()> {
@@ -388,4 +508,128 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use jiaclaw_core::{ChatMessage, ChatRequest, MessageRole};
+    use tower::ServiceExt;
+
+    fn create_test_app() -> Router {
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let state = AppState {
+            agent: Arc::new(agent),
+        };
+
+        Router::new()
+            .route("/health", get(health_handler))
+            .route("/api/chat", post(chat_handler))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.agent_name, "JiaClaw");
+        assert!(!health.version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_endpoint() {
+        let app = create_test_app();
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "你好".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+        };
+
+        let request_body = serde_json::to_string(&request).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let chat_response: ChatResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(!chat_response.message.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_endpoint_with_tool_call() {
+        let app = create_test_app();
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "列出工作空间".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+        };
+
+        let request_body = serde_json::to_string(&request).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let chat_response: ChatResponse = serde_json::from_slice(&body).unwrap();
+
+        // 在存根模式下，应该触发工具调用
+        assert!(
+            !chat_response.tool_calls.is_empty(),
+            "应该有工具调用"
+        );
+        assert_eq!(chat_response.tool_calls[0].tool_name, "workspace_list");
+    }
 }
