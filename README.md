@@ -56,6 +56,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 自动幂等性密钥生成
   - 非流式聊天补全
   - 请求追踪和错误处理
+- ✅ **HTTP 服务** - 基础 REST API 支持
+  - Webhook 入站通道（`POST /hooks/inbound`）
+  - Session 管理和历史持久化
+  - 可选的 webhook secret 鉴权
 
 ### 待实现
 
@@ -131,8 +135,22 @@ cargo run --bin jiaclaw -- chat "你好，JiaClaw"
 # 或使用配置文件
 cargo run --bin jiaclaw -- chat --config config/jiaclaw.toml "你好，JiaClaw"
 
-# 启动服务（存根实现）
+# 启动 HTTP 服务
 cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
+
+# 测试 Webhook 入站
+curl -X POST http://127.0.0.1:8080/hooks/inbound \
+  -H "Content-Type: application/json" \
+  -d '{"chat_id": "test-123", "text": "你好"}'
+
+# 使用 Webhook Secret 鉴权
+export JIACLAW_WEBHOOK_SECRET=my-secret-token
+cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
+
+curl -X POST http://127.0.0.1:8080/hooks/inbound \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: my-secret-token" \
+  -d '{"chat_id": "test-123", "text": "你好"}'
 ```
 
 **注意**：

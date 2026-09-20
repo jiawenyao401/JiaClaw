@@ -51,21 +51,32 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
-| **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ 基础（存根） | P1 | - |
-| **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ⏳ 计划中 | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentHost API |
+| **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ 基础 | P1 | - |
+| **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ✅ 基础（Axum） | P1 | - |
+| **Webhook 入站** | ✅ 支持 | ❌ 无 | ✅ **已实现** | P1 | - |
 | **SSE 事件流** | ✅ 支持 | ⏳ 部分 | ⏳ 计划中 | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
 | **WebSocket** | ⏳ 社区贡献 | ❌ 无 | ⏳ 计划中（M4） | P2 | - |
 | **Discord/Slack** | ✅ 插件支持 | ❌ 无 | ⏳ 计划中（通过 MCP） | P2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) MCP 集成 |
+| **Telegram** | ✅ 插件支持 | ❌ 无 | ⏳ 计划中（通过 MCP） | P2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) MCP 集成 |
 | **gRPC** | ❌ 无 | ❌ 无 | ⏳ 可选（通过 StateKnot） | P2 | - |
 
 **JiaClaw 现状**:
-- ✅ CLI 存根已实现（`jiaclaw chat`, `jiaclaw serve`）
-- ❌ HTTP 服务需要 StateKnot `AgentHost` 和身份验证集成
+- ✅ CLI 已实现（`jiaclaw chat`, `jiaclaw serve`）
+- ✅ **HTTP 服务已实现** - 基于 Axum 的 REST API
+  - `POST /hooks/inbound` - 通用 Webhook 入站端点
+  - Session 管理（基于 `chat_id` 的历史持久化）
+  - 可选的 `X-Webhook-Secret` header 鉴权
 - ❌ SSE 事件流需要 `DurableAgentRuns` 的事件订阅 API
+- ❌ Discord/Slack/Telegram bot 需要实现协议适配器
 
 **目标方案**:
-- **P1 HTTP/SSE**: 等待 StateKnot [#92](https://github.com/StateKnot/StateKnot/issues/92) 稳定后实现 `AgentHost` 集成
-- **P2 Discord/Slack**: 通过 MCP 协议适配器，复用 StateKnot 的 `McpRemoteTool` 机制
+- **P1 Webhook 入站**: ✅ **已完成**（本 PR）
+  - 实现 `POST /hooks/inbound` 端点
+  - 使用 `webhook:{chat_id}` 作为 session ID
+  - 支持可选的 `JIACLAW_WEBHOOK_SECRET` 环境变量鉴权
+  - 复用现有的 agent 聊天循环和工具系统
+- **P1 SSE 事件流**: 等待 StateKnot [#92](https://github.com/StateKnot/StateKnot/issues/92) 稳定后实现
+- **P2 Discord/Slack/Telegram**: 通过 Webhook 入站统一接入（外部 bot 转发到 `/hooks/inbound`）或实现原生 MCP 适配器
 
 ---
 

@@ -9,6 +9,8 @@ use jiaclaw::{JiaClawAgent, Workspace};
 use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, MessageRole};
 use std::path::PathBuf;
 
+mod http;
+
 #[derive(Parser)]
 #[command(name = "jiaclaw")]
 #[command(about = "JiaClaw - 基于 StateKnot 的个人持久化智能体运行时", long_about = None)]
@@ -141,25 +143,26 @@ fn init_command(path: Option<PathBuf>, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn serve_command(_config: Option<PathBuf>, bind: String) -> Result<()> {
+async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()> {
     tracing::info!("正在启动 JiaClaw Agent 服务于 {}", bind);
 
-    tracing::warn!(
-        "服务模式尚未完全实现。StateKnot AgentHost 和 HTTP 服务需要：\n\
-         - 稳定的 AgentHost API\n\
-         - PostgreSQL 连接配置\n\
-         - 身份验证和授权集成\n\
-         参见 docs/stateknot-gaps.md 了解详细信息。"
-    );
+    let config = if let Some(path) = config_path {
+        let path_str = path.to_string_lossy();
+        if path_str.ends_with(".toml") {
+            AgentConfig::from_toml_file(&path)?
+        } else if path_str.ends_with(".json") {
+            AgentConfig::from_json_file(&path)?
+        } else {
+            AgentConfig::from_toml_file(&path).or_else(|_| AgentConfig::from_json_file(&path))?
+        }
+    } else {
+        AgentConfig::default()
+    };
 
-    tracing::info!("服务存根已创建。按 Ctrl+C 退出。");
+    tracing::info!("使用 Agent 配置: {}", config.name);
 
-    // 等待 Ctrl+C
-    tokio::signal::ctrl_c()
-        .await
-        .context("等待 Ctrl+C 信号失败")?;
+    http::serve(&bind, config).await?;
 
-    tracing::info!("正在关闭...");
     Ok(())
 }
 

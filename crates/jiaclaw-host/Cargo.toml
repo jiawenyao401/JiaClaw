@@ -12,6 +12,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[lib]
+name = "jiaclaw_host"
+path = "src/lib.rs"
+
 [[bin]]
 name = "jiaclaw"
 path = "src/main.rs"
@@ -33,6 +37,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
+
+# HTTP server dependencies
+axum = "0.7"
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["trace"] }
 
 [lints]
 workspace = true
