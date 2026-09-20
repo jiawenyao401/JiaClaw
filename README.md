@@ -157,6 +157,20 @@ curl -X POST http://127.0.0.1:8080/api/chat \
 curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \
   -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"我是谁？\"}]}"
+
+# Webhook 入站（无需鉴权）
+curl -X POST http://127.0.0.1:8080/hooks/inbound \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "webhook", "chat_id": "user123", "text": "你好，通过 webhook"}'
+
+# Webhook 入站（带鉴权）
+export JIACLAW_WEBHOOK_SECRET=my_secret_key
+cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
+
+curl -X POST http://127.0.0.1:8080/hooks/inbound \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: my_secret_key" \
+  -d '{"channel": "webhook", "chat_id": "user456", "text": "认证的消息", "username": "alice"}'
 ```
 
 **注意**：
@@ -337,6 +351,20 @@ curl -X POST http://127.0.0.1:8080/api/chat \
 curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \
   -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"What is my name?\"}]}"
+
+# Webhook inbound (no auth)
+curl -X POST http://127.0.0.1:8080/hooks/inbound \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "webhook", "chat_id": "user123", "text": "Hello via webhook"}'
+
+# Webhook inbound (with auth)
+export JIACLAW_WEBHOOK_SECRET=my_secret_key
+cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
+
+curl -X POST http://127.0.0.1:8080/hooks/inbound \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: my_secret_key" \
+  -d '{"channel": "webhook", "chat_id": "user456", "text": "Authenticated message", "username": "alice"}'
 ```
 
 **Note**:
