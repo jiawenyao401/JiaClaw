@@ -55,15 +55,27 @@ enum Commands {
         bind: Option<String>,
     },
 
-    /// 运行单次聊天（用于测试）
+    /// 运行聊天（支持单次消息或交互式 REPL）
     Chat {
         /// 配置文件路径
         #[arg(short, long, value_name = "FILE")]
         config: Option<PathBuf>,
 
-        /// 用户消息
+        /// 用户消息（如果提供，则执行单次聊天；否则进入 REPL）
         #[arg(value_name = "MESSAGE")]
-        message: String,
+        message: Option<String>,
+
+        /// 启用的技能列表（可重复使用）
+        #[arg(short, long = "skill", value_name = "NAME")]
+        skills: Vec<String>,
+
+        /// 会话 ID（可选，用于恢复历史对话）
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+
+        /// 禁用技能自动激活
+        #[arg(long)]
+        no_auto_skill: bool,
     },
 
     /// 显示版本和构建信息
@@ -107,8 +119,14 @@ async fn main() -> Result<()> {
         Commands::Serve { config, bind } => {
             serve_command(config, bind).await?;
         }
-        Commands::Chat { config, message } => {
-            chat_command(config, &message).await?;
+        Commands::Chat {
+            config,
+            message,
+            skills,
+            session,
+            no_auto_skill,
+        } => {
+            chat_command(config, message.as_deref(), skills, session, no_auto_skill).await?;
         }
         Commands::Version => {
             version_command();
@@ -906,9 +924,13 @@ fn save_sessions(path: &PathBuf, sessions: &HashMap<String, Vec<ChatMessage>>) -
     Ok(())
 }
 
-async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()> {
-    tracing::info!("运行单次聊天");
-
+async fn chat_command(
+    config_path: Option<PathBuf>,
+    message: Option<&str>,
+    skills: Vec<String>,
+    session_id: Option<String>,
+    no_auto_skill: bool,
+) -> Result<()> {
     let config = if let Some(path) = config_path {
         let path_str = path.to_string_lossy();
         if path_str.ends_with(".toml") {
@@ -916,7 +938,6 @@ async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()>
         } else if path_str.ends_with(".json") {
             AgentConfig::from_json_file(&path)?
         } else {
-            // 尝试两种格式
             AgentConfig::from_toml_file(&path).or_else(|_| AgentConfig::from_json_file(&path))?
         }
     } else {
@@ -934,14 +955,44 @@ async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()>
     // 创建并使用 agent
     let agent = JiaClawAgent::new(config).context("创建 JiaClawAgent 失败")?;
 
+    // 如果提供了消息，执行单次聊天
+    if let Some(msg) = message {
+        tracing::info!("运行单次聊天");
+        single_chat(&agent, msg, &skills, session_id, no_auto_skill).await?;
+    } else {
+        // 否则进入 REPL 模式
+        tracing::info!("进入 REPL 模式");
+        repl_chat(&agent, &skills, session_id, no_auto_skill).await?;
+    }
+
+    Ok(())
+}
+
+/// 单次聊天模式
+async fn single_chat(
+    agent: &JiaClawAgent,
+    message: &str,
+    skills: &[String],
+    session_id: Option<String>,
+    no_auto_skill: bool,
+) -> Result<()> {
+    let enabled_skills = if no_auto_skill {
+        // 如果禁用自动技能激活，清空技能列表
+        // TODO: 未来 API 应该直接支持 no_auto_skill 标志
+        tracing::info!("已禁用技能自动激活");
+        vec![]
+    } else {
+        skills.to_vec()
+    };
+
     let request = ChatRequest {
         messages: vec![ChatMessage {
             role: MessageRole::User,
             content: message.to_string(),
         }],
         enabled_tools: vec![],
-        enabled_skills: vec![],
-        session_id: None,
+        enabled_skills,
+        session_id: session_id.clone(),
     };
 
     tracing::info!("用户消息: {}", message);
@@ -956,13 +1007,23 @@ async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()>
             if let Some(ref result) = tool_call.result {
                 if let Some(result_str) = result.as_str() {
                     // 结果是字符串，直接显示
-                    println!("     结果: {}", result_str.lines().take(3).collect::<Vec<_>>().join("\n     "));
+                    println!(
+                        "     结果: {}",
+                        result_str
+                            .lines()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join("\n     ")
+                    );
                     if result_str.lines().count() > 3 {
                         println!("     ...");
                     }
                 } else {
                     // 结果是其他 JSON，格式化显示
-                    println!("     结果: {}", serde_json::to_string_pretty(result).unwrap_or_default());
+                    println!(
+                        "     结果: {}",
+                        serde_json::to_string_pretty(result).unwrap_or_default()
+                    );
                 }
             }
         }
@@ -972,6 +1033,116 @@ async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()>
     println!("\n助手回复:");
     println!("{}", response.message.content);
     println!("\n状态: {:?}", response.status);
+    
+    if let Some(sid) = session_id {
+        println!("会话 ID: {sid}");
+    }
+
+    Ok(())
+}
+
+/// REPL 多轮对话模式
+async fn repl_chat(
+    agent: &JiaClawAgent,
+    skills: &[String],
+    session_id: Option<String>,
+    no_auto_skill: bool,
+) -> Result<()> {
+    use std::io::{self, Write};
+
+    println!("\n🦀 JiaClaw REPL 模式");
+    println!("输入消息开始对话，输入 'exit'、'quit' 或按 Ctrl+D 退出\n");
+
+    if !skills.is_empty() {
+        println!("✨ 启用的技能: {}", skills.join(", "));
+    }
+    if no_auto_skill {
+        println!("⚠️  技能自动激活已禁用");
+    }
+    if let Some(ref sid) = session_id {
+        println!("📝 会话 ID: {sid}");
+    }
+    println!();
+
+    // 维护会话历史
+    let mut history: Vec<ChatMessage> = Vec::new();
+    let enabled_skills = skills.to_vec();
+
+    loop {
+        // 显示提示符
+        print!("👤 > ");
+        io::stdout().flush()?;
+
+        // 读取用户输入
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(0) => {
+                // EOF (Ctrl+D)
+                println!("\n👋 再见！");
+                break;
+            }
+            Ok(_) => {
+                let trimmed = input.trim();
+
+                // 检查退出命令
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == "exit" || trimmed == "quit" {
+                    println!("👋 再见！");
+                    break;
+                }
+
+                // 添加用户消息到历史
+                let user_message = ChatMessage {
+                    role: MessageRole::User,
+                    content: trimmed.to_string(),
+                };
+                history.push(user_message);
+
+                // 构建请求
+                let request = ChatRequest {
+                    messages: history.clone(),
+                    enabled_tools: vec![],
+                    enabled_skills: if no_auto_skill {
+                        vec![]
+                    } else {
+                        enabled_skills.clone()
+                    },
+                    session_id: session_id.clone(),
+                };
+
+                // 调用 agent
+                match agent.chat(&request).await {
+                    Ok(response) => {
+                        // 显示工具调用（如果有）
+                        if !response.tool_calls.is_empty() {
+                            println!("\n🔧 工具调用:");
+                            for tool_call in &response.tool_calls {
+                                println!("   • {}", tool_call.tool_name);
+                            }
+                            println!();
+                        }
+
+                        // 显示助手回复
+                        println!("🤖 {}\n", response.message.content);
+
+                        // 添加助手消息到历史
+                        history.push(response.message);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ 错误: {e}\n");
+                        // 失败时从历史中移除刚才的用户消息
+                        history.pop();
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ 读取输入失败: {e}");
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1065,6 +1236,7 @@ fn skills_command(config_path: Option<PathBuf>, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("🔍 JiaClaw 配置检查\n");
 

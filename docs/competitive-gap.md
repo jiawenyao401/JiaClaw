@@ -51,7 +51,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
-| **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ 基础 | P1 | - |
+| **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ **完整（REPL+参数）** | P1 | - |
 | **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ✅ **基础（axum）** | P1 | - |
 | **Session（内存）** | ✅ 支持 | ⏳ 部分 | ✅ **已实现** | P1 | - |
 | **Session（落盘）** | ✅ 支持 | ⏳ 部分 | ✅ **可选落盘** | P1 | - |
@@ -65,6 +65,10 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 **JiaClaw 现状**:
 - ✅ CLI 已实现（`jiaclaw chat`, `jiaclaw serve`）
+  - ✅ 单次聊天模式：`jiaclaw chat "消息"`
+  - ✅ REPL 交互模式：`jiaclaw chat`（支持多轮对话）
+  - ✅ 技能开关：`--skill <name>` 可重复使用，`--no-auto-skill` 禁用自动激活
+  - ✅ 会话管理：`--session <id>` 续聊支持
 - ✅ HTTP 服务已实现（GET /health, POST /api/chat, GET /api/tools, GET /api/skills）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史，自动截断超长历史）
 - ✅ **Session 可选落盘**（`[http] persist = true`，进程重启后可恢复历史，原子写入，自动处理损坏文件）

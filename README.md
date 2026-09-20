@@ -158,8 +158,43 @@ cargo run --bin jiaclaw -- chat "你好，JiaClaw"
 # 或使用配置文件
 cargo run --bin jiaclaw -- chat --config config/jiaclaw.toml "你好，JiaClaw"
 
+# 启动交互式 REPL 模式
+cargo run --bin jiaclaw -- chat
+
+# REPL 模式支持多种选项
+cargo run --bin jiaclaw -- chat --skill calculator --skill web_search  # 启用特定技能
+cargo run --bin jiaclaw -- chat --session my-session-id                 # 使用会话 ID
+cargo run --bin jiaclaw -- chat --no-auto-skill                         # 禁用自动技能激活
+
 # 启动 HTTP 服务
 cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
+
+### REPL 交互式对话示例
+
+```bash
+# 进入 REPL 模式（不提供消息参数）
+cargo run --bin jiaclaw -- chat
+
+# 在 REPL 中：
+# 👤 > 你好
+# 🤖 你好！我是 JiaClaw...
+#
+# 👤 > 列出工作空间
+# 🔧 工具调用:
+#    • workspace_list
+# 🤖 根据工具执行结果，操作已完成...
+#
+# 👤 > exit
+# 👋 再见！
+```
+
+**REPL 支持的选项：**
+- `--skill <name>`: 启用特定技能（可多次使用）
+- `--session <id>`: 指定会话 ID，便于续聊
+- `--no-auto-skill`: 禁用技能自动激活
+- 输入 `exit` 或 `quit` 退出，或按 `Ctrl+D`
+
+### HTTP API 示例
 
 # 测试 HTTP API
 curl http://127.0.0.1:8080/health
@@ -381,8 +416,41 @@ cargo run --bin jiaclaw -- chat "Hello, JiaClaw"
 # Or use config file
 cargo run --bin jiaclaw -- chat --config config/jiaclaw.toml "Hello, JiaClaw"
 
+# Start interactive REPL mode
+cargo run --bin jiaclaw -- chat
+
+# REPL mode supports various options
+cargo run --bin jiaclaw -- chat --skill calculator --skill web_search  # Enable specific skills
+cargo run --bin jiaclaw -- chat --session my-session-id                 # Use session ID
+cargo run --bin jiaclaw -- chat --no-auto-skill                         # Disable auto skill activation
+
 # Start HTTP service
 cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
+
+#### REPL Interactive Chat Example
+
+```bash
+# Enter REPL mode (without message argument)
+cargo run --bin jiaclaw -- chat
+
+# In REPL:
+# 👤 > Hello
+# 🤖 Hello! I'm JiaClaw...
+#
+# 👤 > list workspace
+# 🔧 Tool calls:
+#    • workspace_list
+# 🤖 Based on the tool execution results...
+#
+# 👤 > exit
+# 👋 Goodbye!
+```
+
+**REPL Options:**
+- `--skill <name>`: Enable specific skills (can be used multiple times)
+- `--session <id>`: Specify session ID for conversation continuity
+- `--no-auto-skill`: Disable automatic skill activation
+- Type `exit` or `quit` to exit, or press `Ctrl+D`
 
 # Test HTTP API
 curl http://127.0.0.1:8080/health
