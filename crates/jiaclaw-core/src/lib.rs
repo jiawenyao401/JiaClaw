@@ -288,11 +288,24 @@ impl AgentConfig {
         #[derive(Deserialize)]
         struct ConfigFile {
             agent: AgentConfig,
+            #[serde(default)]
+            provider: Option<ProviderConfig>,
+            #[serde(default)]
+            http: Option<HttpConfig>,
         }
 
-        let config: ConfigFile = toml::from_str(content)
+        let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
-        Ok(config.agent)
+        
+        // 如果顶层有 provider 或 http 配置，覆盖 agent 中的配置
+        if let Some(provider) = config_file.provider {
+            config_file.agent.provider = provider;
+        }
+        if let Some(http) = config_file.http {
+            config_file.agent.http = http;
+        }
+        
+        Ok(config_file.agent)
     }
 
     /// 从 JSON 文件加载配置
@@ -315,10 +328,23 @@ impl AgentConfig {
         #[derive(Deserialize)]
         struct ConfigFile {
             agent: AgentConfig,
+            #[serde(default)]
+            provider: Option<ProviderConfig>,
+            #[serde(default)]
+            http: Option<HttpConfig>,
         }
 
-        let config: ConfigFile = serde_json::from_str(content)
+        let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
-        Ok(config.agent)
+        
+        // 如果顶层有 provider 或 http 配置，覆盖 agent 中的配置
+        if let Some(provider) = config_file.provider {
+            config_file.agent.provider = provider;
+        }
+        if let Some(http) = config_file.http {
+            config_file.agent.http = http;
+        }
+        
+        Ok(config_file.agent)
     }
 }

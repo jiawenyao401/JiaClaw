@@ -50,9 +50,9 @@ enum Commands {
         #[arg(short, long, value_name = "FILE")]
         config: Option<PathBuf>,
 
-        /// 绑定地址
-        #[arg(short, long, default_value = "127.0.0.1:8080")]
-        bind: String,
+        /// 绑定地址（覆盖配置文件）
+        #[arg(short, long)]
+        bind: Option<String>,
     },
 
     /// 运行单次聊天（用于测试）
@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn init_command(path: Option<PathBuf>, force: bool) -> Result<()> {
     let workspace_path = path.unwrap_or_else(|| {
         dirs::home_dir()
@@ -202,7 +203,8 @@ struct InboundWebhookResponse {
     error: Option<String>,
 }
 
-async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()> {
+#[allow(clippy::too_many_lines)]
+async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Result<()> {
     // 加载配置
     let mut config = if let Some(path) = config_path {
         let path_str = path.to_string_lossy();
@@ -217,8 +219,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
         AgentConfig::default()
     };
 
-    // 命令行参数覆盖配置文件
-    config.http.bind = bind;
+    // 命令行参数覆盖配置文件（如果提供）
+    if let Some(bind_addr) = bind {
+        config.http.bind = bind_addr;
+    }
 
     tracing::info!("正在启动 JiaClaw Agent 服务");
     tracing::info!("使用 Agent 配置: {}", config.name);
