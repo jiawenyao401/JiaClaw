@@ -1,0 +1,15 @@
+{
+  "agent": {
+    "name": "JiaClaw",
+    "description": "Personal durable agent runtime",
+    "system_instructions": "You are JiaClaw, a helpful personal assistant.",
+    "max_turns": 10
+  },
+  "server": {
+    "bind": "127.0.0.1:8080",
+    "timeout": 300
+  },
+  "logging": {
+    "level": "info"
+  }
+}

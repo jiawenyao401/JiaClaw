@@ -1,0 +1,28 @@
+# Copyright 2026 JiaClaw contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+[package]
+name = "jiaclaw"
+description = "Personal durable agent runtime built on StateKnot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+jiaclaw-core = { version = "=0.1.0", path = "../jiaclaw-core" }
+
+# StateKnot dependencies - commented out until Rust edition 2024 support
+# stateknot-core = { workspace = true }
+# stateknot-runtime = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
