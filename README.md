@@ -56,6 +56,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 自动幂等性密钥生成
   - 非流式聊天补全
   - 请求追踪和错误处理
+- ✅ **Session 可选落盘** - 进程重启后可恢复多轮对话历史
+  - 可配置的持久化开关
+  - 原子写入保证数据安全
+  - 自动处理文件损坏情况
 
 ### 待实现
 
@@ -119,6 +123,10 @@ bind = "127.0.0.1:8080"
 cors_allow_origins = ["*"]
 # 或限制特定来源：
 # cors_allow_origins = ["https://example.com"]
+
+# Session 持久化配置（可选）
+persist = true  # 启用 session 持久化
+persist_path = ".jiaclaw/sessions.json"
 ```
 
 或使用环境变量：
@@ -271,6 +279,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Automatic idempotency key generation
   - Non-streaming chat completions
   - Request tracing and error handling
+- ✅ **Optional Session Persistence** - Restore multi-turn conversations after restart
+  - Configurable persistence toggle
+  - Atomic writes for data safety
+  - Automatic handling of corrupted files
 
 #### Pending
 
@@ -334,6 +346,10 @@ bind = "127.0.0.1:8080"
 cors_allow_origins = ["*"]
 # Or restrict to specific origins:
 # cors_allow_origins = ["https://example.com"]
+
+# Session persistence config (optional)
+persist = true  # Enable session persistence
+persist_path = ".jiaclaw/sessions.json"
 ```
 
 Or use environment variable:

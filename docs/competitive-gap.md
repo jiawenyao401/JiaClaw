@@ -54,6 +54,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ 基础 | P1 | - |
 | **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ✅ **基础（axum）** | P1 | - |
 | **Session（内存）** | ✅ 支持 | ⏳ 部分 | ✅ **已实现** | P1 | - |
+| **Session（落盘）** | ✅ 支持 | ⏳ 部分 | ✅ **可选落盘** | P1 | - |
 | **工具列表 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/tools** | P1 | - |
 | **技能列表 API** | ✅ 支持 | ❌ 无 | ✅ **GET /api/skills** | P1 | - |
 | **Webhook 入站** | ✅ 支持 | ⏳ 部分 | ✅ **POST /hooks/inbound** | P1 | - |
@@ -66,6 +67,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ CLI 已实现（`jiaclaw chat`, `jiaclaw serve`）
 - ✅ HTTP 服务已实现（GET /health, POST /api/chat, GET /api/tools, GET /api/skills）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史，自动截断超长历史）
+- ✅ **Session 可选落盘**（`[http] persist = true`，进程重启后可恢复历史，原子写入，自动处理损坏文件）
 - ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
 - ✅ 技能列表 API（GET /api/skills 列出已发现技能）
 - ✅ Webhook 入站 API（POST /hooks/inbound，支持可选鉴权，自动 session 管理）
