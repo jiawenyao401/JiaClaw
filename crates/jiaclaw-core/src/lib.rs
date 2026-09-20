@@ -69,6 +69,10 @@ pub struct ChatRequest {
     /// 启用的技能列表（可选）
     #[serde(default)]
     pub enabled_skills: Vec<String>,
+
+    /// 会话 ID（可选，用于多轮对话）
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// `JiaClaw` 聊天响应
@@ -83,6 +87,10 @@ pub struct ChatResponse {
 
     /// 运行状态
     pub status: RunStatus,
+
+    /// 会话 ID（如果请求中提供）
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// 工具调用记录
