@@ -455,6 +455,7 @@ impl JiaClawAgent {
     }
 
     /// 生成存根响应（演示用）
+    #[allow(clippy::too_many_lines)]
     fn generate_stub_response(
         &self,
         user_message: &str,

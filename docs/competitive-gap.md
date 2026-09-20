@@ -54,6 +54,8 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ 基础 | P1 | - |
 | **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ✅ **基础（axum）** | P1 | - |
 | **Session（内存）** | ✅ 支持 | ⏳ 部分 | ✅ **已实现** | P1 | - |
+| **工具列表 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/tools** | P1 | - |
+| **技能列表 API** | ✅ 支持 | ❌ 无 | ✅ **GET /api/skills** | P1 | - |
 | **SSE 事件流** | ✅ 支持 | ⏳ 部分 | ⏳ 计划中 | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
 | **WebSocket** | ⏳ 社区贡献 | ❌ 无 | ⏳ 计划中（M4） | P2 | - |
 | **Discord/Slack** | ✅ 插件支持 | ❌ 无 | ⏳ 计划中（通过 MCP） | P2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) MCP 集成 |
@@ -61,8 +63,10 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 **JiaClaw 现状**:
 - ✅ CLI 已实现（`jiaclaw chat`, `jiaclaw serve`）
-- ✅ HTTP 服务已实现（GET /health, POST /api/chat）
-- ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史）
+- ✅ HTTP 服务已实现（GET /health, POST /api/chat, GET /api/tools, GET /api/skills）
+- ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史，自动截断超长历史）
+- ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
+- ✅ 技能列表 API（GET /api/skills 列出已发现技能）
 - ❌ SSE 事件流需要 `DurableAgentRuns` 的事件订阅 API
 
 **目标方案**:

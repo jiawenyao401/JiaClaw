@@ -24,6 +24,10 @@ pub struct Skill {
 
 impl Skill {
     /// 从 SKILL.md 文件解析技能
+    ///
+    /// # Errors
+    ///
+    /// 如果技能文件不存在或无法读取，返回错误。
     pub fn from_file(skill_dir: &Path) -> Result<Self, JiaClawError> {
         let skill_file = skill_dir.join("SKILL.md");
 
@@ -93,6 +97,7 @@ impl Skill {
     }
 
     /// 生成简短摘要（用于注入系统提示）
+    #[must_use]
     pub fn summary(&self) -> String {
         format!("**{}**: {}", self.name, self.description)
     }
@@ -106,6 +111,7 @@ pub struct SkillDiscovery {
 
 impl SkillDiscovery {
     /// 创建新的技能发现器
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         Self {
             skills_root: workspace_path.join("skills"),
@@ -113,6 +119,10 @@ impl SkillDiscovery {
     }
 
     /// 发现所有技能
+    ///
+    /// # Errors
+    ///
+    /// 如果无法读取技能目录或解析技能文件，返回错误。
     pub fn discover(&self) -> Result<Vec<Skill>, JiaClawError> {
         if !self.skills_root.exists() {
             tracing::debug!("技能目录不存在: {}", self.skills_root.display());
@@ -147,6 +157,10 @@ impl SkillDiscovery {
     }
 
     /// 查找特定技能
+    ///
+    /// # Errors
+    ///
+    /// 如果技能文件存在但无法解析，返回错误。
     pub fn find(&self, skill_name: &str) -> Result<Option<Skill>, JiaClawError> {
         let skill_dir = self.skills_root.join(skill_name);
 

@@ -43,7 +43,7 @@ pub struct ChatMessage {
 }
 
 /// 消息角色
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     /// 用户消息
