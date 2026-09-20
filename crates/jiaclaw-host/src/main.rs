@@ -98,10 +98,16 @@ fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()> {
     tracing::info!("运行单次聊天");
 
     let config = if let Some(path) = config_path {
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("无法读取配置文件: {path:?}"))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("无法解析配置文件: {path:?}"))?
+        let path_str = path.to_string_lossy();
+        if path_str.ends_with(".toml") {
+            AgentConfig::from_toml_file(&path)?
+        } else if path_str.ends_with(".json") {
+            AgentConfig::from_json_file(&path)?
+        } else {
+            // 尝试两种格式
+            AgentConfig::from_toml_file(&path)
+                .or_else(|_| AgentConfig::from_json_file(&path))?
+        }
     } else {
         AgentConfig::default()
     };
@@ -125,7 +131,7 @@ fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()> {
     tracing::info!("用户消息: {}", message);
 
     let response = agent
-        .chat(request)
+        .chat(&request)
         .context("聊天请求失败")?;
 
     println!("\n助手回复:");

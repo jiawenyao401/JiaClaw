@@ -134,3 +134,59 @@ impl Default for AgentConfig {
         }
     }
 }
+
+impl AgentConfig {
+    /// 从 TOML 文件加载配置
+    ///
+    /// # Errors
+    ///
+    /// 如果文件读取失败或解析失败，返回错误。
+    pub fn from_toml_file(path: impl AsRef<std::path::Path>) -> Result<Self, JiaClawError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| JiaClawError::Configuration(format!("无法读取配置文件: {e}")))?;
+        Self::from_toml_str(&content)
+    }
+
+    /// 从 TOML 字符串解析配置
+    ///
+    /// # Errors
+    ///
+    /// 如果解析失败，返回错误。
+    pub fn from_toml_str(content: &str) -> Result<Self, JiaClawError> {
+        #[derive(Deserialize)]
+        struct ConfigFile {
+            agent: AgentConfig,
+        }
+        
+        let config: ConfigFile = toml::from_str(content)
+            .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
+        Ok(config.agent)
+    }
+
+    /// 从 JSON 文件加载配置
+    ///
+    /// # Errors
+    ///
+    /// 如果文件读取失败或解析失败，返回错误。
+    pub fn from_json_file(path: impl AsRef<std::path::Path>) -> Result<Self, JiaClawError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| JiaClawError::Configuration(format!("无法读取配置文件: {e}")))?;
+        Self::from_json_str(&content)
+    }
+
+    /// 从 JSON 字符串解析配置
+    ///
+    /// # Errors
+    ///
+    /// 如果解析失败，返回错误。
+    pub fn from_json_str(content: &str) -> Result<Self, JiaClawError> {
+        #[derive(Deserialize)]
+        struct ConfigFile {
+            agent: AgentConfig,
+        }
+        
+        let config: ConfigFile = serde_json::from_str(content)
+            .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
+        Ok(config.agent)
+    }
+}

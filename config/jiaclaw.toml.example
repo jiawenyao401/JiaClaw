@@ -1,0 +1,115 @@
+# JiaClaw 配置示例
+# 复制此文件为 config/jiaclaw.toml 并根据需要调整
+
+[agent]
+# Agent 名称
+name = "JiaClaw"
+
+# Agent 描述
+description = "Personal durable agent runtime"
+
+# 系统指令
+system_instructions = """
+You are JiaClaw, a helpful personal assistant.
+You can use tools, manage skills, and maintain conversation context.
+Always be polite, concise, and accurate.
+"""
+
+# 最大对话轮次
+max_turns = 10
+
+[runtime]
+# StateKnot 运行时配置（当 StateKnot 集成可用时）
+# 
+# # PostgreSQL 连接字符串
+# database_url = "postgresql://user:password@localhost:5432/jiaclaw"
+#
+# # 租户 ID
+# tenant_id = "default"
+#
+# # 工作目录
+# work_dir = "/var/lib/jiaclaw"
+
+[server]
+# HTTP 服务器绑定地址
+bind = "127.0.0.1:8080"
+
+# 请求超时（秒）
+timeout = 300
+
+# 最大并发请求数
+max_concurrent_requests = 100
+
+[logging]
+# 日志级别: trace, debug, info, warn, error
+level = "info"
+
+# 日志格式: json, pretty, compact
+format = "pretty"
+
+# 日志输出: stdout, stderr, file
+output = "stdout"
+
+# 日志文件路径（当 output = "file" 时）
+# file_path = "/var/log/jiaclaw/jiaclaw.log"
+
+[tools]
+# 启用的工具列表（示例）
+enabled = [
+    # "search",
+    # "calculator",
+    # "file_operations",
+]
+
+# MCP 服务器配置（示例）
+# [[tools.mcp_servers]]
+# name = "example-server"
+# url = "http://localhost:3000"
+# auth_token = "your-token-here"
+
+[skills]
+# 启用的技能列表（示例）
+enabled = [
+    # "file_management",
+    # "web_search",
+    # "code_assistant",
+]
+
+# 技能加载路径
+# skill_paths = [
+#     "./skills",
+#     "~/.jiaclaw/skills",
+# ]
+
+[limits]
+# 资源限制配置
+
+# 最大消息长度（字符）
+max_message_length = 10000
+
+# 最大会话历史长度
+max_history_length = 100
+
+# 工具调用超时（秒）
+tool_timeout = 30
+
+# 模型调用超时（秒）
+model_timeout = 120
+
+[model]
+# 模型提供商配置（当 StateKnot 集成可用时）
+#
+# # 提供商: openai, anthropic
+# provider = "openai"
+#
+# # API 密钥（建议使用环境变量 JIACLAW_MODEL_API_KEY）
+# # api_key = "sk-..."
+#
+# # 模型名称
+# model = "gpt-4"
+#
+# # 温度参数
+# temperature = 0.7
+#
+# # 最大 tokens
+# max_tokens = 4096
