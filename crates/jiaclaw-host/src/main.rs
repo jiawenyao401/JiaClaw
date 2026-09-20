@@ -4,10 +4,20 @@
 //! `JiaClaw` 可执行宿主
 
 use anyhow::{Context, Result};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Json},
+    routing::{get, post},
+    Router,
+};
 use clap::{Parser, Subcommand};
 use jiaclaw::{JiaClawAgent, Workspace};
-use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, MessageRole};
+use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 
 #[derive(Parser)]
 #[command(name = "jiaclaw")]
@@ -141,26 +151,97 @@ fn init_command(path: Option<PathBuf>, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn serve_command(_config: Option<PathBuf>, bind: String) -> Result<()> {
+async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()> {
     tracing::info!("正在启动 JiaClaw Agent 服务于 {}", bind);
 
-    tracing::warn!(
-        "服务模式尚未完全实现。StateKnot AgentHost 和 HTTP 服务需要：\n\
-         - 稳定的 AgentHost API\n\
-         - PostgreSQL 连接配置\n\
-         - 身份验证和授权集成\n\
-         参见 docs/stateknot-gaps.md 了解详细信息。"
-    );
+    // 加载配置
+    let config = if let Some(path) = config_path {
+        let path_str = path.to_string_lossy();
+        if path_str.ends_with(".toml") {
+            AgentConfig::from_toml_file(&path)?
+        } else if path_str.ends_with(".json") {
+            AgentConfig::from_json_file(&path)?
+        } else {
+            AgentConfig::from_toml_file(&path).or_else(|_| AgentConfig::from_json_file(&path))?
+        }
+    } else {
+        AgentConfig::default()
+    };
 
-    tracing::info!("服务存根已创建。按 Ctrl+C 退出。");
+    tracing::info!("使用 Agent 配置: {}", config.name);
 
-    // 等待 Ctrl+C
-    tokio::signal::ctrl_c()
+    // 检查工作空间
+    if !config.workspace_path.exists() {
+        tracing::warn!("工作空间不存在，使用默认配置");
+        println!("\n💡 提示: 运行 'jiaclaw init' 创建工作空间");
+    }
+
+    // 创建 Agent（共享状态）
+    let agent = Arc::new(JiaClawAgent::new(config)?);
+
+    // 构建应用路由
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/api/chat", post(chat_handler))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(agent);
+
+    // 解析绑定地址
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!("✅ HTTP 服务器启动成功");
+    tracing::info!("📡 监听地址: http://{}", bind);
+    tracing::info!("🔧 端点:");
+    tracing::info!("   GET  /health     - 健康检查");
+    tracing::info!("   POST /api/chat   - 聊天接口");
+    tracing::info!("\n按 Ctrl+C 停止服务器");
+
+    // 启动服务器
+    axum::serve(listener, app)
         .await
-        .context("等待 Ctrl+C 信号失败")?;
+        .context("HTTP 服务器运行失败")?;
 
-    tracing::info!("正在关闭...");
     Ok(())
+}
+
+/// 健康检查处理器
+async fn health_handler() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ok",
+        "service": "jiaclaw",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+/// 聊天请求处理器
+async fn chat_handler(
+    State(agent): State<Arc<JiaClawAgent>>,
+    Json(request): Json<ChatRequest>,
+) -> Result<Json<ChatResponse>, AppError> {
+    tracing::info!("收到聊天请求，消息数: {}", request.messages.len());
+
+    let response = agent
+        .chat(&request)
+        .await
+        .map_err(|e| AppError(format!("聊天处理失败: {e}")))?;
+
+    Ok(Json(response))
+}
+
+/// 应用错误类型
+struct AppError(String);
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        tracing::error!("请求错误: {}", self.0);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": self.0
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()> {
