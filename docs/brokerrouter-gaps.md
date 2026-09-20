@@ -26,3 +26,49 @@
 - 拒绝 `stream:true`、多模态 content、`n>1` 等
 - 收费 POST 必须带幂等键
 - 人民币账本 / 虚拟密钥 / 租户模型
+
+## 集成状态
+
+✅ **已完成**：
+- `BrokerrouterProvider` 实现（`crates/jiaclaw/src/provider/brokerrouter.rs`）
+- Bearer 虚拟密钥认证
+- 自动幂等性密钥生成（`jiaclaw-{UUID}`，1-200 可打印 ASCII）
+- 非流式聊天补全（`stream: false`）
+- 请求追踪（捕获 `x-request-id` / `x-brokerrouter-request-id`）
+- HTTP 模拟测试（wiremock）
+- 错误处理和状态码映射
+- 配置示例更新（推荐 Brokerrouter）
+
+## 使用示例
+
+### TOML 配置（推荐）
+
+```toml
+[provider]
+type = "brokerrouter"
+base_url = "https://api.brokerrouter.dev"
+api_key = "brk_live_..."  # 或使用环境变量 JIACLAW_API_KEY
+model = "claude-3-5-sonnet-20241022"
+temperature = 0.7
+max_tokens = 4096
+```
+
+### 环境变量
+
+```bash
+export JIACLAW_API_KEY=brk_live_...
+jiaclaw chat "你好"
+```
+
+## 测试
+
+```bash
+# 运行所有测试
+cargo test
+
+# 运行 Brokerrouter 特定测试
+cargo test --package jiaclaw brokerrouter
+
+# 运行 clippy 检查
+cargo clippy -- -D warnings
+```

@@ -17,7 +17,7 @@ pub use jiaclaw_core::{
 mod provider;
 mod workspace;
 
-use provider::OpenAICompatibleProvider;
+use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
 pub use workspace::Workspace;
 
 // StateKnot imports - commented out until edition 2024 support
@@ -84,45 +84,64 @@ impl JiaClawAgent {
     /// # 实现说明
     ///
     /// 根据配置选择提供商：
-    /// - 如果配置了 API key，使用 OpenAI-compatible 提供商
-    /// - 否则回退到存根实现
+    /// 1. `brokerrouter` - 推荐的生产路径（通过 Brokerrouter Gateway）
+    /// 2. `openai_compatible` - 已废弃的直连模式（仅作开发逃生舱）
+    /// 3. 如果未配置 API key，回退到存根实现
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, JiaClawError> {
         // 构建完整的系统提示（包含工作空间内容）
         let system_prompt = self.build_system_prompt(request);
 
+        // 从配置或环境变量获取 API key
+        let env_key = std::env::var("JIACLAW_API_KEY").ok();
+        let api_key = self
+            .config
+            .provider
+            .api_key
+            .as_deref()
+            .or(env_key.as_deref());
+
         // 选择提供商
-        if let Some(api_key) = &self.config.provider.api_key {
-            // 使用真实的 OpenAI-compatible 提供商
-            let provider = OpenAICompatibleProvider::new(&self.config.provider.base_url, api_key);
-
-            provider
-                .chat(
-                    &self.config.provider.model,
-                    &system_prompt,
-                    &request.messages,
-                    self.config.provider.temperature,
-                    self.config.provider.max_tokens,
-                )
-                .await
-        } else if let Ok(env_key) = std::env::var("JIACLAW_API_KEY") {
-            // 从环境变量读取 API key
-            let provider = OpenAICompatibleProvider::new(&self.config.provider.base_url, &env_key);
-
-            provider
-                .chat(
-                    &self.config.provider.model,
-                    &system_prompt,
-                    &request.messages,
-                    self.config.provider.temperature,
-                    self.config.provider.max_tokens,
-                )
-                .await
-        } else {
-            // 回退到存根实现
-            tracing::warn!(
-                "未配置 API key（通过配置文件或 JIACLAW_API_KEY 环境变量），使用存根模式"
-            );
-            Ok(self.stub_chat(request, &system_prompt))
+        match (api_key, self.config.provider.provider_type.as_str()) {
+            (Some(key), "brokerrouter") => {
+                // 推荐：Brokerrouter 提供商
+                let provider = BrokerrouterProvider::new(&self.config.provider.base_url, key);
+                provider
+                    .chat(
+                        &self.config.provider.model,
+                        &system_prompt,
+                        &request.messages,
+                        self.config.provider.temperature,
+                        self.config.provider.max_tokens,
+                    )
+                    .await
+            }
+            (Some(key), "openai_compatible") => {
+                // 已废弃：OpenAI-compatible 提供商
+                let provider = OpenAICompatibleProvider::new(&self.config.provider.base_url, key);
+                provider
+                    .chat(
+                        &self.config.provider.model,
+                        &system_prompt,
+                        &request.messages,
+                        self.config.provider.temperature,
+                        self.config.provider.max_tokens,
+                    )
+                    .await
+            }
+            (Some(_), unknown_type) => {
+                tracing::warn!(
+                    "未知的提供商类型 '{}', 回退到存根模式",
+                    unknown_type
+                );
+                Ok(self.stub_chat(request, &system_prompt))
+            }
+            (None, _) => {
+                // 回退到存根实现
+                tracing::warn!(
+                    "未配置 API key（通过配置文件或 JIACLAW_API_KEY 环境变量），使用存根模式"
+                );
+                Ok(self.stub_chat(request, &system_prompt))
+            }
         }
     }
 

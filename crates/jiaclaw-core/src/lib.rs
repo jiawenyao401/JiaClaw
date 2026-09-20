@@ -95,7 +95,7 @@ pub struct ToolCall {
 }
 
 /// 运行状态
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
     /// 运行中
@@ -145,7 +145,7 @@ fn default_workspace_path() -> std::path::PathBuf {
 /// 模型提供商配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    /// 提供商类型（`openai_compatible`）
+    /// 提供商类型 (`brokerrouter` 推荐, `openai_compatible` 已废弃)
     #[serde(default = "default_provider_type")]
     pub provider_type: String,
 
@@ -171,11 +171,11 @@ pub struct ProviderConfig {
 }
 
 fn default_provider_type() -> String {
-    "openai_compatible".to_string()
+    "brokerrouter".to_string()
 }
 
 fn default_base_url() -> String {
-    "https://api.openai.com/v1".to_string()
+    "https://api.brokerrouter.dev".to_string()
 }
 
 fn default_model() -> String {

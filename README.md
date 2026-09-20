@@ -51,6 +51,11 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ 可执行宿主骨架（`jiaclaw-host`）
 - ✅ 基本 CLI 界面（`serve`, `chat`, `version` 命令）
 - ✅ 存根实现（可编译但功能有限）
+- ✅ **Brokerrouter 集成** - 生产级 AI Gateway 提供商
+  - Bearer 虚拟密钥认证
+  - 自动幂等性密钥生成
+  - 非流式聊天补全
+  - 请求追踪和错误处理
 
 ### 待实现
 
@@ -85,20 +90,55 @@ cargo build
 cargo test
 ```
 
+### 配置
+
+JiaClaw 支持两种提供商：
+
+1. **Brokerrouter**（推荐）- 通过 AI Gateway 路由模型调用
+2. **Stub** - 离线演示模式（无需 API key）
+
+配置示例（`config/jiaclaw.toml`）：
+
+```toml
+[provider]
+type = "brokerrouter"
+base_url = "https://api.brokerrouter.dev"
+# API key 通过环境变量提供
+model = "claude-3-5-sonnet-20241022"
+temperature = 0.7
+max_tokens = 4096
+```
+
+或使用环境变量：
+
+```bash
+export JIACLAW_API_KEY=brk_live_your_key_here
+```
+
 ### 运行示例
 
 ```bash
 # 显示版本信息
 cargo run --bin jiaclaw -- version
 
-# 运行单次聊天（存根实现）
+# 初始化工作空间
+cargo run --bin jiaclaw -- init
+
+# 运行单次聊天（需要配置 API key）
+export JIACLAW_API_KEY=brk_live_...
 cargo run --bin jiaclaw -- chat "你好，JiaClaw"
+
+# 或使用配置文件
+cargo run --bin jiaclaw -- chat --config config/jiaclaw.toml "你好，JiaClaw"
 
 # 启动服务（存根实现）
 cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
 ```
 
-**注意**：由于 StateKnot 处于 pre-alpha，当前实现返回占位响应，不执行实际的模型推理或持久化。
+**注意**：
+- 使用 Brokerrouter 需要有效的虚拟密钥（`brk_live_...`）
+- 无 API key 时自动回退到存根模式（演示功能）
+- StateKnot 持久化功能尚未集成
 
 ## 项目结构
 
@@ -173,6 +213,11 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ Executable host skeleton (`jiaclaw-host`)
 - ✅ Basic CLI interface (`serve`, `chat`, `version` commands)
 - ✅ Stub implementation (compiles but limited functionality)
+- ✅ **Brokerrouter Integration** - Production-grade AI Gateway provider
+  - Bearer virtual key authentication
+  - Automatic idempotency key generation
+  - Non-streaming chat completions
+  - Request tracing and error handling
 
 #### Pending
 
@@ -207,20 +252,55 @@ cargo build
 cargo test
 ```
 
+#### Configuration
+
+JiaClaw supports two providers:
+
+1. **Brokerrouter** (recommended) - Routes model calls through AI Gateway
+2. **Stub** - Offline demo mode (no API key required)
+
+Example configuration (`config/jiaclaw.toml`):
+
+```toml
+[provider]
+type = "brokerrouter"
+base_url = "https://api.brokerrouter.dev"
+# API key via environment variable
+model = "claude-3-5-sonnet-20241022"
+temperature = 0.7
+max_tokens = 4096
+```
+
+Or use environment variable:
+
+```bash
+export JIACLAW_API_KEY=brk_live_your_key_here
+```
+
 #### Run Examples
 
 ```bash
 # Show version info
 cargo run --bin jiaclaw -- version
 
-# Run single chat (stub implementation)
+# Initialize workspace
+cargo run --bin jiaclaw -- init
+
+# Run single chat (requires API key)
+export JIACLAW_API_KEY=brk_live_...
 cargo run --bin jiaclaw -- chat "Hello, JiaClaw"
+
+# Or use config file
+cargo run --bin jiaclaw -- chat --config config/jiaclaw.toml "Hello, JiaClaw"
 
 # Start service (stub implementation)
 cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
 ```
 
-**Note**: Due to StateKnot being pre-alpha, the current implementation returns placeholder responses without actual model inference or persistence.
+**Note**:
+- Brokerrouter requires a valid virtual key (`brk_live_...`)
+- Falls back to stub mode without API key (demo functionality)
+- StateKnot persistence features not yet integrated
 
 ### Documentation
 
