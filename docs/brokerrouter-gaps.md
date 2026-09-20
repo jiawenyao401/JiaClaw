@@ -141,7 +141,7 @@ cargo test
 
 ## Configuration
 
-See `examples/config.toml` for complete configuration examples.
+See `examples/config.example.toml` for complete configuration examples.
 
 Basic Brokerrouter configuration:
 

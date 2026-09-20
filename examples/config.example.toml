@@ -1,0 +1,48 @@
+# JiaClaw Configuration Example
+
+# Brokerrouter Provider (Recommended for Production)
+# ===================================================
+# Use Brokerrouter for production deployments. It provides:
+# - Virtual-key authentication with rotation support
+# - Automatic idempotency guarantees
+# - Request tracking and observability
+# - Production-grade stability
+#
+# See docs/brokerrouter-gaps.md for current limitations and tracked issues.
+
+[provider]
+type = "brokerrouter"
+base_url = "https://api.brokerrouter.dev"  # Brokerrouter API endpoint
+api_key = "brk_live_..."                   # Your virtual key (or set BROKERROUTER_API_KEY env var)
+model = "claude-3-5-sonnet-20241022"       # Default model
+
+# Alternative: OpenAI-Compatible Provider (Deprecated)
+# =====================================================
+# DEPRECATED: This provider is a temporary escape hatch.
+# Use only for local development or emergency fallback.
+# Will be removed in a future release.
+#
+# [provider]
+# type = "openai_compatible"
+# base_url = "http://localhost:8000"
+# api_key = "test-key"
+# model = "test-model"
+
+# Environment Variable Override
+# =============================
+# You can set BROKERROUTER_API_KEY environment variable instead of
+# including the API key in the config file:
+#
+#   export BROKERROUTER_API_KEY=brk_live_...
+#   cargo run
+
+# Getting a Brokerrouter API Key
+# ===============================
+# Brokerrouter is a private service by StateKnot.
+# To obtain an API key:
+#
+# 1. Contact the StateKnot team
+# 2. Follow the onboarding process (tracked in issue #30)
+# 3. Receive your virtual key credentials
+#
+# See: https://github.com/StateKnot/Brokerrouter/issues/30

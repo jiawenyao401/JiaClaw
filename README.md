@@ -35,7 +35,7 @@ cargo build --release
 Create a configuration file or use the provided example:
 
 ```bash
-cp examples/config.toml config.toml
+cp examples/config.example.toml config.toml
 ```
 
 Edit `config.toml` to add your Brokerrouter credentials:
