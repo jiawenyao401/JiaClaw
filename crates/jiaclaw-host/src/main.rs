@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, State},
-    http::{Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
     Router,
@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use jiaclaw::{JiaClawAgent, Workspace};
 use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -162,6 +163,7 @@ const MAX_SESSION_MESSAGES: usize = 50;
 struct AppState {
     agent: Arc<JiaClawAgent>,
     sessions: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    webhook_secret: Option<String>,
 }
 
 /// 健康检查响应
@@ -170,6 +172,34 @@ struct HealthResponse {
     status: String,
     agent_name: String,
     version: String,
+}
+
+/// Webhook 入站请求
+#[derive(Debug, Serialize, Deserialize)]
+struct InboundWebhookRequest {
+    #[serde(default = "default_channel")]
+    channel: String,
+    chat_id: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+}
+
+fn default_channel() -> String {
+    "webhook".to_string()
+}
+
+/// Webhook 入站响应
+#[derive(Debug, Serialize, Deserialize)]
+struct InboundWebhookResponse {
+    ok: bool,
+    session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()> {
@@ -193,9 +223,17 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
 
     // 创建 agent
     let agent = JiaClawAgent::new(config).context("创建 JiaClawAgent 失败")?;
+    
+    // 读取 webhook secret（可选）
+    let webhook_secret = std::env::var("JIACLAW_WEBHOOK_SECRET").ok();
+    if webhook_secret.is_some() {
+        tracing::info!("Webhook secret 已配置");
+    }
+    
     let state = AppState {
         agent: Arc::new(agent),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        webhook_secret,
     };
 
     // 配置 CORS（允许所有来源，生产环境应该更严格）
@@ -212,6 +250,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
         .route("/api/sessions/:id", delete(delete_session_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/skills", get(skills_handler))
+        .route("/hooks/inbound", post(hooks_inbound_handler))
         .layer(cors)
         .with_state(state);
 
@@ -227,6 +266,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
     tracing::info!("   • DELETE /api/sessions/:id    - 删除会话");
     tracing::info!("   • GET    /api/tools           - 列出已注册工具");
     tracing::info!("   • GET    /api/skills          - 列出已发现技能");
+    tracing::info!("   • POST   /hooks/inbound       - Webhook 入站端点");
     tracing::info!("\n💡 试试：curl http://{}/health", bind);
     tracing::info!("按 Ctrl+C 停止服务");
 
@@ -461,6 +501,143 @@ async fn skills_handler(State(state): State<AppState>) -> Json<SkillsResponse> {
     };
 
     Json(SkillsResponse { skills })
+}
+
+/// Webhook 入站处理器
+#[allow(clippy::too_many_lines)]
+async fn hooks_inbound_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InboundWebhookRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    tracing::info!(
+        "收到 webhook 入站请求: channel={}, chat_id={}, username={:?}",
+        body.channel,
+        body.chat_id,
+        body.username
+    );
+
+    // 鉴权检查
+    if let Some(expected) = state.webhook_secret.as_deref() {
+        let provided = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok());
+        if provided != Some(expected) {
+            tracing::warn!("Webhook 鉴权失败: secret 不匹配");
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"ok": false, "error": "unauthorized"})),
+            )
+                .into_response());
+        }
+    }
+
+    // 生成 session_id
+    let session_id = format!("webhook:{}", body.chat_id);
+    tracing::info!("使用 session_id: {}", session_id);
+
+    // 构建聊天请求
+    let mut request = ChatRequest {
+        messages: vec![ChatMessage {
+            role: MessageRole::User,
+            content: body.text.clone(),
+        }],
+        enabled_tools: vec![],
+        enabled_skills: vec![],
+        session_id: Some(session_id.clone()),
+    };
+
+    // 从 session 中获取历史消息
+    {
+        let sessions = state.sessions.lock().unwrap();
+        if let Some(history) = sessions.get(&session_id) {
+            let mut all_messages = history.clone();
+            all_messages.extend(request.messages.clone());
+
+            // 检查消息数上限
+            if all_messages.len() > MAX_SESSION_MESSAGES {
+                tracing::info!(
+                    "Webhook session {} 消息数 {} 超过上限 {}，开始截断",
+                    session_id,
+                    all_messages.len(),
+                    MAX_SESSION_MESSAGES
+                );
+
+                let system_messages: Vec<_> = all_messages
+                    .iter()
+                    .filter(|m| m.role == MessageRole::System)
+                    .cloned()
+                    .collect();
+
+                let non_system_messages: Vec<_> = all_messages
+                    .into_iter()
+                    .filter(|m| m.role != MessageRole::System)
+                    .collect();
+
+                let system_count = system_messages.len();
+                let available_slots = MAX_SESSION_MESSAGES.saturating_sub(system_count);
+                let skip_count = non_system_messages.len().saturating_sub(available_slots);
+
+                all_messages = system_messages;
+                all_messages.extend(non_system_messages.into_iter().skip(skip_count));
+
+                tracing::info!(
+                    "截断后消息数: {} (system: {}, 其他: {})",
+                    all_messages.len(),
+                    system_count,
+                    all_messages.len() - system_count
+                );
+            }
+
+            request.messages = all_messages;
+            tracing::info!(
+                "使用 webhook session {}, 合并后消息数: {}",
+                session_id,
+                request.messages.len()
+            );
+        } else {
+            tracing::info!("创建新 webhook session: {}", session_id);
+        }
+    }
+
+    // 调用 agent
+    let response = state
+        .agent
+        .chat(&request)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 更新 session 历史
+    {
+        let mut sessions = state.sessions.lock().unwrap();
+        sessions.insert(session_id.clone(), request.messages.clone());
+        sessions
+            .entry(session_id.clone())
+            .or_default()
+            .push(response.message.clone());
+        tracing::info!(
+            "更新 webhook session {}, 当前消息数: {}",
+            session_id,
+            sessions.get(&session_id).unwrap().len()
+        );
+    }
+
+    tracing::info!(
+        "Webhook 聊天响应生成，状态: {:?}, 工具调用数: {}",
+        response.status,
+        response.tool_calls.len()
+    );
+
+    // 构建响应
+    let webhook_response = InboundWebhookResponse {
+        ok: true,
+        session_id: session_id.clone(),
+        reply: Some(response.message.content.clone()),
+        message: Some(response.message.content),
+        error: None,
+    };
+
+    Ok((StatusCode::OK, Json(webhook_response)).into_response())
 }
 
 /// 应用错误类型
@@ -730,11 +907,16 @@ mod tests {
     use tower::ServiceExt;
 
     fn create_test_app() -> Router {
+        create_test_app_with_secret(None)
+    }
+
+    fn create_test_app_with_secret(webhook_secret: Option<String>) -> Router {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            webhook_secret,
         };
 
         Router::new()
@@ -744,6 +926,7 @@ mod tests {
             .route("/api/sessions/:id", delete(delete_session_handler))
             .route("/api/tools", get(tools_handler))
             .route("/api/skills", get(skills_handler))
+            .route("/hooks/inbound", post(hooks_inbound_handler))
             .with_state(state)
     }
 
@@ -1035,6 +1218,7 @@ mod tests {
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            webhook_secret: None,
         };
 
         let session_id = "test-limit-session".to_string();
@@ -1160,5 +1344,217 @@ mod tests {
             assert!(!skill.description.is_empty(), "技能描述不应为空");
             assert!(!skill.path.is_empty(), "技能路径不应为空");
         }
+    }
+
+    #[tokio::test]
+    async fn test_webhook_inbound_without_secret() {
+        let app = create_test_app();
+
+        let webhook_request = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "test-chat-123".to_string(),
+            text: "你好，这是一个测试消息".to_string(),
+            username: Some("test_user".to_string()),
+        };
+
+        let request_body = serde_json::to_string(&webhook_request).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let webhook_response: InboundWebhookResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(webhook_response.ok);
+        assert_eq!(webhook_response.session_id, "webhook:test-chat-123");
+        assert!(webhook_response.reply.is_some());
+        assert!(webhook_response.message.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_webhook_inbound_with_secret_missing_header() {
+        let app = create_test_app_with_secret(Some("test-secret-123".to_string()));
+
+        let webhook_request = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "test-chat-456".to_string(),
+            text: "测试消息".to_string(),
+            username: None,
+        };
+
+        let request_body = serde_json::to_string(&webhook_request).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error_response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(error_response["ok"], false);
+        assert_eq!(error_response["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_inbound_with_secret_wrong_secret() {
+        let app = create_test_app_with_secret(Some("correct-secret".to_string()));
+
+        let webhook_request = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "test-chat-789".to_string(),
+            text: "测试消息".to_string(),
+            username: None,
+        };
+
+        let request_body = serde_json::to_string(&webhook_request).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .header("X-Webhook-Secret", "wrong-secret")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error_response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(error_response["ok"], false);
+        assert_eq!(error_response["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_inbound_with_secret_correct() {
+        let app = create_test_app_with_secret(Some("correct-secret".to_string()));
+
+        let webhook_request = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "test-chat-correct".to_string(),
+            text: "认证成功的消息".to_string(),
+            username: Some("authenticated_user".to_string()),
+        };
+
+        let request_body = serde_json::to_string(&webhook_request).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .header("X-Webhook-Secret", "correct-secret")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let webhook_response: InboundWebhookResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(webhook_response.ok);
+        assert_eq!(webhook_response.session_id, "webhook:test-chat-correct");
+        assert!(webhook_response.reply.is_some());
+        assert!(webhook_response.message.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_webhook_inbound_session_persistence() {
+        let app = create_test_app();
+
+        // 第一次调用
+        let webhook_request1 = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "persistent-chat".to_string(),
+            text: "第一条消息".to_string(),
+            username: None,
+        };
+
+        let request_body1 = serde_json::to_string(&webhook_request1).unwrap();
+
+        let response1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response1.status(), StatusCode::OK);
+
+        // 第二次调用，使用相同的 chat_id
+        let webhook_request2 = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "persistent-chat".to_string(),
+            text: "第二条消息".to_string(),
+            username: None,
+        };
+
+        let request_body2 = serde_json::to_string(&webhook_request2).unwrap();
+
+        let response2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body2))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response2.status(), StatusCode::OK);
+
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let webhook_response2: InboundWebhookResponse = serde_json::from_slice(&body2).unwrap();
+
+        assert!(webhook_response2.ok);
+        assert_eq!(webhook_response2.session_id, "webhook:persistent-chat");
     }
 }
