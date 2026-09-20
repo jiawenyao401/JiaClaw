@@ -32,6 +32,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// 创建新的工具注册表
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
@@ -46,6 +47,7 @@ impl ToolRegistry {
     }
 
     /// 获取工具
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|b| &**b)
     }
@@ -56,6 +58,10 @@ impl ToolRegistry {
     }
 
     /// 执行工具调用
+    ///
+    /// # Errors
+    ///
+    /// 如果工具不存在或执行失败，返回错误。
     pub async fn execute(&self, tool_call: &ToolCall) -> Result<String, JiaClawError> {
         let tool = self.get(&tool_call.tool_name).ok_or_else(|| {
             JiaClawError::ToolExecution(format!("工具不存在: {}", tool_call.tool_name))
@@ -78,6 +84,7 @@ pub struct WorkspaceListTool {
 
 impl WorkspaceListTool {
     /// 创建新的工作空间列表工具
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         Self {
             workspace_path: workspace_path.to_path_buf(),
@@ -163,6 +170,7 @@ pub struct MemoryReadTool {
 
 impl MemoryReadTool {
     /// 创建新的记忆读取工具
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         Self {
             workspace_path: workspace_path.to_path_buf(),
@@ -236,6 +244,7 @@ pub struct FileReadTool {
 
 impl FileReadTool {
     /// 创建新的文件读取工具
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         // 规范化工作空间路径，确保沙箱检查在所有平台上一致
         let canonical_workspace = workspace_path
@@ -318,6 +327,7 @@ pub struct FileWriteTool {
 
 impl FileWriteTool {
     /// 创建新的文件写入工具
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         // 规范化工作空间路径，确保沙箱检查在所有平台上一致
         let canonical_workspace = workspace_path
@@ -411,6 +421,7 @@ pub struct HttpGetTool;
 
 impl HttpGetTool {
     /// 创建新的HTTP GET工具
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -489,11 +500,12 @@ impl Tool for HttpGetTool {
     }
 }
 
-/// DateTime 工具
+/// `DateTime` 工具
 pub struct DateTimeTool;
 
 impl DateTimeTool {
-    /// 创建新的DateTime工具
+    /// 创建新的 `DateTime` 工具
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -557,6 +569,7 @@ pub struct JsonQueryTool;
 
 impl JsonQueryTool {
     /// 创建新的JSON查询工具
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -638,6 +651,7 @@ pub struct FileListTool {
 
 impl FileListTool {
     /// 创建新的文件列表工具
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         // 规范化工作空间路径，确保沙箱检查在所有平台上一致
         let canonical_workspace = workspace_path
@@ -768,6 +782,7 @@ pub struct FileDeleteTool {
 
 impl FileDeleteTool {
     /// 创建新的文件删除工具
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         // 规范化工作空间路径，确保沙箱检查在所有平台上一致
         let canonical_workspace = workspace_path
@@ -851,6 +866,7 @@ pub struct FileCopyTool {
 
 impl FileCopyTool {
     /// 创建新的文件复制工具
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         // 规范化工作空间路径，确保沙箱检查在所有平台上一致
         let canonical_workspace = workspace_path
@@ -960,6 +976,7 @@ pub struct ShellExecTool {
 
 impl ShellExecTool {
     /// 创建新的Shell执行工具
+    #[must_use]
     pub fn new(workspace_path: &Path) -> Self {
         Self {
             workspace_path: workspace_path.to_path_buf(),
