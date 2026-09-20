@@ -619,6 +619,430 @@ impl Tool for JsonQueryTool {
     }
 }
 
+/// File List 工具（列出目录内容）
+pub struct FileListTool {
+    workspace_path: PathBuf,
+}
+
+impl FileListTool {
+    /// 创建新的文件列表工具
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: workspace_path.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FileListTool {
+    fn name(&self) -> &str {
+        "file_list"
+    }
+
+    fn description(&self) -> &str {
+        "列出工作空间目录中的文件和子目录"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "目录相对路径（可选，默认为根目录）"
+                }
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let relative_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+
+        let dir_path = if relative_path.is_empty() {
+            self.workspace_path.clone()
+        } else {
+            self.workspace_path.join(relative_path)
+        };
+
+        // 安全检查
+        let canonical_path = dir_path.canonicalize().unwrap_or(dir_path.clone());
+
+        if !canonical_path.starts_with(&self.workspace_path) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "安全错误: 路径 {} 在工作空间外部",
+                relative_path
+            )));
+        }
+
+        if !canonical_path.exists() {
+            return Ok(format!("目录不存在: {}", relative_path));
+        }
+
+        if !canonical_path.is_dir() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径 {} 不是目录",
+                relative_path
+            )));
+        }
+
+        let entries = std::fs::read_dir(&canonical_path)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法读取目录: {e}")))?;
+
+        let mut result = format!(
+            "目录: {}\n\n",
+            if relative_path.is_empty() {
+                "/"
+            } else {
+                relative_path
+            }
+        );
+
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| JiaClawError::ToolExecution(format!("无法读取目录条目: {e}")))?;
+
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            if path.is_dir() {
+                dirs.push(name);
+            } else {
+                let metadata = entry.metadata().ok();
+                let size = metadata.map(|m| m.len()).unwrap_or(0);
+                files.push((name, size));
+            }
+        }
+
+        // 排序
+        dirs.sort();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // 输出目录
+        if !dirs.is_empty() {
+            result.push_str("📁 目录:\n");
+            for dir in &dirs {
+                result.push_str(&format!("  {}/\n", dir));
+            }
+            result.push('\n');
+        }
+
+        // 输出文件
+        if !files.is_empty() {
+            result.push_str("📄 文件:\n");
+            for (name, size) in &files {
+                result.push_str(&format!("  {} ({} bytes)\n", name, size));
+            }
+        }
+
+        if dirs.is_empty() && files.is_empty() {
+            result.push_str("(空目录)\n");
+        }
+
+        Ok(result)
+    }
+}
+
+/// File Delete 工具（删除文件）
+pub struct FileDeleteTool {
+    workspace_path: PathBuf,
+}
+
+impl FileDeleteTool {
+    /// 创建新的文件删除工具
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: workspace_path.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FileDeleteTool {
+    fn name(&self) -> &str {
+        "file_delete"
+    }
+
+    fn description(&self) -> &str {
+        "删除工作空间中的文件（不可恢复，谨慎使用）"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要删除的文件相对路径"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let relative_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'path'".to_string()))?;
+
+        let file_path = self.workspace_path.join(relative_path);
+        let canonical_path = file_path.canonicalize().unwrap_or(file_path.clone());
+
+        // 安全检查
+        if !canonical_path.starts_with(&self.workspace_path) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "安全错误: 文件 {} 在工作空间外部",
+                relative_path
+            )));
+        }
+
+        if !canonical_path.exists() {
+            return Ok(format!("文件不存在: {}", relative_path));
+        }
+
+        if canonical_path.is_dir() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径 {} 是目录，请使用专门的目录删除工具",
+                relative_path
+            )));
+        }
+
+        // 获取文件大小用于确认消息
+        let size = std::fs::metadata(&canonical_path)
+            .ok()
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // 删除文件
+        std::fs::remove_file(&canonical_path)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法删除文件: {e}")))?;
+
+        Ok(format!(
+            "✅ 文件已删除: {}\n大小: {} 字节",
+            relative_path, size
+        ))
+    }
+}
+
+/// File Copy 工具（复制文件）
+pub struct FileCopyTool {
+    workspace_path: PathBuf,
+}
+
+impl FileCopyTool {
+    /// 创建新的文件复制工具
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: workspace_path.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FileCopyTool {
+    fn name(&self) -> &str {
+        "file_copy"
+    }
+
+    fn description(&self) -> &str {
+        "在工作空间内复制文件"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "源文件相对路径"
+                },
+                "destination": {
+                    "type": "string",
+                    "description": "目标文件相对路径"
+                }
+            },
+            "required": ["source", "destination"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let source_rel = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'source'".to_string()))?;
+
+        let dest_rel = args
+            .get("destination")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'destination'".to_string()))?;
+
+        let source_path = self.workspace_path.join(source_rel);
+        let dest_path = self.workspace_path.join(dest_rel);
+
+        // 安全检查源文件
+        let source_canonical = source_path
+            .canonicalize()
+            .map_err(|_| JiaClawError::ToolExecution(format!("源文件不存在: {}", source_rel)))?;
+
+        if !source_canonical.starts_with(&self.workspace_path) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "安全错误: 源文件 {} 在工作空间外部",
+                source_rel
+            )));
+        }
+
+        // 安全检查目标路径
+        let dest_parent = dest_path
+            .parent()
+            .ok_or_else(|| JiaClawError::ToolExecution("无效的目标路径".to_string()))?;
+
+        if !dest_parent.starts_with(&self.workspace_path) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "安全错误: 目标路径 {} 在工作空间外部",
+                dest_rel
+            )));
+        }
+
+        if !source_canonical.is_file() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "源路径 {} 不是文件",
+                source_rel
+            )));
+        }
+
+        // 创建目标父目录
+        std::fs::create_dir_all(dest_parent)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法创建目标目录: {e}")))?;
+
+        // 复制文件
+        let bytes_copied = std::fs::copy(&source_canonical, &dest_path)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法复制文件: {e}")))?;
+
+        Ok(format!(
+            "✅ 文件已复制:\n  从: {}\n  到: {}\n  大小: {} 字节",
+            source_rel, dest_rel, bytes_copied
+        ))
+    }
+}
+
+/// Shell Exec 工具（白名单模式）
+pub struct ShellExecTool {
+    workspace_path: PathBuf,
+}
+
+impl ShellExecTool {
+    /// 创建新的Shell执行工具
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: workspace_path.to_path_buf(),
+        }
+    }
+
+    /// 安全命令白名单
+    fn is_safe_command(cmd: &str) -> bool {
+        const SAFE_COMMANDS: &[&str] = &[
+            "ls", "pwd", "echo", "cat", "head", "tail", "wc", "grep", "find", "which", "date",
+            "whoami", "hostname", "uname", "env",
+        ];
+
+        SAFE_COMMANDS.contains(&cmd)
+    }
+}
+
+#[async_trait]
+impl Tool for ShellExecTool {
+    fn name(&self) -> &str {
+        "shell_exec"
+    }
+
+    fn description(&self) -> &str {
+        "执行安全的Shell命令（白名单：ls, pwd, echo, cat, head, tail, wc, grep, find, which, date, whoami, hostname, uname, env）"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "要执行的命令（仅白名单命令）"
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "命令参数列表（可选）"
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'command'".to_string()))?;
+
+        // 白名单检查
+        if !Self::is_safe_command(command) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "命令 '{}' 不在安全白名单中。\n允许的命令: ls, pwd, echo, cat, head, tail, wc, grep, find, which, date, whoami, hostname, uname, env",
+                command
+            )));
+        }
+
+        let cmd_args = args
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // 在工作空间目录中执行
+        let workspace_path = self.workspace_path.clone();
+        let command_owned = command.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let output = std::process::Command::new(&command_owned)
+                .args(&cmd_args)
+                .current_dir(&workspace_path)
+                .output()
+                .map_err(|e| JiaClawError::ToolExecution(format!("命令执行失败: {e}")))?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let status = output.status;
+
+            let mut result = format!("命令: {} {}\n", command_owned, cmd_args.join(" "));
+            result.push_str(&format!("工作目录: {}\n", workspace_path.display()));
+            result.push_str(&format!("退出码: {}\n\n", status.code().unwrap_or(-1)));
+
+            if !stdout.is_empty() {
+                result.push_str("标准输出:\n");
+                result.push_str(&stdout);
+                result.push('\n');
+            }
+
+            if !stderr.is_empty() {
+                result.push_str("标准错误:\n");
+                result.push_str(&stderr);
+            }
+
+            Ok(result)
+        })
+        .await
+        .map_err(|e| JiaClawError::ToolExecution(format!("任务执行失败: {e}")))?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,5 +1230,121 @@ mod tests {
             }))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_list_tool() {
+        let temp_workspace = std::env::temp_dir().join("jiaclaw_test_file_list");
+        let _ = fs::remove_dir_all(&temp_workspace);
+        fs::create_dir_all(&temp_workspace).unwrap();
+
+        // 创建测试文件和目录
+        fs::write(temp_workspace.join("file1.txt"), "content1").unwrap();
+        fs::write(temp_workspace.join("file2.txt"), "content2").unwrap();
+        fs::create_dir_all(temp_workspace.join("subdir")).unwrap();
+
+        let tool = FileListTool::new(&temp_workspace);
+
+        assert_eq!(tool.name(), "file_list");
+
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(result.contains("file1.txt"));
+        assert!(result.contains("file2.txt"));
+        assert!(result.contains("subdir/"));
+
+        let _ = fs::remove_dir_all(&temp_workspace);
+    }
+
+    #[tokio::test]
+    async fn test_file_delete_tool() {
+        let temp_workspace = std::env::temp_dir().join("jiaclaw_test_file_delete");
+        let _ = fs::remove_dir_all(&temp_workspace);
+        fs::create_dir_all(&temp_workspace).unwrap();
+
+        let test_file = temp_workspace.join("to_delete.txt");
+        fs::write(&test_file, "delete me").unwrap();
+
+        let tool = FileDeleteTool::new(&temp_workspace);
+
+        assert_eq!(tool.name(), "file_delete");
+
+        assert!(test_file.exists());
+
+        let result = tool
+            .execute(serde_json::json!({"path": "to_delete.txt"}))
+            .await
+            .unwrap();
+
+        assert!(result.contains("已删除"));
+        assert!(!test_file.exists());
+
+        let _ = fs::remove_dir_all(&temp_workspace);
+    }
+
+    #[tokio::test]
+    async fn test_file_copy_tool() {
+        let temp_workspace = std::env::temp_dir().join("jiaclaw_test_file_copy");
+        let _ = fs::remove_dir_all(&temp_workspace);
+        fs::create_dir_all(&temp_workspace).unwrap();
+
+        let test_content = "copy this content";
+        fs::write(temp_workspace.join("source.txt"), test_content).unwrap();
+
+        let tool = FileCopyTool::new(&temp_workspace);
+
+        assert_eq!(tool.name(), "file_copy");
+
+        let result = tool
+            .execute(serde_json::json!({
+                "source": "source.txt",
+                "destination": "dest.txt"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("已复制"));
+
+        let dest_path = temp_workspace.join("dest.txt");
+        assert!(dest_path.exists());
+        let content = fs::read_to_string(&dest_path).unwrap();
+        assert_eq!(content, test_content);
+
+        let _ = fs::remove_dir_all(&temp_workspace);
+    }
+
+    #[tokio::test]
+    async fn test_shell_exec_tool() {
+        let temp_workspace = std::env::temp_dir().join("jiaclaw_test_shell");
+        let _ = fs::remove_dir_all(&temp_workspace);
+        fs::create_dir_all(&temp_workspace).unwrap();
+
+        let tool = ShellExecTool::new(&temp_workspace);
+
+        assert_eq!(tool.name(), "shell_exec");
+
+        // 测试安全命令
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "echo",
+                "args": ["hello", "world"]
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("hello world") || result.contains("命令: echo"));
+
+        // 测试不安全命令
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "rm",
+                "args": ["-rf", "/"]
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("不在安全白名单中"));
+
+        let _ = fs::remove_dir_all(&temp_workspace);
     }
 }

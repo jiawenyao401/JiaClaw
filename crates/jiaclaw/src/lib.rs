@@ -22,8 +22,9 @@ mod workspace;
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
 pub use skills::{Skill, SkillDiscovery};
 pub use tools::{
-    DateTimeTool, FileReadTool, FileWriteTool, HttpGetTool, JsonQueryTool, MemoryReadTool, Tool,
-    ToolRegistry, WorkspaceListTool,
+    DateTimeTool, FileCopyTool, FileDeleteTool, FileListTool, FileReadTool, FileWriteTool,
+    HttpGetTool, JsonQueryTool, MemoryReadTool, ShellExecTool, Tool, ToolRegistry,
+    WorkspaceListTool,
 };
 pub use workspace::Workspace;
 
@@ -79,13 +80,25 @@ impl JiaClawAgent {
 
         // 初始化工具注册表
         let mut tools = ToolRegistry::new();
+
+        // 工作空间和记忆工具
         tools.register(Box::new(WorkspaceListTool::new(&config.workspace_path)));
         tools.register(Box::new(MemoryReadTool::new(&config.workspace_path)));
+
+        // 文件操作工具
         tools.register(Box::new(FileReadTool::new(&config.workspace_path)));
         tools.register(Box::new(FileWriteTool::new(&config.workspace_path)));
+        tools.register(Box::new(FileListTool::new(&config.workspace_path)));
+        tools.register(Box::new(FileDeleteTool::new(&config.workspace_path)));
+        tools.register(Box::new(FileCopyTool::new(&config.workspace_path)));
+
+        // 网络和数据工具
         tools.register(Box::new(HttpGetTool::new()));
-        tools.register(Box::new(DateTimeTool::new()));
         tools.register(Box::new(JsonQueryTool::new()));
+
+        // 系统工具
+        tools.register(Box::new(DateTimeTool::new()));
+        tools.register(Box::new(ShellExecTool::new(&config.workspace_path)));
 
         tracing::info!("注册了 {} 个本地工具", tools.list().len());
 
