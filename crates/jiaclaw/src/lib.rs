@@ -10,8 +10,8 @@
 //! - 持久化运行（支持重启后恢复）
 
 pub use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, JiaClawError, MessageRole, ProviderConfig,
-    RunStatus, ToolCall,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpConfig, JiaClawError, MessageRole,
+    ProviderConfig, RunStatus, ToolCall,
 };
 
 mod provider;

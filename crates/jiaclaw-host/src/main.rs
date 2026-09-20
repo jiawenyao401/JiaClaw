@@ -203,10 +203,8 @@ struct InboundWebhookResponse {
 }
 
 async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()> {
-    tracing::info!("正在启动 JiaClaw Agent 服务于 {}", bind);
-
     // 加载配置
-    let config = if let Some(path) = config_path {
+    let mut config = if let Some(path) = config_path {
         let path_str = path.to_string_lossy();
         if path_str.ends_with(".toml") {
             AgentConfig::from_toml_file(&path)?
@@ -219,28 +217,49 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
         AgentConfig::default()
     };
 
+    // 命令行参数覆盖配置文件
+    config.http.bind = bind;
+
+    tracing::info!("正在启动 JiaClaw Agent 服务");
     tracing::info!("使用 Agent 配置: {}", config.name);
 
     // 创建 agent
-    let agent = JiaClawAgent::new(config).context("创建 JiaClawAgent 失败")?;
+    let agent = JiaClawAgent::new(config.clone()).context("创建 JiaClawAgent 失败")?;
     
-    // 读取 webhook secret（可选）
-    let webhook_secret = std::env::var("JIACLAW_WEBHOOK_SECRET").ok();
-    if webhook_secret.is_some() {
-        tracing::info!("Webhook secret 已配置");
-    }
+    // 读取 webhook secret（环境变量优先于配置文件）
+    let webhook_secret = std::env::var("JIACLAW_WEBHOOK_SECRET")
+        .ok()
+        .or(config.http.webhook_secret.clone());
     
     let state = AppState {
         agent: Arc::new(agent),
         sessions: Arc::new(Mutex::new(HashMap::new())),
-        webhook_secret,
+        webhook_secret: webhook_secret.clone(),
     };
 
-    // 配置 CORS（允许所有来源，生产环境应该更严格）
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST])
-        .allow_headers(Any);
+    // 配置 CORS
+    let cors = if config.http.cors_allow_origins.is_empty()
+        || (config.http.cors_allow_origins.len() == 1
+            && config.http.cors_allow_origins[0] == "*")
+    {
+        // 允许所有来源
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers(Any)
+    } else {
+        // 限制特定来源
+        let origins: Vec<_> = config
+            .http
+            .cors_allow_origins
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers(Any)
+    };
 
     // 构建路由
     let app = Router::new()
@@ -255,11 +274,12 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
         .with_state(state);
 
     // 绑定地址
-    let listener = tokio::net::TcpListener::bind(&bind)
+    let listener = tokio::net::TcpListener::bind(&config.http.bind)
         .await
-        .with_context(|| format!("无法绑定到地址: {bind}"))?;
+        .with_context(|| format!("无法绑定到地址: {}", config.http.bind))?;
 
-    tracing::info!("✅ HTTP 服务已启动于 http://{}", bind);
+    // 启动日志
+    tracing::info!("✅ HTTP 服务已启动于 http://{}", config.http.bind);
     tracing::info!("   • GET    /health              - 健康检查");
     tracing::info!("   • POST   /api/chat            - 聊天端点");
     tracing::info!("   • POST   /api/sessions        - 创建会话");
@@ -267,8 +287,37 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
     tracing::info!("   • GET    /api/tools           - 列出已注册工具");
     tracing::info!("   • GET    /api/skills          - 列出已发现技能");
     tracing::info!("   • POST   /hooks/inbound       - Webhook 入站端点");
-    tracing::info!("\n💡 试试：curl http://{}/health", bind);
-    tracing::info!("按 Ctrl+C 停止服务");
+    
+    // 打印配置摘要（不打印 secret 明文）
+    println!("\n📋 HTTP 配置摘要:");
+    println!("   • 绑定地址: {}", config.http.bind);
+    
+    if webhook_secret.is_some() {
+        println!("   • Webhook 鉴权: ✅ 已启用（通过 {}）",
+            if std::env::var("JIACLAW_WEBHOOK_SECRET").is_ok() {
+                "环境变量 JIACLAW_WEBHOOK_SECRET"
+            } else {
+                "配置文件"
+            }
+        );
+    } else {
+        println!("   • Webhook 鉴权: ⚠️  未启用（任何请求都可访问 /hooks/inbound）");
+    }
+    
+    if config.http.cors_allow_origins.is_empty()
+        || (config.http.cors_allow_origins.len() == 1
+            && config.http.cors_allow_origins[0] == "*")
+    {
+        println!("   • CORS 模式: 允许所有来源（Permissive）");
+    } else {
+        println!(
+            "   • CORS 模式: 限制来源（仅允许: {}）",
+            config.http.cors_allow_origins.join(", ")
+        );
+    }
+    
+    println!("\n💡 试试：curl http://{}/health", config.http.bind);
+    println!("按 Ctrl+C 停止服务\n");
 
     // 启动服务器
     axum::serve(listener, app)
@@ -766,59 +815,95 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("📁 工作空间检查");
     println!("   路径: {}", config.workspace_path.display());
 
+    let mut workspace_ok = false;
+    let mut workspace_file_count = 0;
+    let mut skills_count = 0;
+
     if config.workspace_path.exists() {
         println!("   状态: ✅ 存在");
 
-        let workspace = Workspace::load(&config.workspace_path)?;
-        let mut files = Vec::new();
-        if workspace.agents.is_some() {
-            files.push("AGENTS.md");
-        }
-        if workspace.soul.is_some() {
-            files.push("SOUL.md");
-        }
-        if workspace.user.is_some() {
-            files.push("USER.md");
-        }
-        if workspace.memory.is_some() {
-            files.push("MEMORY.md");
-        }
+        match Workspace::load(&config.workspace_path) {
+            Ok(workspace) => {
+                let mut files = Vec::new();
+                if workspace.agents.is_some() {
+                    files.push("AGENTS.md");
+                    workspace_file_count += 1;
+                }
+                if workspace.soul.is_some() {
+                    files.push("SOUL.md");
+                    workspace_file_count += 1;
+                }
+                if workspace.user.is_some() {
+                    files.push("USER.md");
+                    workspace_file_count += 1;
+                }
+                if workspace.memory.is_some() {
+                    files.push("MEMORY.md");
+                    workspace_file_count += 1;
+                }
 
-        if files.is_empty() {
-            println!("   ⚠️  没有找到工作空间文件");
-            println!("   💡 运行 'jiaclaw init' 创建默认文件");
-        } else {
-            println!("   文件: {} 个已加载 ({})", files.len(), files.join(", "));
-        }
+                if files.is_empty() {
+                    println!("   ⚠️  没有找到工作空间文件");
+                    println!("   💡 运行 'jiaclaw init' 创建默认文件");
+                } else {
+                    println!("   文件: {} 个已加载 ({})", files.len(), files.join(", "));
+                    workspace_ok = true;
+                }
 
-        // 检查技能
-        let skills_dir = config.workspace_path.join("skills");
-        if skills_dir.exists() {
-            let discovery = jiaclaw::SkillDiscovery::new(&config.workspace_path);
-            match discovery.discover() {
-                Ok(skills) => {
-                    if skills.is_empty() {
-                        println!("   技能: 0 个");
-                    } else {
-                        println!("   技能: {} 个发现", skills.len());
-                        for skill in &skills {
-                            println!("         • {}", skill.name);
+                // 检查技能
+                let skills_dir = config.workspace_path.join("skills");
+                if skills_dir.exists() {
+                    let discovery = jiaclaw::SkillDiscovery::new(&config.workspace_path);
+                    match discovery.discover() {
+                        Ok(skills) => {
+                            skills_count = skills.len();
+                            if skills.is_empty() {
+                                println!("   技能: 0 个");
+                            } else {
+                                println!("   技能: {} 个发现", skills.len());
+                                for skill in &skills {
+                                    println!("         • {}", skill.name);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("   ⚠️  技能发现失败: {e}");
                         }
                     }
-                }
-                Err(e) => {
-                    println!("   ⚠️  技能发现失败: {e}");
+                } else {
+                    println!("   技能: 目录不存在");
                 }
             }
-        } else {
-            println!("   技能: 目录不存在");
+            Err(e) => {
+                println!("   ⚠️  加载工作空间失败: {e}");
+            }
         }
     } else {
         println!("   状态: ❌ 不存在");
         println!("   💡 运行 'jiaclaw init' 创建工作空间");
     }
 
-    // 2. 检查提供商配置
+    // 2. 检查工具系统
+    println!("\n🔧 工具系统");
+    let tools_count = match JiaClawAgent::new(config.clone()) {
+        Ok(agent) => {
+            let tool_list = agent.tools().list();
+            let count = tool_list.len();
+            println!("   已注册工具: {count} 个");
+            for tool_name in tool_list {
+                if let Some(tool) = agent.tools().get(tool_name) {
+                    println!("      • {}: {}", tool.name(), tool.description());
+                }
+            }
+            count
+        }
+        Err(e) => {
+            println!("   ⚠️  无法初始化 Agent: {e}");
+            0
+        }
+    };
+
+    // 3. 检查提供商配置
     println!("\n🔌 提供商配置");
     println!("   类型: {}", config.provider.provider_type);
     println!("   模型: {}", config.provider.model);
@@ -861,36 +946,68 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_API_KEY=your-key");
     }
 
-    // 3. 工具系统
-    println!("\n🔧 工具系统");
-    let agent = JiaClawAgent::new(config.clone())?;
-    let tool_list = agent.tools().list();
-    println!("   本地工具: {} 个已注册", tool_list.len());
-    for tool_name in tool_list {
-        if let Some(tool) = agent.tools().get(tool_name) {
-            println!("      • {}: {}", tool.name(), tool.description());
-        }
+    // 4. HTTP 配置检查
+    println!("\n🌐 HTTP 配置");
+    println!("   绑定地址: {}", config.http.bind);
+    
+    // 检查 webhook secret（环境变量优先）
+    let webhook_secret = std::env::var("JIACLAW_WEBHOOK_SECRET")
+        .ok()
+        .or(config.http.webhook_secret.clone());
+    
+    if webhook_secret.is_some() {
+        println!("   Webhook 鉴权: ✅ 已启用（通过 {}）",
+            if std::env::var("JIACLAW_WEBHOOK_SECRET").is_ok() {
+                "环境变量 JIACLAW_WEBHOOK_SECRET"
+            } else {
+                "配置文件"
+            }
+        );
+    } else {
+        println!("   Webhook 鉴权: ⚠️  未启用");
+        println!("   💡 设置环境变量: export JIACLAW_WEBHOOK_SECRET=your-secret");
+    }
+    
+    // CORS 配置
+    if config.http.cors_allow_origins.is_empty()
+        || (config.http.cors_allow_origins.len() == 1
+            && config.http.cors_allow_origins[0] == "*")
+    {
+        println!("   CORS 模式: 允许所有来源（Permissive）");
+    } else {
+        println!(
+            "   CORS 模式: 限制来源（{}）",
+            config.http.cors_allow_origins.join(", ")
+        );
     }
 
-    // 4. StateKnot 集成状态
+    // 5. StateKnot 集成状态
     println!("\n⚙️  StateKnot 集成");
     println!("   状态: ⏳ 等待稳定 API 发布");
     println!("   持久化: ❌ 未启用");
     println!("   PostgreSQL: ❌ 未配置");
     println!("   💡 参见 docs/stateknot-gaps.md 了解详情");
 
-    // 5. 总结
+    // 6. 总结
     println!("\n📊 总结");
-    if config.workspace_path.exists() && has_key {
-        println!("   ✅ 配置良好，可以开始使用");
-        println!("   💡 试试: jiaclaw chat \"你好\"");
-    } else if !config.workspace_path.exists() {
-        println!("   ⚠️  需要初始化工作空间");
+    println!("   • 工作空间文件: {workspace_file_count} 个");
+    println!("   • 已发现技能: {skills_count} 个");
+    println!("   • 已注册工具: {tools_count} 个");
+    println!("   • HTTP 绑定: {}", config.http.bind);
+    println!("   • Webhook 鉴权: {}", if webhook_secret.is_some() { "已启用" } else { "未启用" });
+    
+    if !has_key {
+        println!("\n   ⚠️  运行模式: Stub（存根模式）");
+        println!("   💡 未检测到 Brokerrouter/API key，将使用演示模式");
+        println!("   💡 配置 JIACLAW_API_KEY 环境变量以启用真实模型调用");
+    }
+    
+    if workspace_ok {
+        println!("\n   ✅ 配置良好，可以开始使用");
+        println!("   💡 试试: jiaclaw serve");
+    } else {
+        println!("\n   ⚠️  需要初始化工作空间");
         println!("   💡 运行: jiaclaw init");
-    } else if !has_key {
-        println!("   ⚠️  未配置 API key，将使用存根模式");
-        println!("   💡 设置: export JIACLAW_API_KEY=your-key");
-        println!("   💡 或在存根模式下测试: jiaclaw chat \"你好\"");
     }
 
     Ok(())

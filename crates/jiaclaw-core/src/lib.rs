@@ -145,6 +145,10 @@ pub struct AgentConfig {
     /// 模型提供商配置
     #[serde(default)]
     pub provider: ProviderConfig,
+
+    /// HTTP 服务配置
+    #[serde(default)]
+    pub http: HttpConfig,
 }
 
 fn default_workspace_path() -> std::path::PathBuf {
@@ -152,6 +156,40 @@ fn default_workspace_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".jiaclaw")
         .join("workspace")
+}
+
+/// HTTP 服务配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpConfig {
+    /// HTTP 服务绑定地址
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+
+    /// Webhook 鉴权密钥（可选，环境变量 `JIACLAW_WEBHOOK_SECRET` 优先）
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+
+    /// CORS 允许的来源列表（空或 `["*"]` 表示允许所有来源）
+    #[serde(default = "default_cors_allow_origins")]
+    pub cors_allow_origins: Vec<String>,
+}
+
+fn default_http_bind() -> String {
+    "127.0.0.1:8080".to_string()
+}
+
+fn default_cors_allow_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_http_bind(),
+            webhook_secret: None,
+            cors_allow_origins: default_cors_allow_origins(),
+        }
+    }
 }
 
 /// 模型提供商配置
@@ -224,6 +262,7 @@ impl Default for AgentConfig {
             max_turns: 10,
             workspace_path: default_workspace_path(),
             provider: ProviderConfig::default(),
+            http: HttpConfig::default(),
         }
     }
 }

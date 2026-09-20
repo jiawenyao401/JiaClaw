@@ -107,6 +107,18 @@ base_url = "https://api.brokerrouter.dev"
 model = "claude-3-5-sonnet-20241022"
 temperature = 0.7
 max_tokens = 4096
+
+[http]
+# HTTP 服务绑定地址
+bind = "127.0.0.1:8080"
+
+# Webhook 鉴权密钥（可选，环境变量 JIACLAW_WEBHOOK_SECRET 优先）
+# webhook_secret = "your-secret-here"
+
+# CORS 允许的来源列表（空或 ["*"] 表示允许所有来源）
+cors_allow_origins = ["*"]
+# 或限制特定来源：
+# cors_allow_origins = ["https://example.com"]
 ```
 
 或使用环境变量：
@@ -123,6 +135,9 @@ cargo run --bin jiaclaw -- version
 
 # 初始化工作空间
 cargo run --bin jiaclaw -- init
+
+# 检查配置和环境
+cargo run --bin jiaclaw -- doctor
 
 # 运行单次聊天（需要配置 API key）
 export JIACLAW_API_KEY=brk_live_...
@@ -307,6 +322,18 @@ base_url = "https://api.brokerrouter.dev"
 model = "claude-3-5-sonnet-20241022"
 temperature = 0.7
 max_tokens = 4096
+
+[http]
+# HTTP service bind address
+bind = "127.0.0.1:8080"
+
+# Webhook authentication secret (optional, JIACLAW_WEBHOOK_SECRET env var takes priority)
+# webhook_secret = "your-secret-here"
+
+# CORS allowed origins (empty or ["*"] allows all origins)
+cors_allow_origins = ["*"]
+# Or restrict to specific origins:
+# cors_allow_origins = ["https://example.com"]
 ```
 
 Or use environment variable:
@@ -323,6 +350,9 @@ cargo run --bin jiaclaw -- version
 
 # Initialize workspace
 cargo run --bin jiaclaw -- init
+
+# Check configuration and environment
+cargo run --bin jiaclaw -- doctor
 
 # Run single chat (requires API key)
 export JIACLAW_API_KEY=brk_live_...
