@@ -137,6 +137,12 @@ cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
 # 测试 HTTP API
 curl http://127.0.0.1:8080/health
 
+# 列出已注册的工具
+curl http://127.0.0.1:8080/api/tools
+
+# 列出已发现的技能
+curl http://127.0.0.1:8080/api/skills
+
 # 无状态聊天
 curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \

@@ -210,6 +210,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
         .route("/api/chat", post(chat_handler))
         .route("/api/sessions", post(create_session_handler))
         .route("/api/sessions/:id", delete(delete_session_handler))
+        .route("/api/tools", get(tools_handler))
+        .route("/api/skills", get(skills_handler))
         .layer(cors)
         .with_state(state);
 
@@ -223,6 +225,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
     tracing::info!("   • POST   /api/chat            - 聊天端点");
     tracing::info!("   • POST   /api/sessions        - 创建会话");
     tracing::info!("   • DELETE /api/sessions/:id    - 删除会话");
+    tracing::info!("   • GET    /api/tools           - 列出已注册工具");
+    tracing::info!("   • GET    /api/skills          - 列出已发现技能");
     tracing::info!("\n💡 试试：curl http://{}/health", bind);
     tracing::info!("按 Ctrl+C 停止服务");
 
@@ -366,6 +370,33 @@ struct DeleteSessionResponse {
     message: String,
 }
 
+/// 工具信息
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolInfo {
+    name: String,
+    description: String,
+}
+
+/// 工具列表响应
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolsResponse {
+    tools: Vec<ToolInfo>,
+}
+
+/// 技能信息
+#[derive(Debug, Serialize, Deserialize)]
+struct SkillInfo {
+    name: String,
+    description: String,
+    path: String,
+}
+
+/// 技能列表响应
+#[derive(Debug, Serialize, Deserialize)]
+struct SkillsResponse {
+    skills: Vec<SkillInfo>,
+}
+
 /// 删除会话处理器
 async fn delete_session_handler(
     State(state): State<AppState>,
@@ -387,6 +418,49 @@ async fn delete_session_handler(
             message: format!("会话 {session_id} 不存在"),
         })
     }
+}
+
+/// 工具列表处理器
+async fn tools_handler(State(state): State<AppState>) -> Json<ToolsResponse> {
+    let tool_names = state.agent.tools().list();
+    let tools: Vec<ToolInfo> = tool_names
+        .iter()
+        .filter_map(|name| {
+            state.agent.tools().get(name).map(|tool| ToolInfo {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+            })
+        })
+        .collect();
+
+    tracing::info!("列出工具: {} 个已注册", tools.len());
+    Json(ToolsResponse { tools })
+}
+
+/// 技能列表处理器
+async fn skills_handler(State(state): State<AppState>) -> Json<SkillsResponse> {
+    let workspace_path = &state.agent.config().workspace_path;
+    let discovery = jiaclaw::SkillDiscovery::new(workspace_path);
+
+    let skills = match discovery.discover() {
+        Ok(discovered_skills) => {
+            tracing::info!("发现技能: {} 个", discovered_skills.len());
+            discovered_skills
+                .into_iter()
+                .map(|skill| SkillInfo {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    path: skill.path.to_string_lossy().to_string(),
+                })
+                .collect()
+        }
+        Err(e) => {
+            tracing::warn!("技能发现失败: {}", e);
+            Vec::new()
+        }
+    };
+
+    Json(SkillsResponse { skills })
 }
 
 /// 应用错误类型
@@ -668,6 +742,8 @@ mod tests {
             .route("/api/chat", post(chat_handler))
             .route("/api/sessions", post(create_session_handler))
             .route("/api/sessions/:id", delete(delete_session_handler))
+            .route("/api/tools", get(tools_handler))
+            .route("/api/skills", get(skills_handler))
             .with_state(state)
     }
 
@@ -1028,5 +1104,61 @@ mod tests {
         // 但应该在合理范围内（< MAX_SESSION_MESSAGES + 2，考虑新消息和响应）
         // 这里我们主要验证截断逻辑被触发了
         // 可以通过日志验证，或者检查消息内容包含 system 消息
+    }
+
+    #[tokio::test]
+    async fn test_tools_endpoint() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(Request::builder().uri("/api/tools").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tools_response: ToolsResponse = serde_json::from_slice(&body).unwrap();
+
+        // 应该有一些已注册的工具
+        assert!(!tools_response.tools.is_empty(), "应该有已注册的工具");
+
+        // 验证工具信息包含名称和描述
+        for tool in &tools_response.tools {
+            assert!(!tool.name.is_empty(), "工具名称不应为空");
+            assert!(!tool.description.is_empty(), "工具描述不应为空");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_skills_endpoint() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/skills")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let skills_response: SkillsResponse = serde_json::from_slice(&body).unwrap();
+
+        // 技能可能为空（如果工作空间不存在或没有技能）
+        // 只验证响应格式正确
+        for skill in &skills_response.skills {
+            assert!(!skill.name.is_empty(), "技能名称不应为空");
+            assert!(!skill.description.is_empty(), "技能描述不应为空");
+            assert!(!skill.path.is_empty(), "技能路径不应为空");
+        }
     }
 }
