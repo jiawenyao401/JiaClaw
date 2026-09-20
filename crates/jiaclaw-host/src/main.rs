@@ -5,17 +5,21 @@
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{Method, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use clap::{Parser, Subcommand};
 use jiaclaw::{JiaClawAgent, Workspace};
 use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole};
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Parser)]
@@ -154,6 +158,7 @@ fn init_command(path: Option<PathBuf>, force: bool) -> Result<()> {
 #[derive(Clone)]
 struct AppState {
     agent: Arc<JiaClawAgent>,
+    sessions: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
 }
 
 /// 健康检查响应
@@ -187,6 +192,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
     let agent = JiaClawAgent::new(config).context("创建 JiaClawAgent 失败")?;
     let state = AppState {
         agent: Arc::new(agent),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // 配置 CORS（允许所有来源，生产环境应该更严格）
@@ -199,6 +205,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/api/chat", post(chat_handler))
+        .route("/api/sessions", post(create_session_handler))
+        .route("/api/sessions/:id", delete(delete_session_handler))
         .layer(cors)
         .with_state(state);
 
@@ -208,8 +216,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: String) -> Result<()>
         .with_context(|| format!("无法绑定到地址: {bind}"))?;
 
     tracing::info!("✅ HTTP 服务已启动于 http://{}", bind);
-    tracing::info!("   • GET  /health    - 健康检查");
-    tracing::info!("   • POST /api/chat  - 聊天端点");
+    tracing::info!("   • GET    /health              - 健康检查");
+    tracing::info!("   • POST   /api/chat            - 聊天端点");
+    tracing::info!("   • POST   /api/sessions        - 创建会话");
+    tracing::info!("   • DELETE /api/sessions/:id    - 删除会话");
     tracing::info!("\n💡 试试：curl http://{}/health", bind);
     tracing::info!("按 Ctrl+C 停止服务");
 
@@ -236,9 +246,29 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// 聊天处理器
 async fn chat_handler(
     State(state): State<AppState>,
-    Json(request): Json<ChatRequest>,
+    Json(mut request): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
-    tracing::info!("收到聊天请求，消息数: {}", request.messages.len());
+    tracing::info!(
+        "收到聊天请求，消息数: {}, session_id: {:?}",
+        request.messages.len(),
+        request.session_id
+    );
+
+    let session_id = request.session_id.clone();
+
+    // 如果提供了 session_id，从 session 中获取历史消息
+    if let Some(ref sid) = session_id {
+        let sessions = state.sessions.lock().unwrap();
+        if let Some(history) = sessions.get(sid) {
+            // 将历史消息和新消息合并
+            let mut all_messages = history.clone();
+            all_messages.extend(request.messages.clone());
+            request.messages = all_messages;
+            tracing::info!("使用 session {}, 合并后消息数: {}", sid, request.messages.len());
+        } else {
+            tracing::info!("创建新 session: {}", sid);
+        }
+    }
 
     let response = state
         .agent
@@ -246,13 +276,68 @@ async fn chat_handler(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    // 如果提供了 session_id，更新 session 历史
+    if let Some(ref sid) = session_id {
+        let mut sessions = state.sessions.lock().unwrap();
+        sessions.insert(sid.clone(), request.messages.clone());
+        sessions.entry(sid.clone()).or_default().push(response.message.clone());
+        tracing::info!("更新 session {}, 当前消息数: {}", sid, sessions.get(sid).unwrap().len());
+    }
+
     tracing::info!(
         "聊天响应生成，状态: {:?}, 工具调用数: {}",
         response.status,
         response.tool_calls.len()
     );
 
+    // 将 session_id 添加到响应中
+    let mut response = response;
+    response.session_id = session_id;
+
     Ok(Json(response))
+}
+
+/// 创建会话响应
+#[derive(Debug, Serialize, Deserialize)]
+struct CreateSessionResponse {
+    session_id: String,
+}
+
+/// 创建会话处理器
+async fn create_session_handler() -> Json<CreateSessionResponse> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    tracing::info!("创建新 session: {}", session_id);
+    Json(CreateSessionResponse { session_id })
+}
+
+/// 删除会话响应
+#[derive(Debug, Serialize, Deserialize)]
+struct DeleteSessionResponse {
+    success: bool,
+    message: String,
+}
+
+/// 删除会话处理器
+async fn delete_session_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<DeleteSessionResponse> {
+    let mut sessions = state.sessions.lock().unwrap();
+    let existed = sessions.remove(&session_id).is_some();
+
+    if existed {
+        tracing::info!("删除 session: {}", session_id);
+        Json(DeleteSessionResponse {
+            success: true,
+            message: format!("会话 {session_id} 已删除"),
+        })
+    } else {
+        tracing::warn!("尝试删除不存在的 session: {}", session_id);
+        Json(DeleteSessionResponse {
+            success: false,
+            message: format!("会话 {session_id} 不存在"),
+        })
+    }
 }
 
 /// 应用错误类型
@@ -318,6 +403,7 @@ async fn chat_command(config_path: Option<PathBuf>, message: &str) -> Result<()>
         }],
         enabled_tools: vec![],
         enabled_skills: vec![],
+        session_id: None,
     };
 
     tracing::info!("用户消息: {}", message);
@@ -525,11 +611,14 @@ mod tests {
         let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
         let state = AppState {
             agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         };
 
         Router::new()
             .route("/health", get(health_handler))
             .route("/api/chat", post(chat_handler))
+            .route("/api/sessions", post(create_session_handler))
+            .route("/api/sessions/:id", delete(delete_session_handler))
             .with_state(state)
     }
 
@@ -565,6 +654,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            session_id: None,
         };
 
         let request_body = serde_json::to_string(&request).unwrap();
@@ -602,6 +692,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            session_id: None,
         };
 
         let request_body = serde_json::to_string(&request).unwrap();
@@ -631,5 +722,135 @@ mod tests {
             "应该有工具调用"
         );
         assert_eq!(chat_response.tool_calls[0].tool_name, "workspace_list");
+    }
+
+    #[tokio::test]
+    async fn test_create_session() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_response: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(!create_response.session_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_session() {
+        let app = create_test_app();
+
+        // 第一次请求，创建 session
+        let session_id = "test-session-123".to_string();
+        let request1 = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "你好".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            session_id: Some(session_id.clone()),
+        };
+
+        let request_body1 = serde_json::to_string(&request1).unwrap();
+
+        let response1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response1.status(), StatusCode::OK);
+
+        let body1 = axum::body::to_bytes(response1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let chat_response1: ChatResponse = serde_json::from_slice(&body1).unwrap();
+
+        assert_eq!(chat_response1.session_id, Some(session_id.clone()));
+        assert!(!chat_response1.message.content.is_empty());
+
+        // 第二次请求，使用同一个 session
+        let request2 = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "我是谁？".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            session_id: Some(session_id.clone()),
+        };
+
+        let request_body2 = serde_json::to_string(&request2).unwrap();
+
+        let response2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body2))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response2.status(), StatusCode::OK);
+
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let chat_response2: ChatResponse = serde_json::from_slice(&body2).unwrap();
+
+        assert_eq!(chat_response2.session_id, Some(session_id));
+        assert!(!chat_response2.message.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_session() {
+        let app = create_test_app();
+
+        let session_id = "test-session-to-delete".to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let delete_response: DeleteSessionResponse = serde_json::from_slice(&body).unwrap();
+
+        // Session 不存在时也应该返回 200，但 success 为 false
+        assert!(!delete_response.success);
     }
 }

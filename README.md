@@ -131,8 +131,26 @@ cargo run --bin jiaclaw -- chat "你好，JiaClaw"
 # 或使用配置文件
 cargo run --bin jiaclaw -- chat --config config/jiaclaw.toml "你好，JiaClaw"
 
-# 启动服务（存根实现）
+# 启动 HTTP 服务
 cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
+
+# 测试 HTTP API
+curl http://127.0.0.1:8080/health
+
+# 无状态聊天
+curl -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "你好"}]}'
+
+# 带 session 的多轮对话
+SESSION_ID=$(uuidgen)
+curl -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"我叫张三\"}]}"
+
+curl -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"我是谁？\"}]}"
 ```
 
 **注意**：
@@ -293,8 +311,26 @@ cargo run --bin jiaclaw -- chat "Hello, JiaClaw"
 # Or use config file
 cargo run --bin jiaclaw -- chat --config config/jiaclaw.toml "Hello, JiaClaw"
 
-# Start service (stub implementation)
+# Start HTTP service
 cargo run --bin jiaclaw -- serve --bind 127.0.0.1:8080
+
+# Test HTTP API
+curl http://127.0.0.1:8080/health
+
+# Stateless chat
+curl -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello"}]}'
+
+# Multi-turn conversation with session
+SESSION_ID=$(uuidgen)
+curl -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"My name is John\"}]}"
+
+curl -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"What is my name?\"}]}"
 ```
 
 **Note**:

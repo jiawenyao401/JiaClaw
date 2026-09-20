@@ -51,16 +51,18 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
-| **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ 基础（存根） | P1 | - |
-| **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ⏳ 计划中 | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentHost API |
+| **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ 基础 | P1 | - |
+| **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ✅ **基础（axum）** | P1 | - |
+| **Session（内存）** | ✅ 支持 | ⏳ 部分 | ✅ **已实现** | P1 | - |
 | **SSE 事件流** | ✅ 支持 | ⏳ 部分 | ⏳ 计划中 | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
 | **WebSocket** | ⏳ 社区贡献 | ❌ 无 | ⏳ 计划中（M4） | P2 | - |
 | **Discord/Slack** | ✅ 插件支持 | ❌ 无 | ⏳ 计划中（通过 MCP） | P2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) MCP 集成 |
 | **gRPC** | ❌ 无 | ❌ 无 | ⏳ 可选（通过 StateKnot） | P2 | - |
 
 **JiaClaw 现状**:
-- ✅ CLI 存根已实现（`jiaclaw chat`, `jiaclaw serve`）
-- ❌ HTTP 服务需要 StateKnot `AgentHost` 和身份验证集成
+- ✅ CLI 已实现（`jiaclaw chat`, `jiaclaw serve`）
+- ✅ HTTP 服务已实现（GET /health, POST /api/chat）
+- ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史）
 - ❌ SSE 事件流需要 `DurableAgentRuns` 的事件订阅 API
 
 **目标方案**:

@@ -368,6 +368,7 @@ impl JiaClawAgent {
                     messages: messages.clone(),
                     enabled_tools: vec![],
                     enabled_skills: vec![],
+                    session_id: None,
                 };
                 self.stub_chat(&request, system_prompt)
             };
@@ -381,6 +382,7 @@ impl JiaClawAgent {
                     message: response.message,
                     tool_calls: all_tool_calls,
                     status: response.status,
+                    session_id: None,
                 });
             }
             
@@ -448,6 +450,7 @@ impl JiaClawAgent {
             },
             tool_calls: vec![],
             status: RunStatus::Completed,
+            session_id: None,
         }
     }
 
@@ -710,6 +713,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            session_id: None,
         };
 
         let response = agent.chat(&request).await;
@@ -729,6 +733,7 @@ mod tests {
             }],
             enabled_tools: vec![],
             enabled_skills: vec![],
+            session_id: None,
         };
 
         let response = agent.chat(&request).await;
