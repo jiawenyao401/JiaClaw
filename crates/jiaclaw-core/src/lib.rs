@@ -145,6 +145,10 @@ pub struct AgentConfig {
     /// 模型提供商配置
     #[serde(default)]
     pub provider: ProviderConfig,
+
+    /// HTTP 服务配置
+    #[serde(default)]
+    pub http: HttpConfig,
 }
 
 fn default_workspace_path() -> std::path::PathBuf {
@@ -152,6 +156,40 @@ fn default_workspace_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".jiaclaw")
         .join("workspace")
+}
+
+/// HTTP 服务配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpConfig {
+    /// HTTP 服务绑定地址
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+
+    /// Webhook 鉴权密钥（可选，环境变量 `JIACLAW_WEBHOOK_SECRET` 优先）
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+
+    /// CORS 允许的来源列表（空或 `["*"]` 表示允许所有来源）
+    #[serde(default = "default_cors_allow_origins")]
+    pub cors_allow_origins: Vec<String>,
+}
+
+fn default_http_bind() -> String {
+    "127.0.0.1:8080".to_string()
+}
+
+fn default_cors_allow_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_http_bind(),
+            webhook_secret: None,
+            cors_allow_origins: default_cors_allow_origins(),
+        }
+    }
 }
 
 /// 模型提供商配置
@@ -224,6 +262,7 @@ impl Default for AgentConfig {
             max_turns: 10,
             workspace_path: default_workspace_path(),
             provider: ProviderConfig::default(),
+            http: HttpConfig::default(),
         }
     }
 }
@@ -249,11 +288,24 @@ impl AgentConfig {
         #[derive(Deserialize)]
         struct ConfigFile {
             agent: AgentConfig,
+            #[serde(default)]
+            provider: Option<ProviderConfig>,
+            #[serde(default)]
+            http: Option<HttpConfig>,
         }
 
-        let config: ConfigFile = toml::from_str(content)
+        let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
-        Ok(config.agent)
+        
+        // 如果顶层有 provider 或 http 配置，覆盖 agent 中的配置
+        if let Some(provider) = config_file.provider {
+            config_file.agent.provider = provider;
+        }
+        if let Some(http) = config_file.http {
+            config_file.agent.http = http;
+        }
+        
+        Ok(config_file.agent)
     }
 
     /// 从 JSON 文件加载配置
@@ -276,10 +328,23 @@ impl AgentConfig {
         #[derive(Deserialize)]
         struct ConfigFile {
             agent: AgentConfig,
+            #[serde(default)]
+            provider: Option<ProviderConfig>,
+            #[serde(default)]
+            http: Option<HttpConfig>,
         }
 
-        let config: ConfigFile = serde_json::from_str(content)
+        let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
-        Ok(config.agent)
+        
+        // 如果顶层有 provider 或 http 配置，覆盖 agent 中的配置
+        if let Some(provider) = config_file.provider {
+            config_file.agent.provider = provider;
+        }
+        if let Some(http) = config_file.http {
+            config_file.agent.http = http;
+        }
+        
+        Ok(config_file.agent)
     }
 }

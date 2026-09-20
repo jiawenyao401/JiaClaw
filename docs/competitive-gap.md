@@ -264,22 +264,30 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 |------|----------|--------------|---------|--------|---------------|
 | **安装方式** | `pip install` | `pip install` | `cargo install`（计划） | P1 | - |
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
-| **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ⏳ `jiaclaw init`（本 PR） | P1 | - |
-| **配置文件** | YAML/TOML | JSON/YAML | TOML/JSON | P0 | - |
-| **开发模式** | ✅ 简单 | ✅ 简单 | ⏳ 计划中（本 PR） | P1 | - |
+| **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
+| **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook** | P1 | - |
+| **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
-| **文档质量** | ✅ 优秀 | ⏳ 中等 | ⏳ 基础（本 PR 改进） | P1 | - |
+| **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
 
 **JiaClaw 现状**:
 - ✅ Cargo 工作空间已配置
-- ❌ 缺少 `jiaclaw init` 命令创建工作空间
-- ❌ 文档偏向架构设计，缺少快速上手指南
+- ✅ `jiaclaw init` 命令创建工作空间
+- ✅ HTTP 配置支持（bind、webhook_secret、cors_allow_origins）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置）
+- ⏳ 文档持续改进中
 
 **目标方案**:
-- **P1 初始化向导**: **本 PR 实现**
-  - `jiaclaw init` 创建 `~/.jiaclaw/workspace/` 和示例配置
-  - 创建 `AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`
-- **P1 开发模式**: 无 API key 时使用存根，降低上手门槛
+- **P1 运维配置**: ✅ **已实现**
+  - TOML 配置支持 `[http]` 段落
+  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET` 优先）
+  - CORS 来源控制（空或 `["*"]` 保持 permissive，否则限制）
+  - 启动日志打印配置摘要（不泄露 secret 明文）
+- **P1 doctor 诊断**: ✅ **已实现**
+  - 检查 workspace 可读性、工具数量、技能数量
+  - HTTP 配置摘要（bind、webhook 鉴权状态、CORS 模式）
+  - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
 ---
@@ -364,9 +372,9 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 ### P0 - 关键阻塞（Critical）
 | 功能 | 当前状态 | 计划 |
 |------|---------|------|
-| OpenAI-compatible 提供商 | ❌ 存根 | **本 PR 实现** |
-| 基础 CLI | ✅ 存根 | **本 PR 完善** |
-| 配置管理 | ✅ 基础 | **本 PR 扩展** |
+| OpenAI-compatible 提供商 | ✅ 已实现 | 集成 Brokerrouter |
+| 基础 CLI | ✅ 完善 | - |
+| 配置管理 | ✅ HTTP 配置已添加 | - |
 | StateKnot 稳定 API | ❌ pre-alpha | 等待 [#92](https://github.com/StateKnot/StateKnot/issues/92) |
 
 ### P1 - 高优先级（High）
