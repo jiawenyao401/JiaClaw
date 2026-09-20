@@ -24,19 +24,47 @@
 │  │  - 会话状态                            │                 │
 │  └──────────────────┬────────────────────┘                 │
 │                     │                                        │
+│  提供商适配层        │                                        │
+│  ┌──────────────────▼────────────────────┐                 │
+│  │    Provider Adapter (provider.rs)     │                 │
+│  │  - StubProvider (离线模式)            │                 │
+│  │  - BrokerrouterProvider (生产模式)    │                 │
+│  │  - DirectProvider (临时，待废弃)      │                 │
+│  └──────────────────┬────────────────────┘                 │
+│                     │                                        │
 │  领域模型层          │                                        │
 │  ┌──────────────────▼────────────────────┐                 │
 │  │    Core Types (jiaclaw-core crate)    │                 │
 │  │  - ChatRequest / ChatResponse          │                 │
 │  │  - ChatMessage / MessageRole           │                 │
 │  │  - ToolCall / RunStatus                │                 │
-│  │  - AgentConfig                         │                 │
+│  │  - AgentConfig / ProviderConfig        │                 │
 │  └──────────────────┬────────────────────┘                 │
 └────────────────────┬┬────────────────────────────────────┬─┘
                      ││                                    │
-                     ││  StateKnot 集成边界                │
+                     ││  集成边界                          │
                      ││                                    │
 ┌────────────────────▼▼────────────────────────────────────▼─┐
+│                   Brokerrouter Gateway                      │
+│              (AI Model Routing Layer)                       │
+├─────────────────────────────────────────────────────────────┤
+│  - OpenAI-compatible API (/v1/chat/completions)            │
+│  - 多提供商路由（OpenAI, Anthropic, Ollama, etc.）         │
+│  - 认证与授权                                               │
+│  - 错误处理与重试                                           │
+│  - 可观测性（日志、指标）                                   │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     │  上游提供商
+                     │
+         ┌───────────┼───────────┐
+         ▼           ▼           ▼
+    ┌────────┐  ┌────────┐  ┌────────┐
+    │ OpenAI │  │Anthropic│  │ Ollama │
+    └────────┘  └────────┘  └────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
 │                    StateKnot 框架                           │
 ├─────────────────────────────────────────────────────────────┤
 │  Runtime 层                                                 │
@@ -57,7 +85,7 @@
 │                                                             │
 │  Integration 层                                             │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  Model Adapters: OpenAI, Anthropic                   │  │
+│  │  Model Adapters: (与 Brokerrouter 协同)              │  │
 │  │  Protocol Adapters: MCP, A2A                         │  │
 │  │  McpRemoteTool / A2aRemoteAgent                      │  │
 │  └──────────────────────────────────────────────────────┘  │
@@ -95,6 +123,15 @@
   - 管理聊天会话和对话历史
   - 协调工具调用和技能执行
   - 处理持久化和恢复逻辑
+
+- **Provider 适配器** - 模型提供商抽象
+  - `StubProvider` - 离线存根模式（无需外部服务）
+  - `BrokerrouterProvider` - 生产模式（通过 Brokerrouter Gateway）
+  - `DirectProvider` - 临时直连模式（待废弃）
+  
+- **Workspace** - 工作空间管理
+  - 加载和管理 `AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`
+  - 注入工作空间内容到系统提示
 
 #### 3. `jiaclaw-host` - 可执行宿主
 
@@ -262,14 +299,17 @@ JiaClaw 使用 StateKnot 的类型化 Agent API（`TypedAgent<ChatRequest, ChatR
 
 ## 下一步
 
-1. **监控 StateKnot 发布** - 等待稳定的公共 API
-2. **实现持久化配置** - PostgreSQL 设置和迁移
-3. **注册示例工具** - 基本 MCP 工具集成
-4. **实现 HTTP 服务** - RESTful API 和 SSE 事件
-5. **添加示例技能** - 可扩展的技能系统
+1. **等待 Brokerrouter** - 作为 AI Gateway 层的优先路径
+2. **监控 StateKnot 发布** - 等待稳定的公共 API
+3. **实现持久化配置** - PostgreSQL 设置和迁移
+4. **注册示例工具** - 基本 MCP 工具集成
+5. **实现 HTTP 服务** - RESTful API 和 SSE 事件
+6. **添加示例技能** - 可扩展的技能系统
 
 ## 参考资料
 
 - [StateKnot 文档](https://stknot.com/docs/)
 - [StateKnot 仓库](https://github.com/StateKnot/StateKnot)
+- [Brokerrouter 仓库](https://github.com/StateKnot/Brokerrouter)
+- [Brokerrouter 差距文档](brokerrouter-gaps.md)
 - [StateKnot RFC 和设计文档](https://github.com/StateKnot/StateKnot/tree/main/docs)

@@ -32,7 +32,8 @@ JiaClaw 与 [OpenClaw](https://github.com/openclaw/openclaw) 和 [Hermes Agent](
 - ✅ **类型安全** - Rust + TypedAgent<I,O> 提供编译时保证和 JSON Schema 验证
 - ✅ **生产治理** - 租户隔离、资源策略、预算控制、审计日志
 - ✅ **协议原生** - MCP 和 A2A 一等公民支持，非插件式集成
-- ⚠️ **早期阶段** - 当前功能有限，等待 StateKnot 稳定 API
+- ✅ **Gateway 抽象** - 通过 [Brokerrouter](https://github.com/StateKnot/Brokerrouter) 统一模型访问（规划中）
+- ⚠️ **早期阶段** - 当前功能有限，等待 StateKnot 和 Brokerrouter 稳定 API
 
 详细对比见 [竞争差距分析](docs/competitive-gap.md)，包含 10 个维度（通道、记忆、技能、工具、模型、持久化、安装、安全、调度、多智能体）的能力矩阵和优先级路线图。
 
@@ -120,6 +121,7 @@ JiaClaw/
 - [架构概览](docs/architecture.md) - 系统设计和组件
 - [竞争差距分析](docs/competitive-gap.md) - 相对 OpenClaw/Hermes 的能力对比和路线图
 - [StateKnot 能力差距](docs/stateknot-gaps.md) - 当前限制和追踪的上游议题
+- [Brokerrouter 能力差距](docs/brokerrouter-gaps.md) - AI Gateway 集成需求和议题
 - [路线图](docs/roadmap.md) - 开发计划和里程碑
 
 ## 贡献

@@ -1,7 +1,26 @@
 // Copyright 2026 JiaClaw contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! OpenAI-compatible 模型提供商
+//! 模型提供商适配器
+//!
+//! ## 架构约束
+//!
+//! `JiaClaw` 必须通过 [Brokerrouter](https://github.com/StateKnot/Brokerrouter)
+//! 作为 AI Gateway 路由所有模型调用。
+//!
+//! ## 实现状态
+//!
+//! - ✅ `StubProvider` - 离线存根模式（无需外部服务）
+//! - 🚧 `DirectProvider` - 临时直连模式（当前实现，待废弃）
+//! - ⏳ `BrokerrouterProvider` - 生产模式（待 Brokerrouter 可用后实现）
+//!
+//! ## 过渡计划
+//!
+//! 1. M0.5: 使用 `DirectProvider` 作为临时方案
+//! 2. M1: 实现 `BrokerrouterProvider`，设为默认
+//! 3. M2: 废弃 `DirectProvider`，仅保留 Brokerrouter + Stub
+//!
+//! 参见 `docs/brokerrouter-gaps.md` 了解集成需求和议题跟踪。
 
 use jiaclaw_core::{ChatMessage, ChatResponse, JiaClawError, MessageRole, RunStatus};
 use serde::{Deserialize, Serialize};
@@ -34,7 +53,18 @@ struct OpenAIChoice {
     message: OpenAIMessage,
 }
 
-/// OpenAI-compatible 提供商
+/// OpenAI-compatible 提供商（临时直连实现）
+///
+/// ⚠️ **临时方案**: 这是早期开发的临时实现。
+///
+/// **生产路径**: 将迁移到 `BrokerrouterProvider`，通过 Brokerrouter Gateway
+/// 统一路由到上游提供商（OpenAI, Anthropic, Ollama, etc.）。
+///
+/// **保留原因**:
+/// - 早期开发和测试
+/// - Brokerrouter 可用前的备选方案
+///
+/// **废弃时间**: M2（Brokerrouter 稳定后）
 #[allow(clippy::module_name_repetitions)]
 pub struct OpenAICompatibleProvider {
     base_url: String,
@@ -43,6 +73,10 @@ pub struct OpenAICompatibleProvider {
 
 impl OpenAICompatibleProvider {
     /// 创建新的提供商实例
+    ///
+    /// # 注意
+    ///
+    /// 这是临时实现。生产环境应使用 `BrokerrouterProvider`。
     pub fn new(base_url: &str, api_key: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),

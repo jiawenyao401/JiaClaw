@@ -14,9 +14,10 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ **持久化优先架构** - 基于 StateKnot 的确定性图执行、检查点和恢复
 - ✅ **类型化 Agent 合约** - TypedAgent<I,O> 提供编译时安全和 JSON Schema 验证
 - ✅ **生产治理** - 租户隔离、资源策略、预算控制、审计日志
-- ⏳ **协议原生** - MCP 和 A2A 一等公民支持（待实现）
+- ✅ **协议原生** - MCP 和 A2A 一等公民支持（待实现）
+- ✅ **Gateway 层抽象** - 通过 [Brokerrouter](https://github.com/StateKnot/Brokerrouter) 统一模型访问（规划中）
 
-当前 JiaClaw 处于**早期开发阶段**，许多功能待 StateKnot 稳定后实现。本文档对比三个系统的能力矩阵，标注优先级和实现计划。
+当前 JiaClaw 处于**早期开发阶段**，许多功能待 StateKnot 和 Brokerrouter 稳定后实现。本文档对比三个系统的能力矩阵，标注优先级和实现计划。
 
 ---
 
@@ -199,12 +200,18 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ❌ 需要等待 StateKnot [#92](https://github.com/StateKnot/StateKnot/issues/92) 模型适配器 API
 
 **目标方案**:
-- **P0 OpenAI-compatible**: **本 PR 实现**
-  - 在 JiaClaw 层添加 OpenAI-compatible HTTP 客户端
+- **P0 Brokerrouter 集成**: **优先路径**
+  - 等待 Brokerrouter 仓库可用后，作为主要 Gateway 层
+  - 配置 Brokerrouter 端点和路由规则
+  - 透传标准 OpenAI-compatible 请求
+  - 参见 [Brokerrouter 差距文档](brokerrouter-gaps.md)
+- **P1 临时直连**: 当前 PR 已实现
+  - 在 JiaClaw 层添加 OpenAI-compatible HTTP 客户端（临时方案）
   - 支持 `base_url` + `api_key` 配置（兼容 Ollama/LM Studio）
   - 无 API key 时回退到存根
-- **P1 StateKnot 集成**: 等待 [#92](https://github.com/StateKnot/StateKnot/issues/92) 后迁移到 StateKnot Model Adapter
-- **P1 流式输出**: 等待 StateKnot AgentServiceV1 SSE 支持
+  - ⚠️ 将在 Brokerrouter 可用后废弃，仅用于早期开发
+- **P1 StateKnot 集成**: 等待 [#92](https://github.com/StateKnot/StateKnot/issues/92) 后迁移到 StateKnot Model Adapter（与 Brokerrouter 协同）
+- **P1 流式输出**: 等待 Brokerrouter SSE 支持 + StateKnot AgentServiceV1
 
 **竞争优势**:
 - 模型调用自动持久化，失败自动重试（at-least-once 语义）
@@ -415,16 +422,23 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 ## 下一步行动（本 PR 后）
 
-### 立即可做（不依赖 StateKnot）
-1. ✅ **本 PR**: OpenAI-compatible 提供商、工作空间引导、技能骨架
+### 立即可做（不依赖 StateKnot/Brokerrouter）
+1. ✅ **本 PR**: OpenAI-compatible 提供商（临时直连）、工作空间引导、技能骨架
 2. 改进文档（Quick Start、Tutorial）
 3. 添加更多示例技能
 4. 社区参与（博客、视频、讨论）
 
+### 等待 Brokerrouter（M0.5-M1 过渡）
+1. 监控 Brokerrouter 仓库可用性
+2. 创建 Brokerrouter 集成议题（#1-#10）
+3. 实现 `BrokerrouterProvider` 适配器
+4. 配置 Brokerrouter 作为默认 Gateway
+5. 废弃临时直连模式（保留存根）
+
 ### 等待 StateKnot（M1）
 1. 监控 [#92](https://github.com/StateKnot/StateKnot/issues/92) 稳定 API 发布
 2. 实现 PostgreSQL 持久化配置
-3. 迁移到 StateKnot Model Adapter
+3. 集成 StateKnot Model Adapter（与 Brokerrouter 协同）
 4. 实现 HTTP/SSE 服务
 
 ### 中期目标（M2-M3）
@@ -441,7 +455,9 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 ---
 
-## 附录：上游议题清单
+## 附录：上游依赖清单
+
+### StateKnot 议题
 
 | 议题 | 标题 | 状态 | 链接 |
 |------|------|------|------|
@@ -450,6 +466,19 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | #94 | Configuration helpers for PostgreSQL | Open | https://github.com/StateKnot/StateKnot/issues/94 |
 | #95 | Documentation: Local Rust tools | Open | https://github.com/StateKnot/StateKnot/issues/95 |
 | #96 | Discussion: Skill composition | Open | https://github.com/StateKnot/StateKnot/issues/96 |
+
+### Brokerrouter 议题
+
+详见 [Brokerrouter 差距文档](brokerrouter-gaps.md)
+
+| 议题 | 标题 | 优先级 | 状态 | 链接 |
+|------|------|--------|------|------|
+| #1 | OpenAI-compatible API 实现 | P0 | 待创建 | [Brokerrouter#1](https://github.com/StateKnot/Brokerrouter/issues/1) |
+| #2 | 多提供商支持和自动路由 | P0 | 待创建 | [Brokerrouter#2](https://github.com/StateKnot/Brokerrouter/issues/2) |
+| #3 | 认证与授权 | P1 | 待创建 | [Brokerrouter#3](https://github.com/StateKnot/Brokerrouter/issues/3) |
+| #4 | 流式响应支持 | P1 | 待创建 | [Brokerrouter#4](https://github.com/StateKnot/Brokerrouter/issues/4) |
+| #5 | 工具调用支持 | P1 | 待创建 | [Brokerrouter#5](https://github.com/StateKnot/Brokerrouter/issues/5) |
+| ... | *(更多见 brokerrouter-gaps.md)* | - | - | - |
 
 ---
 
