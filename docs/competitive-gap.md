@@ -112,26 +112,53 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
-| **技能定义** | ✅ Python 类 + 装饰器 | ✅ 函数 + 描述 | ⏳ SKILL.md（计划） | P1 | [#96](https://github.com/StateKnot/StateKnot/issues/96) 技能组合 |
-| **技能发现** | ✅ 自动扫描 | ⏳ 手动注册 | ⏳ 计划中 | P1 | - |
-| **技能激活** | ✅ 动态加载 | ✅ 运行时选择 | ⏳ 计划中（M3） | P1 | - |
+| **技能定义** | ✅ Python 类 + 装饰器 | ✅ 函数 + 描述 | ✅ **SKILL.md + YAML frontmatter** | P1 | [#96](https://github.com/StateKnot/StateKnot/issues/96) 技能组合 |
+| **技能发现** | ✅ 自动扫描 | ⏳ 手动注册 | ✅ **自动扫描 skills/**  | P1 | - |
+| **技能激活** | ✅ 动态加载 | ✅ 运行时选择 | ✅ **显式 + 自动触发** | P1 | - |
+| **触发器** | ⏳ 部分支持 | ❌ 无 | ✅ **关键词匹配** | P1 | - |
 | **技能依赖** | ⏳ 部分支持 | ❌ 无 | ⏳ 计划中（M3） | P2 | - |
 | **技能市场** | ✅ 社区生态 | ❌ 无 | ⏳ 计划中（M3） | P2 | - |
 | **技能隔离** | ❌ 无 | ❌ 无 | ✅ **租户策略** | P1 | StateKnot 租户隔离 |
 
 **JiaClaw 现状**:
-- ❌ 技能系统尚未实现，仅有 `ChatRequest.enabled_skills` 字段
-- ❌ 需要设计技能清单格式和加载机制
+- ✅ 技能定义：`SKILL.md` 格式（YAML frontmatter + Markdown 内容）
+- ✅ 技能发现：启动时自动扫描 `skills/**/SKILL.md`
+- ✅ 技能激活：支持显式启用（`enabled_skills` 字段）和自动触发（`triggers` 关键词）
+- ✅ CLI 命令：`jiaclaw skills` 列出已发现技能
+- ✅ API 端点：`GET /api/skills` 返回技能列表
+- ✅ 示例技能：`search` 和 `calculator`（带触发器）
+
+**技能格式示例**:
+```markdown
+---
+name: web_search
+description: 搜索互联网信息
+triggers:
+  - search
+  - 搜索
+  - find
+---
+
+# Web Search Skill
+...
+```
 
 **目标方案**:
-- **P1 技能定义**: 采用 `SKILL.md` 格式（类似 Cursor Agent Skills）
+- **P1 技能定义** ✅ 已实现
   - 每个技能一个目录: `skills/<skill-name>/SKILL.md`
-  - 清单包含: 名称、描述、工具列表、提示片段、依赖
-- **P1 技能发现**: 运行时扫描 `skills/` 目录
-- **P1 技能激活**: 根据用户请求或 Agent 配置动态加载
+  - YAML frontmatter: `name`, `description`, `triggers`
+  - Markdown 内容: 详细说明、使用示例
+- **P1 技能发现** ✅ 已实现
+  - 运行时扫描 `skills/` 目录
+  - 解析 YAML frontmatter 和 Markdown 内容
+- **P1 技能激活** ✅ 已实现
+  - 显式启用：通过 `ChatRequest.enabled_skills` 指定
+  - 自动触发：用户消息匹配 `triggers` 时自动启用（可配置）
 - **P2 技能隔离**: 利用 StateKnot 的资源策略限制技能的工具访问范围
 
 **竞争优势**:
+- 技能格式简单（Markdown + YAML），易于编辑和版本控制
+- 自动触发机制降低用户学习成本
 - 技能隔离和权限管理由 StateKnot 租户策略提供，更安全
 - 技能执行自动获得持久化和恢复能力
 

@@ -152,8 +152,35 @@ impl JiaClawAgent {
     ///
     /// 本方法会自动处理工具调用循环（最多 5 次迭代）。
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, JiaClawError> {
+        // 检查是否有技能应该被自动触发
+        let mut enabled_skills = request.enabled_skills.clone();
+        
+        if let Some(last_user_msg) = request
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::User))
+        {
+            let discovery = SkillDiscovery::new(&self.config.workspace_path);
+            let auto_triggered = discovery.auto_trigger_skills(&last_user_msg.content, &self.skills);
+            
+            for skill_name in auto_triggered {
+                if !enabled_skills.contains(&skill_name) {
+                    tracing::info!("自动激活技能: {}", skill_name);
+                    enabled_skills.push(skill_name);
+                }
+            }
+        }
+        
+        let request_with_skills = ChatRequest {
+            messages: request.messages.clone(),
+            enabled_tools: request.enabled_tools.clone(),
+            enabled_skills,
+            session_id: request.session_id.clone(),
+        };
+        
         // 构建完整的系统提示（包含工作空间内容）
-        let system_prompt = self.build_system_prompt(request);
+        let system_prompt = self.build_system_prompt(&request_with_skills);
 
         // 从配置或环境变量获取 API key
         let env_key = std::env::var("JIACLAW_API_KEY").ok();
@@ -170,7 +197,7 @@ impl JiaClawAgent {
             (Some(key), "brokerrouter" | "openai_compatible") => {
                 // 使用工具执行循环
                 self.execute_tool_loop(
-                    request.messages.clone(),
+                    request_with_skills.messages.clone(),
                     &system_prompt,
                     provider_type,
                     Some(key),
@@ -184,7 +211,7 @@ impl JiaClawAgent {
                 );
                 // 存根模式也支持工具执行
                 self.execute_tool_loop(
-                    request.messages.clone(),
+                    request_with_skills.messages.clone(),
                     &system_prompt,
                     "stub",
                     None,
@@ -197,7 +224,7 @@ impl JiaClawAgent {
                     "未配置 API key（通过配置文件或 JIACLAW_API_KEY 环境变量），使用存根模式"
                 );
                 self.execute_tool_loop(
-                    request.messages.clone(),
+                    request_with_skills.messages.clone(),
                     &system_prompt,
                     "stub",
                     None,

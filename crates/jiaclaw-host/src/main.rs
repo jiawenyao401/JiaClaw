@@ -75,6 +75,17 @@ enum Commands {
         #[arg(short, long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
+
+    /// 列出已发现的技能
+    Skills {
+        /// 配置文件路径
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+
+        /// 显示详细信息
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
@@ -104,6 +115,9 @@ async fn main() -> Result<()> {
         }
         Commands::Doctor { config } => {
             doctor_command(config)?;
+        }
+        Commands::Skills { config, verbose } => {
+            skills_command(config, verbose)?;
         }
     }
 
@@ -970,6 +984,87 @@ fn version_command() {
 }
 
 #[allow(clippy::too_many_lines)]
+fn skills_command(config_path: Option<PathBuf>, verbose: bool) -> Result<()> {
+    let config = if let Some(path) = config_path {
+        let path_str = path.to_string_lossy();
+        if path_str.ends_with(".toml") {
+            AgentConfig::from_toml_file(&path)?
+        } else if path_str.ends_with(".json") {
+            AgentConfig::from_json_file(&path)?
+        } else {
+            AgentConfig::from_toml_file(&path).or_else(|_| AgentConfig::from_json_file(&path))?
+        }
+    } else {
+        AgentConfig::default()
+    };
+
+    println!("🎯 JiaClaw 技能列表\n");
+    println!("📁 工作空间: {}\n", config.workspace_path.display());
+
+    let skills_dir = config.workspace_path.join("skills");
+    
+    if !skills_dir.exists() {
+        println!("❌ 技能目录不存在: {}", skills_dir.display());
+        println!("\n💡 运行 'jiaclaw init' 创建工作空间和示例技能");
+        return Ok(());
+    }
+
+    let discovery = jiaclaw::SkillDiscovery::new(&config.workspace_path);
+    
+    match discovery.discover() {
+        Ok(skills) => {
+            if skills.is_empty() {
+                println!("⚠️  未发现任何技能");
+                println!("\n💡 在 {} 中创建技能目录和 SKILL.md 文件", skills_dir.display());
+                println!("   每个技能应包含:");
+                println!("   • YAML frontmatter（name, description, triggers）");
+                println!("   • Markdown 内容（技能说明）");
+            } else {
+                println!("✅ 发现 {} 个技能:\n", skills.len());
+                
+                for (i, skill) in skills.iter().enumerate() {
+                    println!("{}. {}", i + 1, skill.name);
+                    println!("   描述: {}", skill.description);
+                    
+                    if skill.triggers.is_empty() {
+                        println!("   触发词: 无");
+                    } else {
+                        println!("   触发词: {}", skill.triggers.join(", "));
+                    }
+                    
+                    println!("   路径: {}", skill.path.display());
+                    
+                    if verbose {
+                        println!("\n   内容预览:");
+                        let preview = skill.content
+                            .lines()
+                            .take(5)
+                            .collect::<Vec<_>>()
+                            .join("\n   ");
+                        println!("   {preview}");
+                        if skill.content.lines().count() > 5 {
+                            println!("   ...");
+                        }
+                    }
+                    
+                    println!();
+                }
+                
+                println!("💡 使用提示:");
+                println!("   • 显式启用: 在 ChatRequest 的 enabled_skills 字段中指定");
+                println!("   • 自动激活: 当用户消息包含触发词时自动启用");
+                println!("   • 详细模式: 使用 --verbose 查看技能完整内容");
+            }
+        }
+        Err(e) => {
+            println!("❌ 技能发现失败: {e}");
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
+}
+
 fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("🔍 JiaClaw 配置检查\n");
 

@@ -234,11 +234,20 @@ This file stores important context and information from past conversations.
     }
 
     fn search_skill_content() -> &'static str {
-        r#"# Search Skill
+        r#"---
+name: search
+description: Web search capability for finding information online
+triggers:
+  - search
+  - 搜索
+  - find
+  - 查找
+  - look up
+---
 
-## Description
+# Search Skill
 
-Web search capability for finding information online.
+This skill provides web search capabilities for finding information, news, and current events.
 
 ## Tools
 
@@ -254,6 +263,7 @@ When the user asks to search for information, news, or current events, use this 
 - "Search for the latest news on AI"
 - "Find information about Rust programming"
 - "Look up the weather forecast"
+- "搜索最新的 AI 新闻"
 
 ## Implementation Status
 
@@ -267,11 +277,20 @@ When the user asks to search for information, news, or current events, use this 
     }
 
     fn calculator_skill_content() -> &'static str {
-        r#"# Calculator Skill
+        r#"---
+name: calculator
+description: Mathematical computation and evaluation skill
+triggers:
+  - calculate
+  - 计算
+  - math
+  - 数学
+  - compute
+---
 
-## Description
+# Calculator Skill
 
-Mathematical computation and evaluation skill.
+This skill provides mathematical computation and evaluation capabilities.
 
 ## Tools
 
@@ -287,6 +306,7 @@ When the user asks to perform calculations or unit conversions, use this skill.
 - "Calculate 15% tip on $85"
 - "Convert 100 kilometers to miles"
 - "What's the square root of 144?"
+- "计算 123 * 456"
 
 ## Implementation Status
 
