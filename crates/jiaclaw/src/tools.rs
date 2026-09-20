@@ -230,6 +230,395 @@ impl Tool for MemoryReadTool {
     }
 }
 
+/// File Read 工具（读取工作空间文件）
+pub struct FileReadTool {
+    workspace_path: PathBuf,
+}
+
+impl FileReadTool {
+    /// 创建新的文件读取工具
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: workspace_path.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FileReadTool {
+    fn name(&self) -> &str {
+        "file_read"
+    }
+
+    fn description(&self) -> &str {
+        "读取工作空间中的文件内容（相对路径，沙箱化到工作空间）"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "文件相对路径（相对于工作空间根目录）"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let relative_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'path'".to_string()))?;
+
+        // 规范化路径以防止目录遍历攻击
+        let file_path = self.workspace_path.join(relative_path);
+        let canonical_path = file_path.canonicalize().unwrap_or(file_path.clone());
+
+        // 确保文件在工作空间内
+        if !canonical_path.starts_with(&self.workspace_path) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "安全错误: 文件 {} 在工作空间外部",
+                relative_path
+            )));
+        }
+
+        if !canonical_path.exists() {
+            return Ok(format!("文件不存在: {}", relative_path));
+        }
+
+        if !canonical_path.is_file() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径 {} 不是文件",
+                relative_path
+            )));
+        }
+
+        let content = std::fs::read_to_string(&canonical_path)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法读取文件: {e}")))?;
+
+        Ok(format!(
+            "文件: {}\n路径: {}\n大小: {} 字节\n\n{}",
+            relative_path,
+            canonical_path.display(),
+            content.len(),
+            content
+        ))
+    }
+}
+
+/// File Write 工具（写入工作空间文件）
+pub struct FileWriteTool {
+    workspace_path: PathBuf,
+}
+
+impl FileWriteTool {
+    /// 创建新的文件写入工具
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: workspace_path.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FileWriteTool {
+    fn name(&self) -> &str {
+        "file_write"
+    }
+
+    fn description(&self) -> &str {
+        "在工作空间中写入或创建文件（相对路径，沙箱化到工作空间）"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "文件相对路径（相对于工作空间根目录）"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "要写入的文件内容"
+                }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let relative_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'path'".to_string()))?;
+
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'content'".to_string()))?;
+
+        // 构建文件路径
+        let file_path = self.workspace_path.join(relative_path);
+
+        // 确保目标路径在工作空间内（before creating file)
+        let parent = file_path
+            .parent()
+            .ok_or_else(|| JiaClawError::ToolExecution("无效的文件路径".to_string()))?;
+
+        if !parent.starts_with(&self.workspace_path) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "安全错误: 文件 {} 在工作空间外部",
+                relative_path
+            )));
+        }
+
+        // 创建父目录（如果不存在）
+        std::fs::create_dir_all(parent)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法创建目录: {e}")))?;
+
+        // 写入文件
+        std::fs::write(&file_path, content)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法写入文件: {e}")))?;
+
+        Ok(format!(
+            "✅ 文件已写入: {}\n路径: {}\n大小: {} 字节",
+            relative_path,
+            file_path.display(),
+            content.len()
+        ))
+    }
+}
+
+/// HTTP GET 工具
+pub struct HttpGetTool;
+
+impl HttpGetTool {
+    /// 创建新的HTTP GET工具
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for HttpGetTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for HttpGetTool {
+    fn name(&self) -> &str {
+        "http_get"
+    }
+
+    fn description(&self) -> &str {
+        "发送HTTP GET请求并返回响应内容"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "目标URL（必须是http或https）"
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'url'".to_string()))?;
+
+        // 验证URL格式
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(JiaClawError::ToolExecution(
+                "URL必须以http://或https://开头".to_string(),
+            ));
+        }
+
+        // 使用spawn_blocking执行同步HTTP请求
+        let url_owned = url.to_string();
+        tokio::task::spawn_blocking(move || {
+            let response = minreq::get(&url_owned)
+                .send()
+                .map_err(|e| JiaClawError::ToolExecution(format!("HTTP请求失败: {e}")))?;
+
+            let status = response.status_code;
+            let body = response.as_str().unwrap_or_default().to_string();
+
+            Ok(format!(
+                "HTTP GET {}\n状态码: {}\n响应大小: {} 字节\n\n{}",
+                url_owned,
+                status,
+                body.len(),
+                if body.len() > 1000 {
+                    format!(
+                        "{}...\n\n[响应过长，已截断。完整大小: {} 字节]",
+                        &body[..1000],
+                        body.len()
+                    )
+                } else {
+                    body
+                }
+            ))
+        })
+        .await
+        .map_err(|e| JiaClawError::ToolExecution(format!("任务执行失败: {e}")))?
+    }
+}
+
+/// DateTime 工具
+pub struct DateTimeTool;
+
+impl DateTimeTool {
+    /// 创建新的DateTime工具
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DateTimeTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for DateTimeTool {
+    fn name(&self) -> &str {
+        "datetime_now"
+    }
+
+    fn description(&self) -> &str {
+        "获取当前日期和时间（UTC）"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, JiaClawError> {
+        use std::time::SystemTime;
+
+        let now = SystemTime::now();
+        let duration_since_epoch = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| JiaClawError::ToolExecution(format!("系统时间错误: {e}")))?;
+
+        let timestamp = duration_since_epoch.as_secs();
+
+        // 简单的UTC时间格式化
+        let days_since_epoch = timestamp / 86400;
+        let seconds_today = timestamp % 86400;
+        let hours = seconds_today / 3600;
+        let minutes = (seconds_today % 3600) / 60;
+        let seconds = seconds_today % 60;
+
+        // 简单的日期计算（从1970-01-01开始）
+        let year = 1970 + days_since_epoch / 365; // 简化计算
+
+        Ok(format!(
+            "当前时间 (UTC):\n\
+             Unix时间戳: {}\n\
+             大约时间: {}-??-?? {:02}:{:02}:{:02}\n\n\
+             注意: 这是简化的时间表示。完整的日期时间功能将在后续迭代中添加。",
+            timestamp, year, hours, minutes, seconds
+        ))
+    }
+}
+
+/// JSON Query 工具
+pub struct JsonQueryTool;
+
+impl JsonQueryTool {
+    /// 创建新的JSON查询工具
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for JsonQueryTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for JsonQueryTool {
+    fn name(&self) -> &str {
+        "json_query"
+    }
+
+    fn description(&self) -> &str {
+        "解析JSON字符串并提取指定路径的值（使用点号表示法，如：user.name）"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "json": {
+                    "type": "string",
+                    "description": "JSON字符串"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "查询路径（可选，留空返回整个JSON）"
+                }
+            },
+            "required": ["json"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let json_str = args
+            .get("json")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'json'".to_string()))?;
+
+        let path = args.get("path").and_then(|v| v.as_str());
+
+        // 解析JSON
+        let json_value: Value = serde_json::from_str(json_str)
+            .map_err(|e| JiaClawError::ToolExecution(format!("JSON解析失败: {e}")))?;
+
+        // 如果没有指定路径，返回格式化的整个JSON
+        if path.is_none() || path == Some("") {
+            let pretty = serde_json::to_string_pretty(&json_value)
+                .unwrap_or_else(|_| json_value.to_string());
+            return Ok(format!("JSON (格式化):\n\n{}", pretty));
+        }
+
+        // 处理路径查询
+        let path = path.unwrap();
+        let parts: Vec<&str> = path.split('.').collect();
+
+        let mut current = &json_value;
+        for part in &parts {
+            current = current
+                .get(part)
+                .ok_or_else(|| JiaClawError::ToolExecution(format!("路径 '{}' 不存在", path)))?;
+        }
+
+        let result = serde_json::to_string_pretty(current).unwrap_or_else(|_| current.to_string());
+
+        Ok(format!("查询路径: {}\n结果:\n\n{}", path, result))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +690,121 @@ mod tests {
 
         let tools = registry.list();
         assert!(tools.contains(&"workspace_list"));
+    }
+
+    #[tokio::test]
+    async fn test_file_read_tool() {
+        let temp_workspace = std::env::temp_dir().join("jiaclaw_test_file_read");
+        let _ = fs::remove_dir_all(&temp_workspace);
+        fs::create_dir_all(&temp_workspace).unwrap();
+
+        let test_content = "Test file content";
+        fs::write(temp_workspace.join("test.txt"), test_content).unwrap();
+
+        let tool = FileReadTool::new(&temp_workspace);
+
+        assert_eq!(tool.name(), "file_read");
+
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt"}))
+            .await
+            .unwrap();
+
+        assert!(result.contains(test_content));
+        assert!(result.contains("test.txt"));
+
+        let _ = fs::remove_dir_all(&temp_workspace);
+    }
+
+    #[tokio::test]
+    async fn test_file_write_tool() {
+        let temp_workspace = std::env::temp_dir().join("jiaclaw_test_file_write");
+        let _ = fs::remove_dir_all(&temp_workspace);
+        fs::create_dir_all(&temp_workspace).unwrap();
+
+        let tool = FileWriteTool::new(&temp_workspace);
+
+        assert_eq!(tool.name(), "file_write");
+
+        let test_content = "Written content";
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "output.txt",
+                "content": test_content
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("已写入"));
+
+        // 验证文件确实被写入
+        let file_path = temp_workspace.join("output.txt");
+        assert!(file_path.exists());
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, test_content);
+
+        let _ = fs::remove_dir_all(&temp_workspace);
+    }
+
+    #[tokio::test]
+    async fn test_http_get_tool() {
+        let tool = HttpGetTool::new();
+
+        assert_eq!(tool.name(), "http_get");
+
+        // 测试无效URL
+        let result = tool
+            .execute(serde_json::json!({"url": "invalid-url"}))
+            .await;
+        assert!(result.is_err());
+
+        // 注意: 实际的HTTP测试需要mock服务器，这里仅测试工具结构
+    }
+
+    #[tokio::test]
+    async fn test_datetime_tool() {
+        let tool = DateTimeTool::new();
+
+        assert_eq!(tool.name(), "datetime_now");
+
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(result.contains("Unix时间戳"));
+        assert!(result.contains("UTC"));
+    }
+
+    #[tokio::test]
+    async fn test_json_query_tool() {
+        let tool = JsonQueryTool::new();
+
+        assert_eq!(tool.name(), "json_query");
+
+        let test_json = r#"{"user": {"name": "Alice", "age": 30}}"#;
+
+        // 测试完整JSON
+        let result = tool
+            .execute(serde_json::json!({"json": test_json}))
+            .await
+            .unwrap();
+        assert!(result.contains("Alice"));
+
+        // 测试路径查询
+        let result = tool
+            .execute(serde_json::json!({
+                "json": test_json,
+                "path": "user.name"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("Alice"));
+
+        // 测试无效路径
+        let result = tool
+            .execute(serde_json::json!({
+                "json": test_json,
+                "path": "invalid.path"
+            }))
+            .await;
+        assert!(result.is_err());
     }
 }

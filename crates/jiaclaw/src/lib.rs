@@ -21,7 +21,10 @@ mod workspace;
 
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
 pub use skills::{Skill, SkillDiscovery};
-pub use tools::{MemoryReadTool, Tool, ToolRegistry, WorkspaceListTool};
+pub use tools::{
+    DateTimeTool, FileReadTool, FileWriteTool, HttpGetTool, JsonQueryTool, MemoryReadTool, Tool,
+    ToolRegistry, WorkspaceListTool,
+};
 pub use workspace::Workspace;
 
 // StateKnot imports - commented out until edition 2024 support
@@ -78,6 +81,11 @@ impl JiaClawAgent {
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(WorkspaceListTool::new(&config.workspace_path)));
         tools.register(Box::new(MemoryReadTool::new(&config.workspace_path)));
+        tools.register(Box::new(FileReadTool::new(&config.workspace_path)));
+        tools.register(Box::new(FileWriteTool::new(&config.workspace_path)));
+        tools.register(Box::new(HttpGetTool::new()));
+        tools.register(Box::new(DateTimeTool::new()));
+        tools.register(Box::new(JsonQueryTool::new()));
 
         tracing::info!("注册了 {} 个本地工具", tools.list().len());
 
