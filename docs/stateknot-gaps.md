@@ -36,8 +36,8 @@ JiaClaw 使用 **git 依赖** 来跟踪 StateKnot 开发进度，但完整功能
 stateknot-core = { git = "https://github.com/StateKnot/StateKnot", rev = "main" }
 ```
 
-**上游议题**: 待创建
-- 标题: "Track: Stable public API release for v0.1.0"
+**上游议题**: [StateKnot/StateKnot#92](https://github.com/StateKnot/StateKnot/issues/92)
+- 标题: "Track: Stable public API release for external consumers"
 - 描述: JiaClaw 需要稳定的公共 API 来构建个人智能体运行时
 - 接受标准:
   - [ ] `stateknot-core` 发布到 crates.io
@@ -79,7 +79,7 @@ let result = agent.run(request).await?;
 - JiaClaw 实现自己的协调逻辑（`JiaClawAgent` 包装器）
 - 当前返回存根响应
 
-**上游议题**: 待创建
+**上游议题**: [StateKnot/StateKnot#93](https://github.com/StateKnot/StateKnot/issues/93)
 - 标题: "Feature: Add convenience API for simple agent runs"
 - 描述: 
   - JiaClaw 用例：快速启动的个人助手，不需要完整的多角色部署
@@ -111,7 +111,7 @@ let store = PostgresStore::connect(config).await?;
 - 暂时跳过持久化集成
 - 使用存根实现进行开发
 
-**上游议题**: 待创建
+**上游议题**: [StateKnot/StateKnot#94](https://github.com/StateKnot/StateKnot/issues/94)
 - 标题: "Feature: Add configuration helpers for PostgreSQL setup"
 - 描述:
   - JiaClaw 用例：简化开发环境设置
@@ -145,7 +145,7 @@ agent_builder.add_tool(SearchTool::new())?;
 - 使用 MCP 协议包装本地工具
 - 或等待文档/示例
 
-**上游议题**: 待创建
+**上游议题**: [StateKnot/StateKnot#95](https://github.com/StateKnot/StateKnot/issues/95)
 - 标题: "Documentation: How to register local Rust tools"
 - 描述:
   - JiaClaw 用例：内置工具（搜索、文件操作等）
@@ -174,7 +174,7 @@ agent_builder.add_tool(SearchTool::new())?;
 - 将技能建模为工具集合
 - 在 JiaClaw 层面管理技能逻辑
 
-**上游议题**: 待创建
+**上游议题**: [StateKnot/StateKnot#96](https://github.com/StateKnot/StateKnot/issues/96)
 - 标题: "Discussion: Best practices for skill composition"
 - 描述:
   - JiaClaw 用例：用户定义的技能模块
@@ -189,17 +189,20 @@ agent_builder.add_tool(SearchTool::new())?;
 
 | 议题编号 | 标题 | 状态 | 优先级 | 链接 |
 |---------|------|------|--------|------|
-| TBD | Stable public API release tracking | 待创建 | Critical | - |
-| TBD | Convenience API for simple agent runs | 待创建 | High | - |
-| TBD | Configuration helpers for PostgreSQL | 待创建 | Medium | - |
-| TBD | Documentation: Local Rust tools | 待创建 | Medium | - |
-| TBD | Discussion: Skill composition | 待创建 | Low | - |
+| #92 | Stable public API release tracking | Open | Critical | [StateKnot/StateKnot#92](https://github.com/StateKnot/StateKnot/issues/92) |
+| #93 | Convenience API for simple agent runs | Open | High | [StateKnot/StateKnot#93](https://github.com/StateKnot/StateKnot/issues/93) |
+| #94 | Configuration helpers for PostgreSQL | Open | Medium | [StateKnot/StateKnot#94](https://github.com/StateKnot/StateKnot/issues/94) |
+| #95 | Documentation: Local Rust tools | Open | Medium | [StateKnot/StateKnot#95](https://github.com/StateKnot/StateKnot/issues/95) |
+| #96 | Discussion: Skill composition | Open | Low | [StateKnot/StateKnot#96](https://github.com/StateKnot/StateKnot/issues/96) |
 
-**创建议题计划**:
-1. 完成 JiaClaw 初始 PR（展示用例和集成点）
-2. 基于真实集成经验提炼议题描述
-3. 在 StateKnot 仓库创建议题
-4. 更新此文档链接
+**创建时间**: 2026-09-20
+
+所有议题已提交到 StateKnot 仓库，包含：
+- JiaClaw 用例说明
+- 当前限制分析
+- 提议的 API/契约
+- 接受标准
+- 指向 JiaClaw 项目的链接
 
 ---
 
@@ -305,7 +308,7 @@ mod tests {
 ## 更新日志
 
 - **2026-09-20**: 初始文档，识别 5 个主要差距
-- **待定**: 创建上游议题并更新链接
+- **2026-09-20**: 创建上游议题 #92-#96 并更新链接
 
 ---
 
