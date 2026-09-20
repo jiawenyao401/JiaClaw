@@ -10,9 +10,15 @@
 //! - 持久化运行（支持重启后恢复）
 
 pub use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, JiaClawError, MessageRole, RunStatus,
-    ToolCall,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, JiaClawError, MessageRole, ProviderConfig,
+    RunStatus, ToolCall,
 };
+
+mod provider;
+mod workspace;
+
+use provider::OpenAICompatibleProvider;
+pub use workspace::Workspace;
 
 // StateKnot imports - commented out until edition 2024 support
 // use stateknot_core::{AgentExecutionConfig, AgentInstructions, BudgetLimits};
@@ -24,6 +30,7 @@ pub use jiaclaw_core::{
 /// 本结构体为未来集成预留了接口。
 pub struct JiaClawAgent {
     config: AgentConfig,
+    workspace: Workspace,
     // TODO: 当 StateKnot 发布稳定 API 后，添加 TypedAgent 字段
     // typed_agent: TypedAgent<ChatRequest, ChatResponse>,
 }
@@ -47,7 +54,10 @@ impl JiaClawAgent {
     ///
     /// 参见 `docs/stateknot-gaps.md` 了解详情。
     pub fn new(config: AgentConfig) -> Result<Self, JiaClawError> {
-        Ok(Self { config })
+        // 加载工作空间文件
+        let workspace = Workspace::load(&config.workspace_path)?;
+
+        Ok(Self { config, workspace })
     }
 
     /// 获取 Agent 配置
@@ -56,33 +66,99 @@ impl JiaClawAgent {
         &self.config
     }
 
+    /// 获取工作空间
+    #[must_use]
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+
     /// 处理聊天请求
     ///
     /// # Errors
     ///
-    /// 当前实现始终返回 `Ok`，但未来可能在以下情况返回错误：
+    /// 可能返回以下错误：
     /// - 请求验证失败
-    /// - `StateKnot` 执行失败
     /// - 模型调用失败
-    /// - 持久化失败
+    /// - 网络错误
     ///
-    /// # 当前实现
+    /// # 实现说明
     ///
-    /// 这是一个存根实现，提供简单的演示响应。完整的实现需要：
-    /// 1. `StateKnot` 的持久化准入（`DurableAgentAdmission`）
-    /// 2. 图驱动器（`GraphDriver`）执行
-    /// 3. 持久化调用执行器（`DurableInvocationExecutor`）
-    /// 4. 模型和工具适配器
-    ///
-    /// 参见 `StateKnot` 议题：
-    /// - 稳定公共 API 发布跟踪
-    /// - 简化的 Agent 运行 API
-    pub fn chat(
-        &self,
-        request: &ChatRequest,
-    ) -> Result<ChatResponse, JiaClawError> {
-        // 存根实现：生成基于上下文的响应
-        
+    /// 根据配置选择提供商：
+    /// - 如果配置了 API key，使用 OpenAI-compatible 提供商
+    /// - 否则回退到存根实现
+    pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, JiaClawError> {
+        // 构建完整的系统提示（包含工作空间内容）
+        let system_prompt = self.build_system_prompt(request);
+
+        // 选择提供商
+        if let Some(api_key) = &self.config.provider.api_key {
+            // 使用真实的 OpenAI-compatible 提供商
+            let provider = OpenAICompatibleProvider::new(&self.config.provider.base_url, api_key);
+
+            provider
+                .chat(
+                    &self.config.provider.model,
+                    &system_prompt,
+                    &request.messages,
+                    self.config.provider.temperature,
+                    self.config.provider.max_tokens,
+                )
+                .await
+        } else if let Ok(env_key) = std::env::var("JIACLAW_API_KEY") {
+            // 从环境变量读取 API key
+            let provider = OpenAICompatibleProvider::new(&self.config.provider.base_url, &env_key);
+
+            provider
+                .chat(
+                    &self.config.provider.model,
+                    &system_prompt,
+                    &request.messages,
+                    self.config.provider.temperature,
+                    self.config.provider.max_tokens,
+                )
+                .await
+        } else {
+            // 回退到存根实现
+            tracing::warn!(
+                "未配置 API key（通过配置文件或 JIACLAW_API_KEY 环境变量），使用存根模式"
+            );
+            Ok(self.stub_chat(request, &system_prompt))
+        }
+    }
+
+    /// 构建系统提示（包含工作空间内容）
+    fn build_system_prompt(&self, request: &ChatRequest) -> String {
+        let mut prompt = self.config.system_instructions.clone();
+
+        // 添加工作空间内容
+        if let Some(ref soul) = self.workspace.soul {
+            prompt.push_str("\n\n## Agent Soul\n");
+            prompt.push_str(soul);
+        }
+
+        if let Some(ref user) = self.workspace.user {
+            prompt.push_str("\n\n## User Profile\n");
+            prompt.push_str(user);
+        }
+
+        if let Some(ref memory) = self.workspace.memory {
+            prompt.push_str("\n\n## Long-term Memory\n");
+            prompt.push_str(memory);
+        }
+
+        // 添加技能摘要
+        if !request.enabled_skills.is_empty() {
+            prompt.push_str("\n\n## Enabled Skills\n");
+            for skill in &request.enabled_skills {
+                prompt.push_str(&format!("- {skill}\n"));
+            }
+        }
+
+        prompt
+    }
+
+    /// 存根实现（无 API key 时使用）
+    fn stub_chat(&self, request: &ChatRequest, system_prompt: &str) -> ChatResponse {
         // 获取最后一条用户消息
         let last_user_message = request
             .messages
@@ -92,34 +168,42 @@ impl JiaClawAgent {
             .map_or("", |msg| msg.content.as_str());
 
         // 简单的响应生成逻辑（演示用）
-        let response_content = self.generate_stub_response(last_user_message, request);
+        let response_content =
+            self.generate_stub_response(last_user_message, request, system_prompt);
 
-        Ok(ChatResponse {
+        ChatResponse {
             message: ChatMessage {
                 role: MessageRole::Assistant,
                 content: response_content,
             },
             tool_calls: vec![],
             status: RunStatus::Completed,
-        })
+        }
     }
 
     /// 生成存根响应（演示用）
-    fn generate_stub_response(&self, user_message: &str, request: &ChatRequest) -> String {
+    fn generate_stub_response(
+        &self,
+        user_message: &str,
+        request: &ChatRequest,
+        _system_prompt: &str,
+    ) -> String {
         let user_lower = user_message.to_lowercase();
 
         // 简单的关键词匹配响应
-        if user_lower.contains("你好") || user_lower.contains("hello") || user_lower.contains("hi") {
+        if user_lower.contains("你好") || user_lower.contains("hello") || user_lower.contains("hi")
+        {
             format!(
                 "你好！我是 {}。{}\n\n\
                  我目前运行在存根模式下，等待 StateKnot 框架集成。\n\
                  当前配置的最大对话轮次为 {} 轮。\n\n\
                  你可以继续与我对话，我会尽力回应（虽然功能有限）。",
-                self.config.name,
-                self.config.description,
-                self.config.max_turns
+                self.config.name, self.config.description, self.config.max_turns
             )
-        } else if user_lower.contains("功能") || user_lower.contains("能力") || user_lower.contains("what can you do") {
+        } else if user_lower.contains("功能")
+            || user_lower.contains("能力")
+            || user_lower.contains("what can you do")
+        {
             let tools_str = if request.enabled_tools.is_empty() {
                 "无".to_string()
             } else {
@@ -130,7 +214,7 @@ impl JiaClawAgent {
             } else {
                 request.enabled_skills.join(", ")
             };
-            
+
             format!(
                 "{} 设计用于提供以下能力：\n\n\
                  ✨ 核心功能（计划中）：\n\
@@ -143,9 +227,7 @@ impl JiaClawAgent {
                  • 已启用工具：{}\n\
                  • 已启用技能：{}\n\n\
                  查看文档了解更多：docs/architecture.md",
-                self.config.name,
-                tools_str,
-                skills_str
+                self.config.name, tools_str, skills_str
             )
         } else if user_lower.contains("帮助") || user_lower.contains("help") {
             "📖 JiaClaw 帮助\n\n\
@@ -160,7 +242,8 @@ impl JiaClawAgent {
              文档:\n\
              • README.md - 项目概览\n\
              • docs/architecture.md - 架构设计\n\
-             • docs/roadmap.md - 开发路线图".to_string()
+             • docs/roadmap.md - 开发路线图"
+                .to_string()
         } else if user_lower.contains("状态") || user_lower.contains("status") {
             format!(
                 "🔍 {} 状态报告\n\n\
@@ -213,11 +296,11 @@ mod tests {
         assert!(agent.is_ok());
     }
 
-    #[test]
-    fn test_chat_stub() {
+    #[tokio::test]
+    async fn test_chat_stub() {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config).unwrap();
-        
+
         let request = ChatRequest {
             messages: vec![ChatMessage {
                 role: MessageRole::User,
@@ -227,7 +310,7 @@ mod tests {
             enabled_skills: vec![],
         };
 
-        let response = agent.chat(&request);
+        let response = agent.chat(&request).await;
         assert!(response.is_ok());
     }
 }

@@ -11,6 +11,17 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
 - 构建和共享自定义技能
 - 在本地或云端部署（保持隐私控制）
 
+## 相对竞品的定位
+
+与 [OpenClaw](https://github.com/openclaw/openclaw) 和 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 相比，JiaClaw 聚焦于：
+
+- **持久化优先**: 确定性图执行、检查点、崩溃恢复（at-least-once 语义）
+- **类型安全**: Rust + TypedAgent<I,O> 编译时保证
+- **生产治理**: 多租户、资源策略、预算控制、审计日志
+- **协议原生**: MCP 和 A2A 一等公民支持
+
+详见 [竞争差距分析](competitive-gap.md) 了解完整对比矩阵。
+
 ## 当前状态：M0 - 脚手架与架构 ✅
 
 **完成日期**: 2026-09-20
@@ -29,6 +40,76 @@ JiaClaw 致力于成为一个**生产就绪的个人持久化智能体运行时*
 - PR #1 到 jiawenyao401/JiaClaw
 - 可编译的代码库（`cargo build` 通过）
 - 基本测试套件（`cargo test` 通过）
+
+---
+
+## M0.5 - 可用迭代（无需 StateKnot） 🚧
+
+**目标日期**: 2026-09-20  
+**依赖**: 无（独立于 StateKnot 稳定 API）
+
+**目标**: 提供实际可用的最小功能集，支持本地开发和测试
+
+### 任务
+
+1. **竞争差距分析** (3/3) ✅
+   - [x] 撰写 `docs/competitive-gap.md` 对比 OpenClaw/Hermes
+   - [x] 更新 README 添加相对竞品章节
+   - [x] 更新 roadmap.md 整合差距分析
+
+2. **OpenAI-compatible 提供商** (0/5)
+   - [ ] 添加 `reqwest` 依赖和 HTTP 客户端
+   - [ ] 实现 OpenAI Chat Completions API 调用
+   - [ ] 支持 `base_url` 配置（兼容 Ollama/LM Studio）
+   - [ ] 环境变量 `JIACLAW_API_KEY` / 配置文件
+   - [ ] 无 API key 时回退到存根（清晰文档说明）
+
+3. **工作空间引导** (0/6)
+   - [ ] 设计工作空间目录结构（`~/.jiaclaw/workspace/`）
+   - [ ] 创建 `AGENTS.md` - Agent 配置和元数据
+   - [ ] 创建 `SOUL.md` - Agent 性格和指令
+   - [ ] 创建 `USER.md` - 用户信息和偏好
+   - [ ] 创建 `MEMORY.md` - 长期记忆和上下文
+   - [ ] 实现 `jiaclaw init` 命令生成默认文件
+
+4. **技能骨架** (0/5)
+   - [ ] 设计 `SKILL.md` 格式（参考 agentskills）
+   - [ ] 实现技能发现（扫描 `skills/*/SKILL.md`）
+   - [ ] 列出启用的技能
+   - [ ] 注入技能摘要到系统提示
+   - [ ] 添加 1-2 个示例技能（search, calculator）
+
+5. **CLI 改进** (0/4)
+   - [ ] `jiaclaw init` 创建工作空间和配置
+   - [ ] `jiaclaw chat` 使用真实提供商（有 key 时）
+   - [ ] `jiaclaw serve` 添加健康检查端点（axum/hyper）
+   - [ ] 改进错误消息和日志输出
+
+6. **测试和文档** (0/4)
+   - [ ] 配置加载测试（TOML/JSON/环境变量）
+   - [ ] 工作空间引导测试
+   - [ ] 技能发现测试
+   - [ ] 存根 vs 真实提供商选择测试
+
+### 验收标准
+
+- [ ] `jiaclaw init` 创建完整的工作空间
+- [ ] `jiaclaw chat "你好"` 在无 API key 时返回存根
+- [ ] `jiaclaw chat "你好"` 在有 API key 时调用真实模型
+- [ ] 技能目录被扫描并注入提示
+- [ ] 工作空间文件（AGENTS/SOUL/USER/MEMORY）影响 Agent 行为
+- [ ] 所有测试通过（`cargo test`）
+- [ ] Clippy 无警告（`cargo clippy`）
+- [ ] 代码格式化（`cargo fmt --check`）
+
+### 相对 OpenClaw/Hermes 的进展
+
+| 功能 | OpenClaw | Hermes | JiaClaw M0.5 | 差距 |
+|------|----------|--------|--------------|------|
+| 真实模型调用 | ✅ | ✅ | 🚧 本阶段 | P0 |
+| 工作空间引导 | ✅ | ⏳ | 🚧 本阶段 | P1 |
+| 技能系统 | ✅ 完整 | ⏳ 部分 | 🚧 骨架 | P1（完整实现在 M3） |
+| 离线开发模式 | ✅ | ⏳ | 🚧 本阶段 | P1 |
 
 ---
 
