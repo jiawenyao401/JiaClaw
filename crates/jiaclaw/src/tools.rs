@@ -237,8 +237,13 @@ pub struct FileReadTool {
 impl FileReadTool {
     /// 创建新的文件读取工具
     pub fn new(workspace_path: &Path) -> Self {
+        // 规范化工作空间路径，确保沙箱检查在所有平台上一致
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.to_path_buf());
+        
         Self {
-            workspace_path: workspace_path.to_path_buf(),
+            workspace_path: canonical_workspace,
         }
     }
 }
@@ -314,8 +319,13 @@ pub struct FileWriteTool {
 impl FileWriteTool {
     /// 创建新的文件写入工具
     pub fn new(workspace_path: &Path) -> Self {
+        // 规范化工作空间路径，确保沙箱检查在所有平台上一致
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.to_path_buf());
+        
         Self {
-            workspace_path: workspace_path.to_path_buf(),
+            workspace_path: canonical_workspace,
         }
     }
 }
@@ -366,7 +376,14 @@ impl Tool for FileWriteTool {
             .parent()
             .ok_or_else(|| JiaClawError::ToolExecution("无效的文件路径".to_string()))?;
 
-        if !parent.starts_with(&self.workspace_path) {
+        // 规范化父目录路径（如果存在）进行安全检查
+        let canonical_parent = if parent.exists() {
+            parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
+        } else {
+            parent.to_path_buf()
+        };
+        
+        if !canonical_parent.starts_with(&self.workspace_path) {
             return Err(JiaClawError::ToolExecution(format!(
                 "安全错误: 文件 {relative_path} 在工作空间外部"
             )));
@@ -622,8 +639,13 @@ pub struct FileListTool {
 impl FileListTool {
     /// 创建新的文件列表工具
     pub fn new(workspace_path: &Path) -> Self {
+        // 规范化工作空间路径，确保沙箱检查在所有平台上一致
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.to_path_buf());
+        
         Self {
-            workspace_path: workspace_path.to_path_buf(),
+            workspace_path: canonical_workspace,
         }
     }
 }
@@ -747,8 +769,13 @@ pub struct FileDeleteTool {
 impl FileDeleteTool {
     /// 创建新的文件删除工具
     pub fn new(workspace_path: &Path) -> Self {
+        // 规范化工作空间路径，确保沙箱检查在所有平台上一致
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.to_path_buf());
+        
         Self {
-            workspace_path: workspace_path.to_path_buf(),
+            workspace_path: canonical_workspace,
         }
     }
 }
@@ -825,8 +852,13 @@ pub struct FileCopyTool {
 impl FileCopyTool {
     /// 创建新的文件复制工具
     pub fn new(workspace_path: &Path) -> Self {
+        // 规范化工作空间路径，确保沙箱检查在所有平台上一致
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.to_path_buf());
+        
         Self {
-            workspace_path: workspace_path.to_path_buf(),
+            workspace_path: canonical_workspace,
         }
     }
 }
@@ -888,7 +920,14 @@ impl Tool for FileCopyTool {
             .parent()
             .ok_or_else(|| JiaClawError::ToolExecution("无效的目标路径".to_string()))?;
 
-        if !dest_parent.starts_with(&self.workspace_path) {
+        // 规范化父目录路径（如果存在）进行安全检查
+        let canonical_dest_parent = if dest_parent.exists() {
+            dest_parent.canonicalize().unwrap_or_else(|_| dest_parent.to_path_buf())
+        } else {
+            dest_parent.to_path_buf()
+        };
+        
+        if !canonical_dest_parent.starts_with(&self.workspace_path) {
             return Err(JiaClawError::ToolExecution(format!(
                 "安全错误: 目标路径 {dest_rel} 在工作空间外部"
             )));
@@ -900,7 +939,7 @@ impl Tool for FileCopyTool {
             )));
         }
 
-        // 创建目标父目录
+        // 创建目标父目录（使用原始路径，因为 canonicalize 需要路径存在）
         std::fs::create_dir_all(dest_parent)
             .map_err(|e| JiaClawError::ToolExecution(format!("无法创建目标目录: {e}")))?;
 
