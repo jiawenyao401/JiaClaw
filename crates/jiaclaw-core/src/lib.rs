@@ -165,6 +165,10 @@ pub struct HttpConfig {
     #[serde(default = "default_http_bind")]
     pub bind: String,
 
+    /// API 鉴权 Token（可选，环境变量 `JIACLAW_API_TOKEN` 优先）
+    #[serde(default)]
+    pub api_token: Option<String>,
+
     /// Webhook 鉴权密钥（可选，环境变量 `JIACLAW_WEBHOOK_SECRET` 优先）
     #[serde(default)]
     pub webhook_secret: Option<String>,
@@ -198,6 +202,7 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             bind: default_http_bind(),
+            api_token: None,
             webhook_secret: None,
             cors_allow_origins: default_cors_allow_origins(),
             persist: false,

@@ -164,6 +164,7 @@ const MAX_SESSION_MESSAGES: usize = 50;
 struct AppState {
     agent: Arc<JiaClawAgent>,
     sessions: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    api_token: Option<String>,
     webhook_secret: Option<String>,
     persist_enabled: bool,
     persist_path: Arc<PathBuf>,
@@ -232,6 +233,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     // 创建 agent
     let agent = JiaClawAgent::new(config.clone()).context("创建 JiaClawAgent 失败")?;
     
+    // 读取 API token（环境变量优先于配置文件）
+    let api_token = std::env::var("JIACLAW_API_TOKEN")
+        .ok()
+        .or(config.http.api_token.clone());
+    
     // 读取 webhook secret（环境变量优先于配置文件）
     let webhook_secret = std::env::var("JIACLAW_WEBHOOK_SECRET")
         .ok()
@@ -256,6 +262,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     let state = AppState {
         agent: Arc::new(agent),
         sessions: Arc::new(Mutex::new(sessions)),
+        api_token: api_token.clone(),
         webhook_secret: webhook_secret.clone(),
         persist_enabled: config.http.persist,
         persist_path: Arc::new(persist_path),
@@ -316,6 +323,18 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     println!("\n📋 HTTP 配置摘要:");
     println!("   • 绑定地址: {}", config.http.bind);
     
+    if api_token.is_some() {
+        println!("   • API 鉴权: ✅ 已启用（通过 {}）",
+            if std::env::var("JIACLAW_API_TOKEN").is_ok() {
+                "环境变量 JIACLAW_API_TOKEN"
+            } else {
+                "配置文件"
+            }
+        );
+    } else {
+        println!("   • API 鉴权: ⚠️  未启用（API 端点无需鉴权，本地开发友好）");
+    }
+    
     if webhook_secret.is_some() {
         println!("   • Webhook 鉴权: ✅ 已启用（通过 {}）",
             if std::env::var("JIACLAW_WEBHOOK_SECRET").is_ok() {
@@ -353,6 +372,32 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     Ok(())
 }
 
+/// 检查 API Token 鉴权
+fn check_api_auth(state: &AppState, headers: &HeaderMap) -> bool {
+    // 如果未配置 token，则不需要鉴权
+    let Some(expected_token) = state.api_token.as_deref() else {
+        return true;
+    };
+
+    // 检查 Authorization: Bearer <token>
+    if let Some(auth_header) = headers.get("Authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                return token == expected_token;
+            }
+        }
+    }
+
+    // 检查 X-Api-Token: <token>
+    if let Some(token_header) = headers.get("X-Api-Token") {
+        if let Ok(token) = token_header.to_str() {
+            return token == expected_token;
+        }
+    }
+
+    false
+}
+
 /// 健康检查处理器
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let response = HealthResponse {
@@ -366,8 +411,15 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// 聊天处理器
 async fn chat_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(mut request): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
+    // API Token 鉴权检查
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!("API 鉴权失败: token 不匹配或缺失");
+        return Err(AppError::Unauthorized);
+    }
+
     tracing::info!(
         "收到聊天请求，消息数: {}, session_id: {:?}",
         request.messages.len(),
@@ -472,7 +524,13 @@ struct CreateSessionResponse {
 /// 创建会话处理器
 async fn create_session_handler(
     State(state): State<AppState>,
-) -> Json<CreateSessionResponse> {
+    headers: HeaderMap,
+) -> Result<Json<CreateSessionResponse>, AppError> {
+    // API Token 鉴权检查
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!("API 鉴权失败: token 不匹配或缺失");
+        return Err(AppError::Unauthorized);
+    }
     let session_id = uuid::Uuid::new_v4().to_string();
     
     // 立即在 sessions map 中创建空的 Vec，这样后续 DELETE 能正确返回 success=true
@@ -480,7 +538,7 @@ async fn create_session_handler(
     sessions.insert(session_id.clone(), Vec::new());
     
     tracing::info!("创建新 session: {}", session_id);
-    Json(CreateSessionResponse { session_id })
+    Ok(Json(CreateSessionResponse { session_id }))
 }
 
 /// 删除会话响应
@@ -520,8 +578,14 @@ struct SkillsResponse {
 /// 删除会话处理器
 async fn delete_session_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
-) -> Json<DeleteSessionResponse> {
+) -> Result<Json<DeleteSessionResponse>, AppError> {
+    // API Token 鉴权检查
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!("API 鉴权失败: token 不匹配或缺失");
+        return Err(AppError::Unauthorized);
+    }
     let mut sessions = state.sessions.lock().unwrap();
     let existed = sessions.remove(&session_id).is_some();
 
@@ -535,21 +599,29 @@ async fn delete_session_handler(
             }
         }
         
-        Json(DeleteSessionResponse {
+        Ok(Json(DeleteSessionResponse {
             success: true,
             message: format!("会话 {session_id} 已删除"),
-        })
+        }))
     } else {
         tracing::warn!("尝试删除不存在的 session: {}", session_id);
-        Json(DeleteSessionResponse {
+        Ok(Json(DeleteSessionResponse {
             success: false,
             message: format!("会话 {session_id} 不存在"),
-        })
+        }))
     }
 }
 
 /// 工具列表处理器
-async fn tools_handler(State(state): State<AppState>) -> Json<ToolsResponse> {
+async fn tools_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ToolsResponse>, AppError> {
+    // API Token 鉴权检查
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!("API 鉴权失败: token 不匹配或缺失");
+        return Err(AppError::Unauthorized);
+    }
     let tool_names = state.agent.tools().list();
     let tools: Vec<ToolInfo> = tool_names
         .iter()
@@ -562,11 +634,19 @@ async fn tools_handler(State(state): State<AppState>) -> Json<ToolsResponse> {
         .collect();
 
     tracing::info!("列出工具: {} 个已注册", tools.len());
-    Json(ToolsResponse { tools })
+    Ok(Json(ToolsResponse { tools }))
 }
 
 /// 技能列表处理器
-async fn skills_handler(State(state): State<AppState>) -> Json<SkillsResponse> {
+async fn skills_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SkillsResponse>, AppError> {
+    // API Token 鉴权检查
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!("API 鉴权失败: token 不匹配或缺失");
+        return Err(AppError::Unauthorized);
+    }
     let workspace_path = &state.agent.config().workspace_path;
     let discovery = jiaclaw::SkillDiscovery::new(workspace_path);
 
@@ -588,7 +668,7 @@ async fn skills_handler(State(state): State<AppState>) -> Json<SkillsResponse> {
         }
     };
 
-    Json(SkillsResponse { skills })
+    Ok(Json(SkillsResponse { skills }))
 }
 
 /// Webhook 入站处理器
@@ -739,12 +819,14 @@ async fn hooks_inbound_handler(
 #[derive(Debug)]
 enum AppError {
     Internal(String),
+    Unauthorized,
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
         };
 
         let body = serde_json::json!({
@@ -1043,6 +1125,24 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("\n🌐 HTTP 配置");
     println!("   绑定地址: {}", config.http.bind);
     
+    // 检查 API token（环境变量优先）
+    let api_token = std::env::var("JIACLAW_API_TOKEN")
+        .ok()
+        .or(config.http.api_token.clone());
+    
+    if api_token.is_some() {
+        println!("   API 鉴权: ✅ 已启用（通过 {}）",
+            if std::env::var("JIACLAW_API_TOKEN").is_ok() {
+                "环境变量 JIACLAW_API_TOKEN"
+            } else {
+                "配置文件"
+            }
+        );
+    } else {
+        println!("   API 鉴权: ⚠️  未启用（本地开发友好）");
+        println!("   💡 生产环境建议设置: export JIACLAW_API_TOKEN=your-token");
+    }
+    
     // 检查 webhook secret（环境变量优先）
     let webhook_secret = std::env::var("JIACLAW_WEBHOOK_SECRET")
         .ok()
@@ -1087,6 +1187,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("   • 已发现技能: {skills_count} 个");
     println!("   • 已注册工具: {tools_count} 个");
     println!("   • HTTP 绑定: {}", config.http.bind);
+    println!("   • API 鉴权: {}", if api_token.is_some() { "已启用" } else { "未启用" });
     println!("   • Webhook 鉴权: {}", if webhook_secret.is_some() { "已启用" } else { "未启用" });
     
     if !has_key {
@@ -1117,16 +1218,21 @@ mod tests {
     use tower::ServiceExt;
 
     fn create_test_app() -> Router {
-        create_test_app_with_secret(None)
+        create_test_app_with_auth(None, None)
     }
 
     fn create_test_app_with_secret(webhook_secret: Option<String>) -> Router {
+        create_test_app_with_auth(None, webhook_secret)
+    }
+
+    fn create_test_app_with_auth(api_token: Option<String>, webhook_secret: Option<String>) -> Router {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
         let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token,
             webhook_secret,
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
@@ -1432,6 +1538,7 @@ mod tests {
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
             webhook_secret: None,
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
@@ -1783,6 +1890,7 @@ mod tests {
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
             webhook_secret: None,
             persist_enabled: false,
             persist_path: Arc::new(persist_path.clone()),
@@ -1887,5 +1995,286 @@ mod tests {
         assert!(!loaded_after_delete.contains_key(&session_id1));
 
         std::fs::remove_file(&persist_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_not_required_when_no_token() {
+        let app = create_test_app();
+
+        // 不带 token 的请求应该成功
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "测试".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            session_id: None,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_required_with_token() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        // 不带 token 的请求应该返回 401
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "测试".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            session_id: None,
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_bearer_token_success() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        // 带正确 Bearer token 的请求应该成功
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "测试".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            session_id: None,
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_x_api_token_success() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        // 带正确 X-Api-Token 的请求应该成功
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "测试".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            session_id: None,
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .header("x-api-token", "test-token-123")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_wrong_token() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        // 带错误 token 的请求应该返回 401
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "测试".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            session_id: None,
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_no_auth() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        // health 端点不需要鉴权
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_sessions_api_requires_auth() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        // POST /api/sessions 应该需要鉴权
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 带正确 token 应该成功
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_tools_api_requires_auth() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        // GET /api/tools 应该需要鉴权
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 带正确 token 应该成功
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/tools")
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_skills_api_requires_auth() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        // GET /api/skills 应该需要鉴权
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/skills")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 带正确 token 应该成功
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/skills")
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
