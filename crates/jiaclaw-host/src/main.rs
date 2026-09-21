@@ -8,22 +8,27 @@ use axum::{
     extract::{Path, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Json, Response},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Json, Response,
+    },
     routing::{get, post},
     Router,
 };
 use clap::{Parser, Subcommand};
+use futures_util::{stream, Stream};
 use governor::{
     clock::{Clock, DefaultClock},
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
 use jiaclaw::{inspect_identity_file, inspect_memory_file, JiaClawAgent, Workspace};
-use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole};
+use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::HashMap,
+    convert::Infallible,
     num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -858,7 +863,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     // 启动日志
     tracing::info!("✅ HTTP 服务已启动于 http://{}", config.http.bind);
     tracing::info!("   • GET    /health              - 健康检查");
-    tracing::info!("   • POST   /api/chat            - 聊天端点");
+    tracing::info!("   • POST   /api/chat            - 聊天端点（可选 SSE）");
     tracing::info!("   • GET    /api/sessions        - 列出会话");
     tracing::info!("   • POST   /api/sessions        - 创建会话");
     tracing::info!("   • GET    /api/sessions/:id    - 读取会话历史");
@@ -1053,15 +1058,141 @@ async fn openapi_handler(
     ))
 }
 
+/// HTTP 聊天请求体：核心 `ChatRequest` + 可选 `stream`。
+#[derive(Debug, Deserialize)]
+struct ChatHttpBody {
+    #[serde(flatten)]
+    request: ChatRequest,
+    /// 为 true 时返回 SSE；也可通过 `Accept: text/event-stream` 开启。
+    #[serde(default)]
+    stream: bool,
+}
+
+/// `Accept` 是否显式包含 `text/event-stream`（不含 `*/*`）。
+fn accept_includes_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| {
+            accept.split(',').any(|part| {
+                part.split(';')
+                    .next()
+                    .map(str::trim)
+                    .is_some_and(|media| media.eq_ignore_ascii_case("text/event-stream"))
+            })
+        })
+}
+
+fn wants_event_stream(headers: &HeaderMap, stream_field: bool) -> bool {
+    stream_field || accept_includes_event_stream(headers)
+}
+
+fn sse_json_event(name: &str, data: &serde_json::Value) -> Event {
+    Event::default().event(name).data(data.to_string())
+}
+
+fn tool_sse_payload(call: &ToolCall) -> serde_json::Value {
+    let error = call
+        .result
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(serde_json::Value::as_str);
+    match error {
+        Some(error) => json!({
+            "name": call.tool_name,
+            "ok": false,
+            "error": error,
+        }),
+        None => json!({
+            "name": call.tool_name,
+            "ok": true,
+        }),
+    }
+}
+
+/// 将助手文本按句/按块切开，供 SSE `token` 事件使用。
+///
+/// TODO(true-streaming): `Brokerrouter` / `StateKnot` 提供 token stream API 后改为真流式。
+fn chunk_assistant_text(text: &str) -> Vec<String> {
+    const MAX_CHARS: usize = 80;
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for ch in text.chars() {
+        current.push(ch);
+        current_chars += 1;
+        let at_sentence = matches!(ch, '。' | '！' | '？' | '.' | '!' | '?' | '\n');
+        if at_sentence || current_chars >= MAX_CHARS {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn build_chat_sse_events(
+    request_id: &str,
+    session_id: Option<&str>,
+    outcome: Result<&ChatResponse, &str>,
+) -> Vec<Event> {
+    let mut events = vec![sse_json_event(
+        "meta",
+        &json!({
+            "session_id": session_id,
+            "request_id": request_id,
+        }),
+    )];
+
+    match outcome {
+        Ok(response) => {
+            for call in &response.tool_calls {
+                events.push(sse_json_event("tool", &tool_sse_payload(call)));
+            }
+            // TODO(true-streaming): 底层 LLM 暂无 token stream；此处为整段生成后的分块推送。
+            for chunk in chunk_assistant_text(&response.message.content) {
+                events.push(sse_json_event("token", &json!({ "text": chunk })));
+            }
+            let status =
+                serde_json::to_value(&response.status).unwrap_or_else(|_| json!("unknown"));
+            events.push(sse_json_event(
+                "done",
+                &json!({
+                    "reply": response.message.content,
+                    "status": status,
+                    "session_id": response.session_id,
+                }),
+            ));
+        }
+        Err(message) => {
+            events.push(sse_json_event("error", &json!({ "error": message })));
+        }
+    }
+
+    events
+}
+
+fn chat_sse_response(events: Vec<Event>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(stream::iter(events.into_iter().map(Ok)))
+}
+
 /// 聊天处理器
+#[allow(clippy::too_many_lines)]
 async fn chat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut request): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, AppError> {
+    Json(body): Json<ChatHttpBody>,
+) -> Result<Response, AppError> {
     let request_id = request_id_log_value(&headers).to_string();
+    let stream = wants_event_stream(&headers, body.stream);
+    let mut request = body.request;
 
-    // API Token 鉴权检查
+    // API Token 鉴权检查（失败仍返回 JSON 401，即使客户端请求了 SSE）
     if !check_api_auth(&state, &headers) {
         tracing::warn!(request_id = %request_id, "API 鉴权失败: token 不匹配或缺失");
         return Err(AppError::Unauthorized);
@@ -1069,7 +1200,7 @@ async fn chat_handler(
 
     tracing::info!(
         request_id = %request_id,
-        "收到聊天请求，消息数: {}, session_id: {:?}",
+        "收到聊天请求，消息数: {}, session_id: {:?}, stream: {stream}",
         request.messages.len(),
         request.session_id
     );
@@ -1138,11 +1269,22 @@ async fn chat_handler(
         }
     }
 
-    let response = state
-        .agent
-        .chat(&request)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let response = match state.agent.chat(&request).await {
+        Ok(response) => response,
+        Err(e) => {
+            let message = e.to_string();
+            if stream {
+                tracing::error!(request_id = %request_id, "聊天失败（SSE error 事件）: {message}");
+                let events = build_chat_sse_events(
+                    &request_id,
+                    session_id.as_deref(),
+                    Err(message.as_str()),
+                );
+                return Ok(chat_sse_response(events).into_response());
+            }
+            return Err(AppError::Internal(message));
+        }
+    };
 
     // 如果提供了 session_id，更新 session 历史
     if let Some(ref sid) = session_id {
@@ -1173,7 +1315,13 @@ async fn chat_handler(
     let mut response = response;
     response.session_id = session_id;
 
-    Ok(Json(response))
+    if stream {
+        let events =
+            build_chat_sse_events(&request_id, response.session_id.as_deref(), Ok(&response));
+        return Ok(chat_sse_response(events).into_response());
+    }
+
+    Ok(Json(response).into_response())
 }
 
 /// 会话列表项
@@ -5145,5 +5293,247 @@ mod tests {
             .unwrap();
         let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(spec["paths"].is_object());
+        assert_eq!(
+            spec["components"]["schemas"]["ChatRequest"]["properties"]["stream"]["type"],
+            "boolean"
+        );
+        assert!(
+            spec["paths"]["/api/chat"]["post"]["responses"]["200"]["content"]
+                .get("text/event-stream")
+                .is_some(),
+            "OpenAPI 应描述可选 SSE"
+        );
+    }
+
+    fn response_content_type(response: &axum::http::Response<Body>) -> String {
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// 解析 SSE 文本为 `(event, data JSON)`；忽略无 `data:` 的块。
+    fn parse_event_stream(body: &str) -> Vec<(String, serde_json::Value)> {
+        let mut events = Vec::new();
+        for block in body.split("\n\n") {
+            let block = block.trim();
+            if block.is_empty() {
+                continue;
+            }
+            let mut event_name = "message".to_string();
+            let mut data_lines = Vec::new();
+            for line in block.lines() {
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_name = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data_lines.push(rest.trim_start().to_string());
+                }
+            }
+            if data_lines.is_empty() {
+                continue;
+            }
+            let raw = data_lines.join("\n");
+            let data = serde_json::from_str(&raw).unwrap_or(json!({ "raw": raw }));
+            events.push((event_name, data));
+        }
+        events
+    }
+
+    fn chat_json_body(content: &str, session_id: Option<&str>, stream: bool) -> String {
+        let mut value = json!({
+            "messages": [{ "role": "user", "content": content }],
+            "enabled_tools": [],
+            "enabled_skills": [],
+            "auto_skills": true,
+            "session_id": session_id,
+        });
+        if stream {
+            value["stream"] = json!(true);
+        }
+        value.to_string()
+    }
+
+    #[test]
+    fn test_chunk_assistant_text_reconstructs() {
+        let text = "你好！我是 JiaClaw。\n这是第二段，用来验证按句分块。";
+        let chunks = chunk_assistant_text(text);
+        assert!(chunks.len() > 1, "应至少按句切开，实际: {chunks:?}");
+        assert_eq!(chunks.concat(), text);
+        assert!(chunk_assistant_text("").is_empty());
+    }
+
+    #[test]
+    fn test_accept_includes_event_stream() {
+        let mut headers = HeaderMap::new();
+        assert!(!accept_includes_event_stream(&headers));
+
+        headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+        assert!(!accept_includes_event_stream(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream;q=0.9"),
+        );
+        assert!(accept_includes_event_stream(&headers));
+    }
+
+    #[tokio::test]
+    async fn test_chat_json_path_unchanged_without_stream() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(chat_json_body("你好", None, false)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response_content_type(&response).starts_with("application/json"),
+            "未请求流式时应保持 JSON: {}",
+            response_content_type(&response)
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let chat_response: ChatResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!chat_response.message.content.is_empty());
+        assert!(chat_response.session_id.is_none());
+    }
+
+    async fn post_chat_sse(
+        app: Router,
+        body: String,
+        extra_headers: &[(&str, &str)],
+    ) -> (StatusCode, String, String, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/chat")
+            .header("content-type", "application/json");
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = app
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response_content_type(&response);
+        let request_id = request_id_header(&response);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).expect("SSE 应为 UTF-8");
+        (status, content_type, request_id, body)
+    }
+
+    #[tokio::test]
+    async fn test_chat_sse_accept_header_reaches_done() {
+        let app = create_test_app();
+        let (status, content_type, request_id, body) = post_chat_sse(
+            app,
+            chat_json_body("你好", Some("sse-accept"), false),
+            &[
+                ("accept", "text/event-stream"),
+                ("x-request-id", "sse-trace-1"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "Content-Type 应为 SSE，实际: {content_type}"
+        );
+        assert_eq!(request_id, "sse-trace-1");
+
+        let events = parse_event_stream(&body);
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"meta") && names.contains(&"token") && names.contains(&"done"),
+            "应包含 meta/token/done，实际: {names:?}\n{body}"
+        );
+        assert!(
+            !names.contains(&"error"),
+            "成功路径不应有 error 事件: {body}"
+        );
+
+        let meta = events
+            .iter()
+            .find(|(n, _)| n == "meta")
+            .map(|(_, d)| d)
+            .expect("缺少 meta");
+        assert_eq!(meta["request_id"], "sse-trace-1");
+        assert_eq!(meta["session_id"], "sse-accept");
+
+        let done = events
+            .iter()
+            .find(|(n, _)| n == "done")
+            .map(|(_, d)| d)
+            .expect("缺少 done");
+        assert!(!done["reply"].as_str().unwrap_or("").is_empty());
+        assert_eq!(done["session_id"], "sse-accept");
+    }
+
+    #[tokio::test]
+    async fn test_chat_sse_stream_field_reaches_done_with_tool() {
+        let app = create_test_app();
+        let (status, content_type, _, body) =
+            post_chat_sse(app, chat_json_body("列出工作空间", None, true), &[]).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("text/event-stream"));
+
+        let events = parse_event_stream(&body);
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"done"),
+            "应读到 done 事件，实际: {names:?}\n{body}"
+        );
+        assert!(names.contains(&"tool"), "工具调用应有 tool 事件: {names:?}");
+
+        let tool = events
+            .iter()
+            .find(|(n, _)| n == "tool")
+            .map(|(_, d)| d)
+            .expect("缺少 tool");
+        assert_eq!(tool["name"], "workspace_list");
+        assert_eq!(tool["ok"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_chat_sse_auth_failure_stays_json() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+        let (status, content_type, request_id, body) = post_chat_sse(
+            app,
+            chat_json_body("你好", None, true),
+            &[
+                ("accept", "text/event-stream"),
+                ("x-request-id", "sse-unauth"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            content_type.contains("application/json"),
+            "鉴权失败应仍为 JSON，实际: {content_type}"
+        );
+        assert_eq!(request_id, "sse-unauth");
+        assert!(
+            !body.contains("event:"),
+            "鉴权失败不应返回 SSE 事件流: {body}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["error"], "Unauthorized");
     }
 }

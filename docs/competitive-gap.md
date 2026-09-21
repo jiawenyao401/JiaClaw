@@ -64,7 +64,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **Telegram Bot 出站** | ✅ 支持 | ⏳ 部分 | ✅ **可选 sendMessage** | P1 | - |
 | **Request ID** | ✅ 支持 | ⏳ 部分 | ✅ **X-Request-Id** | P1 | - |
 | **OpenAPI** | ✅ FastAPI 自动 | ⏳ 部分 | ✅ **GET /api/openapi.json** | P1 | - |
-| **SSE 事件流** | ✅ 支持 | ⏳ 部分 | ⏳ 计划中 | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
+| **SSE 事件流** | ✅ 支持 | ⏳ 部分 | ✅ **可选 SSE（完成后分块）** | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
 | **WebSocket** | ⏳ 社区贡献 | ❌ 无 | ⏳ 计划中（M4） | P2 | - |
 | **Discord/Slack** | ✅ 插件支持 | ❌ 无 | ⏳ 计划中（通过 MCP） | P2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) MCP 集成 |
 | **gRPC** | ❌ 无 | ❌ 无 | ⏳ 可选（通过 StateKnot） | P2 | - |
@@ -75,10 +75,11 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - ✅ REPL 交互模式：`jiaclaw chat`（支持多轮对话）
   - ✅ 技能开关：`--skill <name>` 可重复使用，`--no-auto-skill` 禁用自动激活
   - ✅ 会话管理：`--session <id>` 续聊支持
-- ✅ HTTP 服务已实现（GET /health, POST /api/chat, GET/POST /api/sessions, GET/DELETE /api/sessions/:id, GET /api/tools, GET /api/skills, GET /api/openapi.json）
+- ✅ HTTP 服务已实现（GET /health, POST /api/chat，可选 SSE, GET/POST /api/sessions, GET/DELETE /api/sessions/:id, GET /api/tools, GET /api/skills, GET /api/openapi.json）
 - ✅ **可选 HTTP 限流**（`[http] rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`，进程内全局，超限 429 + Retry-After；GET /health 不限流；覆盖 `/api/*` 与 `/hooks/inbound`、`/hooks/telegram`）
 - ✅ **请求追踪**（缺失则生成 UUID，响应回写 `X-Request-Id`；chat/webhook tracing 带 request_id）
 - ✅ **OpenAPI 草图**（`GET /api/openapi.json`，手写 OpenAPI 3；鉴权与 `/api/tools` 一致）
+- ✅ **可选 SSE**（`POST /api/chat`：`Accept: text/event-stream` 或 body `stream: true` → `text/event-stream`；事件 `meta` / `token` / `tool` / `done` / `error`。未请求流式时 JSON 不变；鉴权失败仍 JSON 401。**当前为整轮完成后分块推送；Brokerrouter 真流式后续**）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史，自动截断超长历史）
 - ✅ **Session 查询 API**（`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息，不存在 404；读内存当前状态，落盘开启时与 store 一致）
 - ✅ **可选 Session TTL**（`[http] session_ttl_secs` / `JIACLAW_SESSION_TTL_SECS`，正整数启用闲置过期；create/chat/get/list 刷新；过期后 list 省略，GET/DELETE 与不存在一致）
@@ -88,10 +89,10 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ Webhook 入站 API（POST /hooks/inbound，支持可选鉴权，自动 session 管理）
 - ✅ **Telegram Bot 入站**（POST /hooks/telegram，手写 serde 解析 Bot API Update 最小子集；session `telegram:{chat.id}`；可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret` 校验 `X-Telegram-Bot-Api-Secret-Token`；无文本 200 跳过；同步回传 `{ ok, reply }`）
 - ✅ **Telegram Bot 可选出站**（`JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token` 优先；成功回复后 POST `sendMessage`，文本按 4096 截断；出站失败 warn + 仍 200 原 JSON，避免 webhook 重试；未配置 token 时行为与仅入站一致。`setWebhook` 指向公网 `/hooks/telegram`）
-- ❌ SSE 事件流需要 `DurableAgentRuns` 的事件订阅 API
+- ⏳ Brokerrouter / StateKnot **真 token 流式**仍待上游 SSE API（当前 HTTP SSE 为完成后分块）
 
 **目标方案**:
-- **P1 HTTP/SSE**: 等待 StateKnot [#92](https://github.com/StateKnot/StateKnot/issues/92) 稳定后实现 `AgentHost` 集成
+- **P1 HTTP/SSE**: ✅ HTTP 可选 SSE 已落地（完成后分块）。真流式等待 Brokerrouter `stream:true` + StateKnot [#92](https://github.com/StateKnot/StateKnot/issues/92) `AgentHost` 事件订阅
 - **P2 Discord/Slack**: 通过 MCP 协议适配器，复用 StateKnot 的 `McpRemoteTool` 机制
 
 ---
@@ -269,7 +270,7 @@ triggers:
 | **Anthropic** | ✅ 完整 | ⏳ 部分 | ⏳ 计划中（M1） | P1 | StateKnot Model Adapter |
 | **本地模型** | ✅ Ollama/LM Studio | ✅ Hermes 系列 | ⏳ 计划中（M1） | P1 | OpenAI-compatible |
 | **多模态** | ⏳ 部分 | ❌ 无 | ⏳ 计划中（M5） | P2 | StateKnot 扩展 |
-| **流式输出** | ✅ 完整 | ✅ 完整 | ⏳ 计划中（M4） | P1 | StateKnot SSE |
+| **流式输出** | ✅ 完整 | ✅ 完整 | ✅ **HTTP SSE 分块**（真流式待 Brokerrouter） | P1 | StateKnot SSE |
 | **模型切换** | ✅ 运行时 | ✅ 配置化 | ⏳ 计划中（M1） | P1 | StateKnot 适配器注册 |
 
 **JiaClaw 现状**:
@@ -288,7 +289,7 @@ triggers:
   - 无 API key 时回退到存根
   - ⚠️ 将在 Brokerrouter 可用后废弃，仅用于早期开发
 - **P1 StateKnot 集成**: 等待 [#92](https://github.com/StateKnot/StateKnot/issues/92) 后迁移到 StateKnot Model Adapter（与 Brokerrouter 协同）
-- **P1 流式输出**: 等待 Brokerrouter SSE 支持 + StateKnot AgentServiceV1
+- **P1 流式输出**: ✅ `POST /api/chat` 可选 SSE（完成后按句/按块推送）。Brokerrouter 真 SSE + StateKnot AgentServiceV1 仍待后续
 
 **竞争优势**:
 - 模型调用自动持久化，失败自动重试（at-least-once 语义）
@@ -457,7 +458,7 @@ triggers:
 | 功能 | 计划时间 | StateKnot 依赖 |
 |------|---------|---------------|
 | HTTP REST API | M1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentHost |
-| SSE 事件流 | M1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
+| SSE 事件流 | ✅ 本切片（完成后分块） | 真流式：[#92](https://github.com/StateKnot/StateKnot/issues/92) + Brokerrouter |
 | 技能系统 | M3 | [#96](https://github.com/StateKnot/StateKnot/issues/96) |
 | MCP 工具集成 | M2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) |
 | 本地工具（Shell/File/HTTP） | M2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) |
