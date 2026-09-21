@@ -2107,6 +2107,13 @@ fn mkdir_status_line(config: &AgentConfig) -> String {
     "已启用（工作区相对路径创建目录；默认 mkdir -p；禁穿越/symlink 逃逸）".to_string()
 }
 
+fn move_status_line(config: &AgentConfig) -> String {
+    if !config.tools.r#move.enabled {
+        return "已关闭（[tools.move] enabled = false，未注册）".to_string();
+    }
+    "已启用（工作区相对路径移动/重命名；默认不覆盖；禁穿越/symlink 逃逸）".to_string()
+}
+
 fn session_summarize_status_line(config: &AgentConfig) -> String {
     if config.session.effective_summarize_on_overflow() {
         format!(
@@ -2758,6 +2765,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • mkdir: 已关闭（未注册）");
     }
+    if config.tools.r#move.enabled {
+        tracing::info!("   • move: 已启用（工作区相对路径移动/重命名，默认不覆盖）");
+    } else {
+        tracing::info!("   • move: 已关闭（未注册）");
+    }
     if config.heartbeat.enabled {
         tracing::info!(
             "   • Heartbeat: 已启用（间隔 {heartbeat_interval_secs} 秒，session={}, 文件 {}）",
@@ -3018,6 +3030,12 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         println!("   • mkdir: ✅ {}", mkdir_status_line(&config));
     } else {
         println!("   • mkdir: ⚠️  {}", mkdir_status_line(&config));
+    }
+
+    if config.tools.r#move.enabled {
+        println!("   • move: ✅ {}", move_status_line(&config));
+    } else {
+        println!("   • move: ⚠️  {}", move_status_line(&config));
     }
 
     if config.heartbeat.enabled {
@@ -5202,6 +5220,12 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   mkdir: ⚠️  {}", mkdir_status_line(&config));
     }
 
+    if config.tools.r#move.enabled {
+        println!("   move: ✅ {}", move_status_line(&config));
+    } else {
+        println!("   move: ⚠️  {}", move_status_line(&config));
+    }
+
     // 3. 检查提供商配置
     println!("\n🔌 提供商配置");
     println!("   类型: {}", config.provider.provider_type);
@@ -5633,8 +5657,8 @@ mod tests {
         resolve_log_format, ChatMessage, ChatRequest, DeleteFileToolConfig, GlobToolConfig,
         GrepToolConfig, HeartbeatConfig, ListDirToolConfig, LogFormat, LoggingConfig,
         MemorySearchToolConfig, MemoryWriteToolConfig, MessageRole, MkdirToolConfig,
-        ReadFileToolConfig, SessionConfig, StrReplaceToolConfig, ToolsConfig, WebFetchToolConfig,
-        WebSearchToolConfig, WriteFileToolConfig,
+        MoveToolConfig, ReadFileToolConfig, SessionConfig, StrReplaceToolConfig, ToolsConfig,
+        WebFetchToolConfig, WebSearchToolConfig, WriteFileToolConfig,
     };
     use tower::ServiceExt;
 
@@ -8160,6 +8184,10 @@ mod tests {
             tools_response.tools.iter().any(|t| t.name == "mkdir"),
             "应注册默认 mkdir 工具"
         );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "move"),
+            "应注册默认 move 工具"
+        );
 
         // 验证工具信息包含名称和描述
         for tool in &tools_response.tools {
@@ -8891,6 +8919,10 @@ mod tests {
             tools_response.tools.iter().any(|t| t.name == "mkdir"),
             "关闭 glob 不应影响 mkdir"
         );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "move"),
+            "关闭 glob 不应影响 move"
+        );
     }
 
     #[tokio::test]
@@ -8954,6 +8986,74 @@ mod tests {
         assert!(
             tools_response.tools.iter().any(|t| t.name == "read_file"),
             "关闭 mkdir 不应影响 read_file"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "move"),
+            "关闭 mkdir 不应影响 move"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_endpoint_omits_move_when_disabled() {
+        let config = AgentConfig {
+            workspace_path: unique_workspace("jiaclaw-move-off"),
+            tools: ToolsConfig {
+                r#move: MoveToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            discord_public_key: None,
+            discord_bot_token: None,
+            discord_api_base: DISCORD_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tools_response: ToolsResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            tools_response.tools.iter().all(|t| t.name != "move"),
+            "enabled=false 时不应出现 move"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "mkdir"),
+            "关闭 move 不应影响 mkdir"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "read_file"),
+            "关闭 move 不应影响 read_file"
         );
     }
 
@@ -9243,6 +9343,25 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(mkdir_status_line(&disabled).contains("已关闭"));
+    }
+
+    #[test]
+    fn move_status_line_reports_enabled_and_disabled() {
+        let enabled = AgentConfig::default();
+        assert!(move_status_line(&enabled).contains("已启用"));
+        assert!(
+            move_status_line(&enabled).contains("移动")
+                || move_status_line(&enabled).contains("重命名")
+        );
+
+        let disabled = AgentConfig {
+            tools: ToolsConfig {
+                r#move: MoveToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(move_status_line(&disabled).contains("已关闭"));
     }
 
     #[test]

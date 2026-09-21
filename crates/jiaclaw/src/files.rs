@@ -1,7 +1,7 @@
 // Copyright 2026 JiaClaw contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` / `grep` / `glob` / `mkdir`。
+//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` / `grep` / `glob` / `mkdir` / `move`。
 //!
 //! 路径解析复用 [`crate::memory::resolve_workspace_relative_path`]（禁 `..`、绝对路径、symlink 逃逸）。
 //! 不调用 LLM，不执行 shell。
@@ -195,6 +195,38 @@ pub struct MkdirArgs {
     pub path: String,
     /// 是否创建中间目录（默认 `true`）
     pub recursive: bool,
+}
+
+/// `move` 源/目标类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MoveKind {
+    /// 常规文件
+    File,
+    /// 目录（含非空目录；同卷 [`std::fs::rename`]）
+    Dir,
+}
+
+impl MoveKind {
+    /// JSON / 文档用短名。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Dir => "dir",
+        }
+    }
+}
+
+/// 解析后的 `move` 参数。`from` / `source` 与 `to` / `destination` 为别名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveArgs {
+    /// 源路径（工作区相对；文档主名 `from`）
+    pub from: String,
+    /// 目标路径（工作区相对；文档主名 `to`）
+    pub to: String,
+    /// 目标已存在时是否覆盖（默认 `false`）
+    pub overwrite: bool,
 }
 
 /// 将 `max_entries` 钳制到 `1..=1000`。
@@ -684,6 +716,65 @@ pub fn parse_mkdir_args(args: &Value) -> Result<MkdirArgs, JiaClawError> {
     Ok(MkdirArgs {
         path: path.to_string(),
         recursive,
+    })
+}
+
+fn parse_optional_trimmed_path_arg(
+    args: &Value,
+    name: &str,
+) -> Result<Option<String>, JiaClawError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(JiaClawError::ToolExecution(format!(
+                    "参数 '{name}' 不能为空（工作区相对路径）"
+                )))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(JiaClawError::ToolExecution(format!(
+            "参数 '{name}' 必须是字符串（工作区相对路径）"
+        ))),
+    }
+}
+
+fn parse_required_aliased_path(
+    args: &Value,
+    primary: &str,
+    alias: &str,
+) -> Result<String, JiaClawError> {
+    let primary_val = parse_optional_trimmed_path_arg(args, primary)?;
+    let alias_val = parse_optional_trimmed_path_arg(args, alias)?;
+    match (primary_val, alias_val) {
+        (None, None) => Err(JiaClawError::ToolExecution(format!(
+            "缺少参数 '{primary}' 或 '{alias}'（工作区相对路径）"
+        ))),
+        (Some(value), None) | (None, Some(value)) => Ok(value),
+        (Some(left), Some(right)) if left == right => Ok(left),
+        (Some(_), Some(_)) => Err(JiaClawError::ToolExecution(format!(
+            "参数 '{primary}' 与 '{alias}' 必须一致（均为路径别名）"
+        ))),
+    }
+}
+
+/// 解析 `move` 参数：必填 `from` / `source` 与 `to` / `destination`；可选 `overwrite`（默认 `false`）。
+///
+/// 文档主名为 `from` 与 `to`；`source` / `destination` 为别名。成对同时给出时必须一致。
+///
+/// # Errors
+///
+/// 路径缺失/空白、别名冲突，或 `overwrite` 不是布尔值时返回错误。
+pub fn parse_move_args(args: &Value) -> Result<MoveArgs, JiaClawError> {
+    let from = parse_required_aliased_path(args, "from", "source")?;
+    let to = parse_required_aliased_path(args, "to", "destination")?;
+    let overwrite = parse_optional_bool_arg(args, "overwrite", "false")?.unwrap_or(false);
+    Ok(MoveArgs {
+        from,
+        to,
+        overwrite,
     })
 }
 
@@ -1633,6 +1724,312 @@ pub fn mkdir_workspace(
     })
 }
 
+/// Unix `EXDEV`（跨设备）。
+#[cfg(unix)]
+const EXDEV_ERRNO: i32 = 18;
+/// Windows `ERROR_NOT_SAME_DEVICE`。
+#[cfg(windows)]
+const ERROR_NOT_SAME_DEVICE: i32 = 17;
+
+fn is_cross_device(err: &std::io::Error) -> bool {
+    // `ErrorKind::CrossesDevices` 在当前 MSRV 上仍不稳定。
+    match err.raw_os_error() {
+        #[cfg(unix)]
+        Some(EXDEV_ERRNO) => true,
+        #[cfg(windows)]
+        Some(ERROR_NOT_SAME_DEVICE) => true,
+        _ => false,
+    }
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool, JiaClawError> {
+    let mut entries = fs::read_dir(path).map_err(|err| {
+        JiaClawError::ToolExecution(format!("无法读取目录 {}: {err}", path.display()))
+    })?;
+    match entries.next() {
+        None => Ok(true),
+        Some(Ok(_)) => Ok(false),
+        Some(Err(err)) => Err(JiaClawError::ToolExecution(format!(
+            "无法读取目录条目 {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn resolve_move_source(
+    workspace: &Path,
+    from_rel: &str,
+) -> Result<(PathBuf, MoveKind), JiaClawError> {
+    let path = resolve_workspace_relative_path(workspace, from_rel)?;
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(JiaClawError::ToolExecution(format!(
+                "源路径不存在: {from_rel}"
+            )));
+        }
+        Err(err) => {
+            return Err(JiaClawError::ToolExecution(format!(
+                "无法读取源路径元数据 {from_rel}: {err}"
+            )));
+        }
+    };
+
+    let kind = if meta.file_type().is_dir() {
+        MoveKind::Dir
+    } else if meta.file_type().is_file() {
+        MoveKind::File
+    } else {
+        return Err(JiaClawError::ToolExecution(format!(
+            "源路径不是常规文件或目录: {from_rel}"
+        )));
+    };
+
+    if !path.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "源路径不存在: {from_rel}"
+        )));
+    }
+    ensure_existing_within_workspace(workspace, &path)?;
+    let canon = path
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析源路径 {from_rel}: {e}")))?;
+    let ws = canonicalize_existing_or_clone(workspace);
+    if !canon.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 源路径 {from_rel} 指向工作空间外部"
+        )));
+    }
+    if canon == ws {
+        return Err(JiaClawError::ToolExecution(
+            "拒绝移动工作区根目录".to_string(),
+        ));
+    }
+    match kind {
+        MoveKind::Dir if !canon.is_dir() => {
+            return Err(JiaClawError::ToolExecution(format!(
+                "源路径不是目录: {from_rel}"
+            )));
+        }
+        MoveKind::File if !canon.is_file() => {
+            return Err(JiaClawError::ToolExecution(format!(
+                "源路径不是文件: {from_rel}"
+            )));
+        }
+        _ => {}
+    }
+    Ok((canon, kind))
+}
+
+fn resolve_move_destination(
+    workspace: &Path,
+    to_rel: &str,
+    source_canon: &Path,
+    kind: MoveKind,
+    overwrite: bool,
+) -> Result<(PathBuf, bool), JiaClawError> {
+    let (dest, dest_existed) = prepare_workspace_create_path(workspace, to_rel)?;
+    let ws = canonicalize_existing_or_clone(workspace);
+
+    if dest_existed {
+        ensure_existing_within_workspace(workspace, &dest)?;
+        let dest_canon = dest
+            .canonicalize()
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法解析目标路径 {to_rel}: {e}")))?;
+        if !dest_canon.starts_with(&ws) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "安全错误: 目标路径 {to_rel} 指向工作空间外部"
+            )));
+        }
+        if dest_canon == source_canon {
+            return Err(JiaClawError::ToolExecution(format!(
+                "源与目标是同一路径: {to_rel}"
+            )));
+        }
+        if !overwrite {
+            return Err(JiaClawError::ToolExecution(format!(
+                "目标已存在: {to_rel}（overwrite=false，拒绝覆盖）"
+            )));
+        }
+        let dest_meta = fs::symlink_metadata(&dest_canon).map_err(|err| {
+            JiaClawError::ToolExecution(format!("无法读取目标路径元数据 {to_rel}: {err}"))
+        })?;
+        match (
+            kind,
+            dest_meta.file_type().is_dir(),
+            dest_meta.file_type().is_file(),
+        ) {
+            (MoveKind::File, false, true) => {
+                fs::remove_file(&dest_canon).map_err(|err| {
+                    JiaClawError::ToolExecution(format!("无法覆盖目标文件 {to_rel}: {err}"))
+                })?;
+            }
+            (MoveKind::Dir, true, false) => {
+                if !directory_is_empty(&dest_canon)? {
+                    return Err(JiaClawError::ToolExecution(format!(
+                        "拒绝覆盖非空目录: {to_rel}"
+                    )));
+                }
+                fs::remove_dir(&dest_canon).map_err(|err| {
+                    JiaClawError::ToolExecution(format!("无法覆盖目标目录 {to_rel}: {err}"))
+                })?;
+            }
+            _ => {
+                return Err(JiaClawError::ToolExecution(format!(
+                    "源与目标类型不一致，拒绝覆盖: {to_rel}"
+                )));
+            }
+        }
+        return Ok((dest_canon, true));
+    }
+
+    let parent = dest
+        .parent()
+        .ok_or_else(|| JiaClawError::ToolExecution(format!("无效的目标路径: {to_rel}")))?;
+    if !parent.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "目标父目录不存在: {to_rel}"
+        )));
+    }
+    ensure_existing_within_workspace(workspace, parent)?;
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析目标父目录 {to_rel}: {e}")))?;
+    if !parent_canon.starts_with(&ws) || !parent_canon.is_dir() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 目标路径 {to_rel} 指向工作空间外部"
+        )));
+    }
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| JiaClawError::ToolExecution(format!("无效的目标文件名: {to_rel}")))?;
+    let dest_final = parent_canon.join(file_name);
+    if !dest_final.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 目标路径 {to_rel} 指向工作空间外部"
+        )));
+    }
+    Ok((dest_final, false))
+}
+
+fn copy_delete_across_device(
+    source: &Path,
+    dest: &Path,
+    from_rel: &str,
+    to_rel: &str,
+    kind: MoveKind,
+) -> Result<(), JiaClawError> {
+    match kind {
+        MoveKind::File => {
+            fs::copy(source, dest).map_err(|err| {
+                JiaClawError::ToolExecution(format!(
+                    "跨文件系统复制 {from_rel} -> {to_rel} 失败: {err}"
+                ))
+            })?;
+            fs::remove_file(source).map_err(|err| {
+                JiaClawError::ToolExecution(format!(
+                    "跨文件系统复制后无法删除源文件 {from_rel}: {err}"
+                ))
+            })?;
+        }
+        MoveKind::Dir => {
+            if !directory_is_empty(source)? {
+                return Err(JiaClawError::ToolExecution(format!(
+                    "跨文件系统移动非空目录仅支持同卷 rename: {from_rel} -> {to_rel}"
+                )));
+            }
+            fs::create_dir(dest).map_err(|err| {
+                JiaClawError::ToolExecution(format!("跨文件系统创建目标目录 {to_rel} 失败: {err}"))
+            })?;
+            fs::remove_dir(source).map_err(|err| {
+                JiaClawError::ToolExecution(format!(
+                    "跨文件系统复制后无法删除源目录 {from_rel}: {err}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn rename_or_copy_delete(
+    source: &Path,
+    dest: &Path,
+    from_rel: &str,
+    to_rel: &str,
+    kind: MoveKind,
+) -> Result<(), JiaClawError> {
+    match fs::rename(source, dest) {
+        Ok(()) => Ok(()),
+        Err(err) if is_cross_device(&err) => {
+            copy_delete_across_device(source, dest, from_rel, to_rel, kind)
+        }
+        Err(err) => Err(JiaClawError::ToolExecution(format!(
+            "无法移动 {from_rel} -> {to_rel}: {err}"
+        ))),
+    }
+}
+
+/// 在工作区内移动或重命名文件 / 目录。优先同卷 [`std::fs::rename`]；文件与空目录在跨文件系统时回退复制后删除。
+///
+/// `from` 必须存在。`to` 已存在且 `overwrite=false`（默认）时报错。不创建中间目录。
+/// 非空目录仅同卷 rename；跨卷非空目录报错。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、symlink 逃逸、源不存在、目标已存在且未覆盖、类型不匹配，或 IO 失败时返回错误。
+pub fn move_workspace(
+    workspace: &Path,
+    from_rel: &str,
+    to_rel: &str,
+    overwrite: bool,
+) -> Result<MoveOutput, JiaClawError> {
+    let (source_canon, kind) = resolve_move_source(workspace, from_rel)?;
+    let (dest_final, overwritten) =
+        resolve_move_destination(workspace, to_rel, &source_canon, kind, overwrite)?;
+
+    if dest_final == source_canon {
+        return Err(JiaClawError::ToolExecution(format!(
+            "源与目标是同一路径: {to_rel}"
+        )));
+    }
+    if kind == MoveKind::Dir && dest_final.starts_with(&source_canon) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "不能将目录移动到其自身或其子路径: {from_rel} -> {to_rel}"
+        )));
+    }
+
+    rename_or_copy_delete(&source_canon, &dest_final, from_rel, to_rel, kind)?;
+
+    if source_canon.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "移动后源路径仍存在: {from_rel}"
+        )));
+    }
+    if !dest_final.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "移动后目标路径不存在: {to_rel}"
+        )));
+    }
+    ensure_existing_within_workspace(workspace, &dest_final)?;
+    let dest_canon = dest_final.canonicalize().map_err(|e| {
+        JiaClawError::ToolExecution(format!("无法解析移动后的目标路径 {to_rel}: {e}"))
+    })?;
+    let ws = canonicalize_existing_or_clone(workspace);
+    if !dest_canon.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 目标路径 {to_rel} 指向工作空间外部"
+        )));
+    }
+
+    Ok(MoveOutput {
+        from: from_rel.to_string(),
+        to: to_rel.to_string(),
+        overwrite,
+        overwritten,
+        kind,
+    })
+}
+
 fn slice_lines(content: &str, offset: usize, limit: Option<usize>) -> (String, usize, usize, bool) {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -1956,6 +2353,21 @@ pub struct MkdirOutput {
     pub existed: bool,
     /// 实际使用的 recursive/parents 值
     pub recursive: bool,
+}
+
+/// `move` 的 JSON 返回体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveOutput {
+    /// 调用方传入的源路径（文档主名 `from`）
+    pub from: String,
+    /// 调用方传入的目标路径（文档主名 `to`）
+    pub to: String,
+    /// 实际使用的 overwrite 值
+    pub overwrite: bool,
+    /// 是否因 overwrite 删除了已存在的目标
+    pub overwritten: bool,
+    /// 移动的是文件还是目录
+    pub kind: MoveKind,
 }
 
 /// `read_file` 工具：读取工作区相对路径下的文本文件（路径沙箱，不调用 LLM）。
@@ -2478,6 +2890,74 @@ impl Tool for WorkspaceMkdirTool {
         let output = mkdir_workspace(&self.workspace_path, &parsed.path, parsed.recursive)?;
         serde_json::to_string_pretty(&output)
             .map_err(|e| JiaClawError::ToolExecution(format!("序列化 mkdir 结果失败: {e}")))
+    }
+}
+
+/// `move` 工具：在工作区内移动或重命名文件 / 目录（路径沙箱，不调用 LLM）。
+pub struct WorkspaceMoveTool {
+    workspace_path: PathBuf,
+}
+
+impl WorkspaceMoveTool {
+    /// 创建工具。
+    #[must_use]
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WorkspaceMoveTool {
+    fn name(&self) -> &str {
+        "move"
+    }
+
+    fn description(&self) -> &str {
+        "在工作区内移动或重命名文件或目录。文档主名 from / to（source / destination 为别名，同时给出时必须一致）。from 必须存在；to 已存在且 overwrite=false（默认）则报错。支持常规文件、空目录与非空目录（非空目录优先同卷 rename；跨文件系统的非空目录报错，文件与空目录回退复制后删除）。禁止 .. / 绝对路径 / symlink 逃逸。canonicalize 后两端必须仍落在工作区。不创建中间目录。不执行 shell，不调用 LLM。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": {
+                    "type": "string",
+                    "description": "源路径（工作区相对；与 source 为别名，文档主名 from）"
+                },
+                "source": {
+                    "type": "string",
+                    "description": "from 的别名（工作区相对源路径）"
+                },
+                "to": {
+                    "type": "string",
+                    "description": "目标路径（工作区相对；与 destination 为别名，文档主名 to）"
+                },
+                "destination": {
+                    "type": "string",
+                    "description": "to 的别名（工作区相对目标路径）"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "目标已存在时是否覆盖（默认 false，拒绝覆盖）",
+                    "default": false
+                }
+            },
+            "required": ["from", "to"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let parsed = parse_move_args(&args)?;
+        let output = move_workspace(
+            &self.workspace_path,
+            &parsed.from,
+            &parsed.to,
+            parsed.overwrite,
+        )?;
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化 move 结果失败: {e}")))
     }
 }
 
@@ -4063,6 +4543,350 @@ mod tests {
         assert!(!outside_dir.join("pwned").exists());
 
         let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn parse_move_args_requires_from_to_and_accepts_aliases() {
+        let err = parse_move_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("from") || err.contains("source"), "{err}");
+
+        let err = parse_move_args(&serde_json::json!({"from": "a.md"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("to") || err.contains("destination"), "{err}");
+
+        let err = parse_move_args(&serde_json::json!({"from": "  ", "to": "b.md"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("from"), "{err}");
+
+        let parsed = parse_move_args(&serde_json::json!({
+            "from": " notes/a.md ",
+            "to": " notes/b.md "
+        }))
+        .unwrap();
+        assert_eq!(parsed.from, "notes/a.md");
+        assert_eq!(parsed.to, "notes/b.md");
+        assert!(!parsed.overwrite);
+
+        let parsed = parse_move_args(&serde_json::json!({
+            "source": "a.md",
+            "destination": "b.md",
+            "overwrite": true
+        }))
+        .unwrap();
+        assert_eq!(parsed.from, "a.md");
+        assert_eq!(parsed.to, "b.md");
+        assert!(parsed.overwrite);
+
+        let parsed = parse_move_args(&serde_json::json!({
+            "from": "a.md",
+            "source": "a.md",
+            "to": "b.md",
+            "destination": "b.md"
+        }))
+        .unwrap();
+        assert_eq!(parsed.from, "a.md");
+        assert_eq!(parsed.to, "b.md");
+
+        let err = parse_move_args(&serde_json::json!({
+            "from": "a.md",
+            "source": "other.md",
+            "to": "b.md"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("from") && err.contains("source"), "{err}");
+
+        let err = parse_move_args(&serde_json::json!({
+            "from": "a.md",
+            "to": "b.md",
+            "destination": "c.md"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("to") && err.contains("destination"), "{err}");
+
+        let err = parse_move_args(&serde_json::json!({
+            "from": "a.md",
+            "to": "b.md",
+            "overwrite": "yes"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("overwrite"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn move_renames_regular_file() {
+        let ws = unique_temp("jiaclaw_move_file_ok");
+        fs::write(ws.join("old.md"), "hello").unwrap();
+        let tool = WorkspaceMoveTool::new(&ws);
+        assert_eq!(tool.name(), "move");
+
+        let result = tool
+            .execute(serde_json::json!({
+                "from": "old.md",
+                "to": "new.md"
+            }))
+            .await
+            .unwrap();
+        let parsed: MoveOutput = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.from, "old.md");
+        assert_eq!(parsed.to, "new.md");
+        assert!(!parsed.overwrite);
+        assert!(!parsed.overwritten);
+        assert_eq!(parsed.kind, MoveKind::File);
+        assert!(!ws.join("old.md").exists());
+        assert_eq!(fs::read_to_string(ws.join("new.md")).unwrap(), "hello");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn move_accepts_source_destination_aliases() {
+        let ws = unique_temp("jiaclaw_move_alias");
+        fs::create_dir_all(ws.join("notes")).unwrap();
+        fs::write(ws.join("notes").join("a.md"), "x").unwrap();
+        let tool = WorkspaceMoveTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "source": "notes/a.md",
+                "destination": "notes/b.md"
+            }))
+            .await
+            .unwrap();
+        let parsed: MoveOutput = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.from, "notes/a.md");
+        assert_eq!(parsed.to, "notes/b.md");
+        assert!(!ws.join("notes").join("a.md").exists());
+        assert!(ws.join("notes").join("b.md").is_file());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn move_empty_and_nonempty_directories() {
+        let ws = unique_temp("jiaclaw_move_dirs");
+        fs::create_dir_all(ws.join("empty")).unwrap();
+        fs::create_dir_all(ws.join("full")).unwrap();
+        fs::write(ws.join("full").join("a.md"), "nested").unwrap();
+        let tool = WorkspaceMoveTool::new(&ws);
+
+        let empty = tool
+            .execute(serde_json::json!({
+                "from": "empty",
+                "to": "empty-renamed"
+            }))
+            .await
+            .unwrap();
+        let parsed: MoveOutput = serde_json::from_str(&empty).unwrap();
+        assert_eq!(parsed.kind, MoveKind::Dir);
+        assert!(!ws.join("empty").exists());
+        assert!(ws.join("empty-renamed").is_dir());
+
+        let full = tool
+            .execute(serde_json::json!({
+                "from": "full",
+                "to": "full-renamed"
+            }))
+            .await
+            .unwrap();
+        let parsed: MoveOutput = serde_json::from_str(&full).unwrap();
+        assert_eq!(parsed.kind, MoveKind::Dir);
+        assert!(!ws.join("full").exists());
+        assert_eq!(
+            fs::read_to_string(ws.join("full-renamed").join("a.md")).unwrap(),
+            "nested"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn move_rejects_existing_dest_without_overwrite() {
+        let ws = unique_temp("jiaclaw_move_no_overwrite");
+        fs::write(ws.join("a.md"), "src").unwrap();
+        fs::write(ws.join("b.md"), "dst").unwrap();
+        let tool = WorkspaceMoveTool::new(&ws);
+        let err = tool
+            .execute(serde_json::json!({
+                "from": "a.md",
+                "to": "b.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("已存在") || err.contains("overwrite"), "{err}");
+        assert_eq!(fs::read_to_string(ws.join("a.md")).unwrap(), "src");
+        assert_eq!(fs::read_to_string(ws.join("b.md")).unwrap(), "dst");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn move_overwrite_replaces_existing_file() {
+        let ws = unique_temp("jiaclaw_move_overwrite");
+        fs::write(ws.join("a.md"), "src").unwrap();
+        fs::write(ws.join("b.md"), "dst").unwrap();
+        let tool = WorkspaceMoveTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "from": "a.md",
+                "to": "b.md",
+                "overwrite": true
+            }))
+            .await
+            .unwrap();
+        let parsed: MoveOutput = serde_json::from_str(&result).unwrap();
+        assert!(parsed.overwrite);
+        assert!(parsed.overwritten);
+        assert!(!ws.join("a.md").exists());
+        assert_eq!(fs::read_to_string(ws.join("b.md")).unwrap(), "src");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn move_missing_source_is_explicit_error() {
+        let ws = unique_temp("jiaclaw_move_missing");
+        let tool = WorkspaceMoveTool::new(&ws);
+        let err = tool
+            .execute(serde_json::json!({
+                "from": "no-such.md",
+                "to": "out.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不存在"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn move_missing_parent_is_explicit_error() {
+        let ws = unique_temp("jiaclaw_move_noparent");
+        fs::write(ws.join("a.md"), "x").unwrap();
+        let tool = WorkspaceMoveTool::new(&ws);
+        let err = tool
+            .execute(serde_json::json!({
+                "from": "a.md",
+                "to": "missing/a.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("父目录不存在"), "{err}");
+        assert!(ws.join("a.md").is_file());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn move_rejects_dir_into_itself() {
+        let ws = unique_temp("jiaclaw_move_into_self");
+        fs::create_dir_all(ws.join("notes")).unwrap();
+        fs::write(ws.join("notes").join("a.md"), "x").unwrap();
+        let tool = WorkspaceMoveTool::new(&ws);
+        let err = tool
+            .execute(serde_json::json!({
+                "from": "notes",
+                "to": "notes/nested"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("自身") || err.contains("子路径"), "{err}");
+        assert!(ws.join("notes").join("a.md").is_file());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn move_rejects_traversal_and_absolute_on_both_ends() {
+        let ws = unique_temp("jiaclaw_move_trav");
+        fs::write(ws.join("ok.md"), "inside").unwrap();
+        let tool = WorkspaceMoveTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({
+                "from": "../secret.md",
+                "to": "ok.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+
+        let err = tool
+            .execute(serde_json::json!({
+                "from": "ok.md",
+                "to": "../escaped.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+        assert!(ws.join("ok.md").is_file());
+
+        let err = tool
+            .execute(serde_json::json!({
+                "from": "/etc/passwd",
+                "to": "stolen.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+
+        let err = tool
+            .execute(serde_json::json!({
+                "from": "ok.md",
+                "to": "/tmp/jiaclaw-move-escape"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_rejects_symlink_escape() {
+        let ws = unique_temp("jiaclaw_move_symlink");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_move_outside_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret-outside").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("leak.md")).unwrap();
+        fs::write(ws.join("ok.md"), "inside").unwrap();
+
+        let tool = WorkspaceMoveTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "from": "leak.md",
+                "to": "copied.md"
+            }))
+            .await;
+        assert!(result.is_err(), "symlink 源逃逸应被拒绝: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("安全") || err.contains("工作空间") || err.contains("不是"),
+            "{err}"
+        );
+
+        let dest_link = tool
+            .execute(serde_json::json!({
+                "from": "ok.md",
+                "to": "leak.md",
+                "overwrite": true
+            }))
+            .await;
+        assert!(
+            dest_link.is_err(),
+            "经 symlink 覆盖逃逸应被拒绝: {dest_link:?}"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret-outside");
+
+        let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(&ws);
     }
 }

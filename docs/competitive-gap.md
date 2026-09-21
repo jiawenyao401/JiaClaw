@@ -248,7 +248,7 @@ triggers:
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
 | **Shell 命令** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
-| **文件读写** | ✅ 完整 | ✅ 完整 | ✅ **已实现 + 沙箱 read_file/list_dir/write_file/delete_file/str_replace/grep/glob/mkdir** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
+| **文件读写** | ✅ 完整 | ✅ 完整 | ✅ **已实现 + 沙箱 read_file/list_dir/write_file/delete_file/str_replace/grep/glob/mkdir/move** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
 | **浏览器控制** | ✅ Selenium/Playwright | ⏳ 部分 | ⏳ 计划中（M3） | P2 | MCP Browser Tool |
 | **网页抓取** | ✅ BeautifulSoup | ✅ 完整 | ✅ **可选 web_fetch（去标签文本）** | P1 | 轻量 HTML 剥离，无头浏览器不做 |
 | **API 调用** | ✅ requests | ✅ httpx | ✅ **已实现（HTTP）** | P1 | Rust reqwest + MCP |
@@ -316,6 +316,11 @@ triggers:
   - 可选 `recursive` / `parents`（默认 `true`，等价 `mkdir -p`；两者为别名，同时给出时必须一致）
   - 目录已存在则幂等成功（`created=false`，`existed=true`）；已存在且为文件则报错
   - 路径安全复用 resolve（禁穿越 / 绝对路径 / symlink 逃逸）；创建后 canonicalize 必须仍落在工作区
+  - `enabled = false` 不注册；`GET /api/tools` / system prompt / doctor 与其它可选工具并列；无 shell、不调用 LLM；**不做 exec**
+- ✅ **可选 move**（默认注册；文档主名 `from` / `to`，`source` / `destination` 为别名）
+  - `from` 必须存在；`to` 已存在且 `overwrite=false`（默认）则报错，不默认覆盖
+  - 支持常规文件、空目录与非空目录；优先同卷 `rename`；文件与空目录跨文件系统回退 copy+delete；非空目录跨卷报错
+  - 路径安全复用 resolve（两端禁穿越 / 绝对路径 / symlink 逃逸）；canonicalize 后必须仍落在工作区；不创建中间目录
   - `enabled = false` 不注册；`GET /api/tools` / system prompt / doctor 与其它可选工具并列；无 shell、不调用 LLM；**不做 exec**
 - ✅ **可选每工具调用超时**（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`，正整数启用；`0`/非法=关闭）
   - 对每次 `Tool::execute` 用 `tokio::time::timeout` 包裹；超时写入 `Tool timed out after Ns` 到 tool result，不 panic，继续 loop
@@ -441,7 +446,7 @@ triggers:
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
 | **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
 | **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
-| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/请求体上限/TTL/摘要压缩/工具超时/工具循环上限/Heartbeat/web_search/web_fetch/memory_search/memory_write/read_file/list_dir/write_file/delete_file/str_replace/grep/glob/mkdir/metrics/JSON 日志/优雅退出** | P1 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/请求体上限/TTL/摘要压缩/工具超时/工具循环上限/Heartbeat/web_search/web_fetch/memory_search/memory_write/read_file/list_dir/write_file/delete_file/str_replace/grep/glob/mkdir/move/metrics/JSON 日志/优雅退出** | P1 | - |
 | **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
 | **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
@@ -465,7 +470,8 @@ triggers:
 - ✅ 可选 `grep`（`[tools.grep] enabled` 默认 true；工作区字面量文本搜索，非正则；默认最多 50 条；doctor 报告是否启用）
 - ✅ 可选 `glob`（`[tools.glob] enabled` 默认 true；工作区 glob 按模式找文件；只返回常规文件；默认最多 100 条；doctor 报告是否启用）
 - ✅ 可选 `mkdir`（`[tools.mkdir] enabled` 默认 true；工作区相对路径创建目录；默认 mkdir -p；目录已存在幂等成功；doctor 报告是否启用）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、请求体上限、Metrics 是否公开、日志 format、Session TTL、优雅退出宽限期、Session 摘要压缩、工具超时、工具循环上限、web_search key 是否配置、web_fetch 是否启用、memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace / grep / glob / mkdir 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
+- ✅ 可选 `move`（`[tools.move] enabled` 默认 true；工作区相对路径移动/重命名；默认不覆盖；doctor 报告是否启用）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、请求体上限、Metrics 是否公开、日志 format、Session TTL、优雅退出宽限期、Session 摘要压缩、工具超时、工具循环上限、web_search key 是否配置、web_fetch 是否启用、memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace / grep / glob / mkdir / move 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
@@ -495,10 +501,11 @@ triggers:
   - 可选 grep（`[tools.grep]`，工作区字面量文本搜索，非正则；默认最多 50 条；禁穿越；无 shell / ripgrep）
   - 可选 glob（`[tools.glob]`，工作区 glob 按模式找文件；只返回常规文件；默认最多 100 条；禁穿越；无 shell / find）
   - 可选 mkdir（`[tools.mkdir]`，工作区相对路径创建目录；默认 mkdir -p；目录已存在幂等成功；已存在文件报错；禁穿越；无 shell / exec）
+  - 可选 move（`[tools.move]`，工作区相对路径移动/重命名；文档主名 from/to；默认不覆盖；支持文件与目录；禁穿越；无 shell / exec）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小
-  - HTTP 配置摘要（bind、日志 format、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 是否启用及允许来源、限流是否开启及数值、请求体上限字节数、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace / grep / glob / mkdir 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
+  - HTTP 配置摘要（bind、日志 format、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 是否启用及允许来源、限流是否开启及数值、请求体上限字节数、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace / grep / glob / mkdir / move 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
@@ -621,6 +628,7 @@ triggers:
 | 工作区 grep | ✅ 本切片 | 路径沙箱，字面量搜索，无 regex / exec |
 | 工作区 glob | ✅ 本切片 | 路径沙箱，按模式找文件，无 find / exec |
 | 工作区 mkdir | ✅ 本切片 | 路径沙箱，创建目录，默认 mkdir -p，无 exec |
+| 工作区 move | ✅ 本切片 | 路径沙箱，移动/重命名，默认不覆盖，无 exec |
 | 工作区 SOUL.md / USER.md 注入 | ✅ 本切片 | - |
 | 工作区 HEARTBEAT.md 定时心跳 | ✅ 本切片 | - |
 
