@@ -147,9 +147,14 @@ See `config/jiaclaw.toml` for detailed configuration options.
     }
 
     fn default_soul_content() -> &'static str {
-        r"# Agent Soul
+        r"# Agent Soul / 人格
 
-This file defines the personality and behavioral characteristics of your JiaClaw agent.
+此文件在每次对话开始时注入系统提示（独立区块 `## Soul（人格）`）。
+
+- 只写稳定人格：语气、价值观、沟通风格；不要写临时任务状态。
+- 默认路径：`{workspace}/SOUL.md`（可通过配置 `[identity] soul_path` 覆盖）。
+- 文件不存在或为空时对话不会报错；超过 32KiB 时截断注入并 warn。
+- 可用工具 `soul_write` 覆盖（默认）或追加。
 
 ## Personality Traits
 
@@ -174,9 +179,14 @@ This file defines the personality and behavioral characteristics of your JiaClaw
     }
 
     fn default_user_content() -> &'static str {
-        r"# User Profile
+        r"# User Profile / 用户画像
 
-This file contains information about you, the user, to help JiaClaw provide personalized assistance.
+此文件在每次对话开始时注入系统提示（独立区块 `## User（用户画像）`）。
+
+- 记录稳定的用户信息与偏好，便于个性化；不要写一次性上下文。
+- 默认路径：`{workspace}/USER.md`（可通过配置 `[identity] user_path` 覆盖）。
+- 文件不存在或为空时对话不会报错；超过 32KiB 时截断注入并 warn。
+- 可用工具 `user_write` 覆盖（默认）或追加。
 
 ## About You
 

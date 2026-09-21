@@ -18,7 +18,7 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-use jiaclaw::{inspect_memory_file, JiaClawAgent, Workspace};
+use jiaclaw::{inspect_identity_file, inspect_memory_file, JiaClawAgent, Workspace};
 use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -122,12 +122,35 @@ enum Commands {
         #[command(subcommand)]
         action: MemoryCommands,
     },
+
+    /// Agent 人格（SOUL.md）
+    Soul {
+        #[command(subcommand)]
+        action: IdentityFileCommands,
+    },
+
+    /// 用户画像（USER.md）
+    User {
+        #[command(subcommand)]
+        action: IdentityFileCommands,
+    },
 }
 
 /// 长期记忆子命令
 #[derive(Subcommand)]
 enum MemoryCommands {
     /// 显示约定 MEMORY 文件内容
+    Show {
+        /// 配置文件路径
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
+}
+
+/// 人格 / 用户画像子命令
+#[derive(Subcommand)]
+enum IdentityFileCommands {
+    /// 显示约定文件内容
     Show {
         /// 配置文件路径
         #[arg(short, long, value_name = "FILE")]
@@ -175,6 +198,16 @@ async fn main() -> Result<()> {
         Commands::Memory { action } => match action {
             MemoryCommands::Show { config } => {
                 memory_show_command(config)?;
+            }
+        },
+        Commands::Soul { action } => match action {
+            IdentityFileCommands::Show { config } => {
+                identity_show_command(config, IdentityShowKind::Soul)?;
+            }
+        },
+        Commands::User { action } => match action {
+            IdentityFileCommands::Show { config } => {
+                identity_show_command(config, IdentityShowKind::User)?;
             }
         },
     }
@@ -419,7 +452,9 @@ fn session_ttl_config_source() -> &'static str {
     }
 }
 
-fn sessions_from_messages(raw: HashMap<String, Vec<ChatMessage>>) -> HashMap<String, SessionRecord> {
+fn sessions_from_messages(
+    raw: HashMap<String, Vec<ChatMessage>>,
+) -> HashMap<String, SessionRecord> {
     raw.into_iter()
         .map(|(id, messages)| (id, SessionRecord::new(messages)))
         .collect()
@@ -1721,6 +1756,59 @@ fn memory_show_command(config_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum IdentityShowKind {
+    Soul,
+    User,
+}
+
+fn identity_show_command(config_path: Option<PathBuf>, kind: IdentityShowKind) -> Result<()> {
+    let config = load_agent_config(config_path)?;
+    let (title, rel_path, tool_hint) = match kind {
+        IdentityShowKind::Soul => (
+            "✨ 人格（SOUL）",
+            config.identity.soul_path.as_str(),
+            "soul_write",
+        ),
+        IdentityShowKind::User => (
+            "👤 用户画像（USER）",
+            config.identity.user_path.as_str(),
+            "user_write",
+        ),
+    };
+    let status =
+        inspect_identity_file(&config.workspace_path, rel_path).context("无法解析身份文件路径")?;
+
+    println!("{title}\n");
+    println!("   工作空间: {}", config.workspace_path.display());
+    println!("   约定路径: {rel_path}");
+    println!("   文件:     {}", status.path.display());
+
+    if !status.exists {
+        println!("   状态:     ⚠️  不存在 (0 bytes)");
+        println!("\n💡 文件缺失时对话仍可进行，不会报错。");
+        println!("   可手动创建该文件，或让 Agent 调用 {tool_hint}。");
+        return Ok(());
+    }
+
+    println!("   状态:     ✅ 存在 ({} bytes)", status.size_bytes);
+
+    let content = std::fs::read_to_string(&status.path)
+        .with_context(|| format!("无法读取 {}", status.path.display()))?;
+
+    if content.trim().is_empty() {
+        println!("\n（文件为空，不会注入系统提示）");
+        return Ok(());
+    }
+
+    println!("\n----- 内容 -----\n{content}");
+    if !content.ends_with('\n') {
+        println!();
+    }
+    println!("----- 结束 -----");
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("🔍 JiaClaw 配置检查\n");
@@ -1793,6 +1881,44 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
                     }
                     Err(e) => {
                         println!("   MEMORY: ❌ 无法解析约定路径: {e}");
+                    }
+                }
+
+                match inspect_identity_file(&config.workspace_path, &config.identity.soul_path) {
+                    Ok(status) => {
+                        println!(
+                            "   SOUL:   {} （配置路径: {}）",
+                            status.path.display(),
+                            config.identity.soul_path
+                        );
+                        if status.exists {
+                            println!("           ✅ 存在 ({} bytes)", status.size_bytes);
+                        } else {
+                            println!("           ⚠️  不存在");
+                            println!("           💡 可手动创建，或在对话中使用 soul_write 写入");
+                        }
+                    }
+                    Err(e) => {
+                        println!("   SOUL:   ❌ 无法解析约定路径: {e}");
+                    }
+                }
+
+                match inspect_identity_file(&config.workspace_path, &config.identity.user_path) {
+                    Ok(status) => {
+                        println!(
+                            "   USER:   {} （配置路径: {}）",
+                            status.path.display(),
+                            config.identity.user_path
+                        );
+                        if status.exists {
+                            println!("           ✅ 存在 ({} bytes)", status.size_bytes);
+                        } else {
+                            println!("           ⚠️  不存在");
+                            println!("           💡 可手动创建，或在对话中使用 user_write 写入");
+                        }
+                    }
+                    Err(e) => {
+                        println!("   USER:   ❌ 无法解析约定路径: {e}");
                     }
                 }
 

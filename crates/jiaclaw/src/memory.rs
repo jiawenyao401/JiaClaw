@@ -11,7 +11,7 @@ use jiaclaw_core::{JiaClawError, MEMORY_PROMPT_MAX_BYTES};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
-/// 记忆文件在磁盘上的状态（供 `doctor` / CLI 使用）
+/// 工作区约定文件在磁盘上的状态（MEMORY / SOUL / USER，供 `doctor` / CLI 使用）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryFileStatus {
     /// 解析后的绝对或工作区拼接路径
@@ -22,23 +22,26 @@ pub struct MemoryFileStatus {
     pub size_bytes: u64,
 }
 
-/// 将配置中的相对路径解析为工作区内的记忆文件路径。
+/// 将配置中的相对路径解析为工作区内文件路径。
 ///
-/// 拒绝绝对路径和任何 `..` 组件，防止路径穿越。
+/// 拒绝绝对路径和任何 `..` 组件，防止路径穿越。SOUL / USER 与 MEMORY 共用此解析。
 ///
 /// # Errors
 ///
 /// 路径为空、绝对路径、包含 `..`，或不落在工作空间内时返回错误。
-pub fn resolve_memory_path(workspace: &Path, configured: &str) -> Result<PathBuf, JiaClawError> {
+pub fn resolve_workspace_relative_path(
+    workspace: &Path,
+    configured: &str,
+) -> Result<PathBuf, JiaClawError> {
     let configured = configured.trim();
     if configured.is_empty() {
-        return Err(JiaClawError::Configuration("记忆路径不能为空".to_string()));
+        return Err(JiaClawError::Configuration("路径不能为空".to_string()));
     }
 
     let rel = Path::new(configured);
     if rel.is_absolute() {
         return Err(JiaClawError::Configuration(format!(
-            "记忆路径必须相对于工作空间，禁止绝对路径: {configured}"
+            "路径必须相对于工作空间，禁止绝对路径: {configured}"
         )));
     }
 
@@ -47,12 +50,12 @@ pub fn resolve_memory_path(workspace: &Path, configured: &str) -> Result<PathBuf
             Component::Normal(_) | Component::CurDir => {}
             Component::ParentDir => {
                 return Err(JiaClawError::Configuration(format!(
-                    "记忆路径禁止路径穿越 (..): {configured}"
+                    "路径禁止路径穿越 (..): {configured}"
                 )));
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(JiaClawError::Configuration(format!(
-                    "记忆路径必须相对于工作空间: {configured}"
+                    "路径必须相对于工作空间: {configured}"
                 )));
             }
         }
@@ -63,6 +66,67 @@ pub fn resolve_memory_path(workspace: &Path, configured: &str) -> Result<PathBuf
 
     ensure_path_within_workspace(&workspace_base, &joined)?;
     Ok(joined)
+}
+
+/// 将配置中的相对路径解析为工作区内的记忆文件路径。
+///
+/// # Errors
+///
+/// 路径为空、绝对路径、包含 `..`，或不落在工作空间内时返回错误。
+pub fn resolve_memory_path(workspace: &Path, configured: &str) -> Result<PathBuf, JiaClawError> {
+    resolve_workspace_relative_path(workspace, configured)
+}
+
+/// 读取工作区约定文件以注入系统提示（MEMORY / SOUL / USER 共用）。
+///
+/// 文件不存在或（trim 后）为空时返回 `Ok(None)`，不报错。
+/// 超过 [`MEMORY_PROMPT_MAX_BYTES`] 时截断到 UTF-8 边界并 `warn`。
+///
+/// # Errors
+///
+/// 路径非法，或文件存在但无法读取时返回错误。
+pub fn load_prompt_file(
+    workspace: &Path,
+    configured: &str,
+    kind: &str,
+) -> Result<Option<String>, JiaClawError> {
+    let path = resolve_workspace_relative_path(workspace, configured)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    if !path.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            kind,
+            "{kind} 路径存在但不是文件，跳过注入"
+        );
+        return Ok(None);
+    }
+
+    ensure_existing_within_workspace(workspace, &path)?;
+
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        JiaClawError::Configuration(format!("无法读取{kind}文件 {}: {e}", path.display()))
+    })?;
+
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+
+    if raw.len() > MEMORY_PROMPT_MAX_BYTES {
+        tracing::warn!(
+            path = %path.display(),
+            kind,
+            size_bytes = raw.len(),
+            limit_bytes = MEMORY_PROMPT_MAX_BYTES,
+            "{kind} 文件过大，截断后注入系统提示"
+        );
+        Ok(Some(
+            truncate_utf8(&raw, MEMORY_PROMPT_MAX_BYTES).to_string(),
+        ))
+    } else {
+        Ok(Some(raw))
+    }
 }
 
 /// 读取记忆文件以注入系统提示。
@@ -77,50 +141,19 @@ pub fn load_memory_for_prompt(
     workspace: &Path,
     configured: &str,
 ) -> Result<Option<String>, JiaClawError> {
-    let path = resolve_memory_path(workspace, configured)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    if !path.is_file() {
-        tracing::warn!(path = %path.display(), "MEMORY 路径存在但不是文件，跳过注入");
-        return Ok(None);
-    }
-
-    ensure_existing_within_workspace(workspace, &path)?;
-
-    let raw = std::fs::read_to_string(&path).map_err(|e| {
-        JiaClawError::Configuration(format!("无法读取记忆文件 {}: {e}", path.display()))
-    })?;
-
-    if raw.trim().is_empty() {
-        return Ok(None);
-    }
-
-    if raw.len() > MEMORY_PROMPT_MAX_BYTES {
-        tracing::warn!(
-            path = %path.display(),
-            size_bytes = raw.len(),
-            limit_bytes = MEMORY_PROMPT_MAX_BYTES,
-            "MEMORY 文件过大，截断后注入系统提示"
-        );
-        Ok(Some(
-            truncate_utf8(&raw, MEMORY_PROMPT_MAX_BYTES).to_string(),
-        ))
-    } else {
-        Ok(Some(raw))
-    }
+    load_prompt_file(workspace, configured, "MEMORY")
 }
 
-/// 检查记忆文件是否存在及其大小。
+/// 检查工作区约定文件是否存在及其大小。
 ///
 /// # Errors
 ///
 /// 配置路径非法时返回错误。
-pub fn inspect_memory_file(
+pub fn inspect_workspace_file(
     workspace: &Path,
     configured: &str,
 ) -> Result<MemoryFileStatus, JiaClawError> {
-    let path = resolve_memory_path(workspace, configured)?;
+    let path = resolve_workspace_relative_path(workspace, configured)?;
     if path.is_file() {
         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         Ok(MemoryFileStatus {
@@ -137,6 +170,57 @@ pub fn inspect_memory_file(
     }
 }
 
+/// 检查记忆文件是否存在及其大小。
+///
+/// # Errors
+///
+/// 配置路径非法时返回错误。
+pub fn inspect_memory_file(
+    workspace: &Path,
+    configured: &str,
+) -> Result<MemoryFileStatus, JiaClawError> {
+    inspect_workspace_file(workspace, configured)
+}
+
+/// 写入工作区约定文件：`replace = true` 覆盖；否则追加 Markdown 段落。
+///
+/// 只能写约定路径。追加时在已有内容与新段落之间插入换行分隔，并以临时文件 + rename 原子落盘。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间，或 IO 失败时返回错误。
+pub fn write_workspace_file(
+    workspace: &Path,
+    configured: &str,
+    content: &str,
+    replace: bool,
+) -> Result<PathBuf, JiaClawError> {
+    let path = resolve_workspace_relative_path(workspace, configured)?;
+    ensure_path_within_workspace(workspace, &path)?;
+
+    if path.exists() {
+        ensure_existing_within_workspace(workspace, &path)?;
+        if !path.is_file() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径不是文件: {}",
+                path.display()
+            )));
+        }
+    }
+
+    let new_contents = if replace || !path.exists() {
+        content.to_string()
+    } else {
+        let existing = std::fs::read_to_string(&path).map_err(|e| {
+            JiaClawError::ToolExecution(format!("无法读取文件 {}: {e}", path.display()))
+        })?;
+        join_memory_append(&existing, content)
+    };
+
+    atomic_write(&path, &new_contents)?;
+    Ok(path)
+}
+
 /// 写入记忆文件：默认追加一段 Markdown；`replace = true` 时覆盖。
 ///
 /// 只能写约定路径。追加时在已有内容与新段落之间插入换行分隔，并以临时文件 + rename 原子落盘。
@@ -150,30 +234,7 @@ pub fn write_memory(
     content: &str,
     replace: bool,
 ) -> Result<PathBuf, JiaClawError> {
-    let path = resolve_memory_path(workspace, configured)?;
-    ensure_path_within_workspace(workspace, &path)?;
-
-    if path.exists() {
-        ensure_existing_within_workspace(workspace, &path)?;
-        if !path.is_file() {
-            return Err(JiaClawError::ToolExecution(format!(
-                "记忆路径不是文件: {}",
-                path.display()
-            )));
-        }
-    }
-
-    let new_contents = if replace || !path.exists() {
-        content.to_string()
-    } else {
-        let existing = std::fs::read_to_string(&path).map_err(|e| {
-            JiaClawError::ToolExecution(format!("无法读取记忆文件 {}: {e}", path.display()))
-        })?;
-        join_memory_append(&existing, content)
-    };
-
-    atomic_write(&path, &new_contents)?;
-    Ok(path)
+    write_workspace_file(workspace, configured, content, replace)
 }
 
 /// 追加时用空行分隔已有内容与新段落。
@@ -217,7 +278,7 @@ fn ensure_path_within_workspace(workspace: &Path, target: &Path) -> Result<(), J
             return Ok(());
         }
         return Err(JiaClawError::ToolExecution(format!(
-            "安全错误: 记忆文件 {} 不在工作空间 {} 内",
+            "安全错误: 文件 {} 不在工作空间 {} 内",
             target.display(),
             ws.display()
         )));
@@ -239,7 +300,7 @@ fn ensure_path_within_workspace(workspace: &Path, target: &Path) -> Result<(), J
     }
 
     Err(JiaClawError::ToolExecution(format!(
-        "安全错误: 记忆文件 {} 不在工作空间 {} 内",
+        "安全错误: 文件 {} 不在工作空间 {} 内",
         target.display(),
         ws.display()
     )))
@@ -248,11 +309,11 @@ fn ensure_path_within_workspace(workspace: &Path, target: &Path) -> Result<(), J
 fn ensure_existing_within_workspace(workspace: &Path, path: &Path) -> Result<(), JiaClawError> {
     let ws = canonicalize_existing_or_clone(workspace);
     let canon = path.canonicalize().map_err(|e| {
-        JiaClawError::ToolExecution(format!("无法解析记忆文件 {}: {e}", path.display()))
+        JiaClawError::ToolExecution(format!("无法解析文件 {}: {e}", path.display()))
     })?;
     if !canon.starts_with(&ws) {
         return Err(JiaClawError::ToolExecution(format!(
-            "安全错误: 记忆文件 {} 指向工作空间外部",
+            "安全错误: 文件 {} 指向工作空间外部",
             path.display()
         )));
     }
@@ -261,25 +322,25 @@ fn ensure_existing_within_workspace(workspace: &Path, path: &Path) -> Result<(),
 
 fn atomic_write(path: &Path, contents: &str) -> Result<(), JiaClawError> {
     let parent = path.parent().ok_or_else(|| {
-        JiaClawError::ToolExecution(format!("无效的记忆文件路径: {}", path.display()))
+        JiaClawError::ToolExecution(format!("无效的文件路径: {}", path.display()))
     })?;
     std::fs::create_dir_all(parent).map_err(|e| {
-        JiaClawError::ToolExecution(format!("无法创建记忆文件目录 {}: {e}", parent.display()))
+        JiaClawError::ToolExecution(format!("无法创建文件目录 {}: {e}", parent.display()))
     })?;
 
-    let file_name = path.file_name().ok_or_else(|| {
-        JiaClawError::ToolExecution(format!("无效的记忆文件名: {}", path.display()))
-    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| JiaClawError::ToolExecution(format!("无效的文件名: {}", path.display())))?;
     let tmp = parent.join(format!("{}.tmp", file_name.to_string_lossy()));
 
     std::fs::write(&tmp, contents).map_err(|e| {
-        JiaClawError::ToolExecution(format!("无法写入临时记忆文件 {}: {e}", tmp.display()))
+        JiaClawError::ToolExecution(format!("无法写入临时文件 {}: {e}", tmp.display()))
     })?;
 
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         JiaClawError::ToolExecution(format!(
-            "无法提交记忆文件 {} -> {}: {e}",
+            "无法提交文件 {} -> {}: {e}",
             tmp.display(),
             path.display()
         ))

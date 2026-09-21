@@ -161,6 +161,10 @@ pub struct AgentConfig {
     /// 工作区长期记忆配置（缺省为 `{workspace}/MEMORY.md`）
     #[serde(default)]
     pub memory: MemoryConfig,
+
+    /// 工作区人格 / 用户画像配置（缺省为 `{workspace}/SOUL.md` 与 `USER.md`）
+    #[serde(default)]
+    pub identity: IdentityConfig,
 }
 
 fn default_workspace_path() -> std::path::PathBuf {
@@ -173,11 +177,25 @@ fn default_workspace_path() -> std::path::PathBuf {
 /// 默认工作区记忆文件名（相对于 `workspace_path`）
 pub const DEFAULT_MEMORY_PATH: &str = "MEMORY.md";
 
-/// 注入系统提示时的最大字节数（32 KiB）
+/// 默认人格文件名（相对于 `workspace_path`）
+pub const DEFAULT_SOUL_PATH: &str = "SOUL.md";
+
+/// 默认用户画像文件名（相对于 `workspace_path`）
+pub const DEFAULT_USER_PATH: &str = "USER.md";
+
+/// 注入系统提示时的最大字节数（32 KiB）；MEMORY / SOUL / USER 各自独立截断
 pub const MEMORY_PROMPT_MAX_BYTES: usize = 32 * 1024;
 
 fn default_memory_path() -> String {
     DEFAULT_MEMORY_PATH.to_string()
+}
+
+fn default_soul_path() -> String {
+    DEFAULT_SOUL_PATH.to_string()
+}
+
+fn default_user_path() -> String {
+    DEFAULT_USER_PATH.to_string()
 }
 
 /// 工作区长期记忆配置
@@ -192,6 +210,27 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             path: default_memory_path(),
+        }
+    }
+}
+
+/// 工作区人格与用户画像配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityConfig {
+    /// 人格文件路径（相对于 `workspace_path`，默认 `SOUL.md`）
+    #[serde(default = "default_soul_path")]
+    pub soul_path: String,
+
+    /// 用户画像文件路径（相对于 `workspace_path`，默认 `USER.md`）
+    #[serde(default = "default_user_path")]
+    pub user_path: String,
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            soul_path: default_soul_path(),
+            user_path: default_user_path(),
         }
     }
 }
@@ -400,6 +439,7 @@ impl Default for AgentConfig {
             provider: ProviderConfig::default(),
             http: HttpConfig::default(),
             memory: MemoryConfig::default(),
+            identity: IdentityConfig::default(),
         }
     }
 }
@@ -431,12 +471,14 @@ impl AgentConfig {
             http: Option<HttpConfig>,
             #[serde(default)]
             memory: Option<MemoryConfig>,
+            #[serde(default)]
+            identity: Option<IdentityConfig>,
         }
 
         let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -445,6 +487,9 @@ impl AgentConfig {
         }
         if let Some(memory) = config_file.memory {
             config_file.agent.memory = memory;
+        }
+        if let Some(identity) = config_file.identity {
+            config_file.agent.identity = identity;
         }
 
         Ok(config_file.agent)
@@ -476,12 +521,14 @@ impl AgentConfig {
             http: Option<HttpConfig>,
             #[serde(default)]
             memory: Option<MemoryConfig>,
+            #[serde(default)]
+            identity: Option<IdentityConfig>,
         }
 
         let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -490,6 +537,9 @@ impl AgentConfig {
         }
         if let Some(memory) = config_file.memory {
             config_file.agent.memory = memory;
+        }
+        if let Some(identity) = config_file.identity {
+            config_file.agent.identity = identity;
         }
 
         Ok(config_file.agent)
@@ -500,7 +550,8 @@ impl AgentConfig {
 mod tests {
     use super::{
         parse_positive_rate_limit, parse_positive_session_ttl, resolve_rate_limit_per_minute,
-        resolve_session_ttl_secs, AgentConfig, HttpConfig, DEFAULT_MEMORY_PATH,
+        resolve_session_ttl_secs, AgentConfig, HttpConfig, DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH,
+        DEFAULT_USER_PATH,
     };
 
     #[test]
@@ -601,6 +652,8 @@ session_ttl_secs = 3600
         assert_eq!(config.http.rate_limit_per_minute, None);
         assert_eq!(config.http.session_ttl_secs, None);
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
+        assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
+        assert_eq!(config.identity.user_path, DEFAULT_USER_PATH);
     }
 
     #[test]
@@ -614,6 +667,8 @@ max_turns = 10
 "#;
         let config = AgentConfig::from_toml_str(toml).expect("parse toml");
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
+        assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
+        assert_eq!(config.identity.user_path, DEFAULT_USER_PATH);
     }
 
     #[test]
@@ -647,5 +702,57 @@ path = "notes/MEMORY.md"
         }"#;
         let config = AgentConfig::from_json_str(json).expect("parse json");
         assert_eq!(config.memory.path, "custom.md");
+    }
+
+    #[test]
+    fn identity_config_defaults_without_section() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
+        assert_eq!(config.identity.user_path, DEFAULT_USER_PATH);
+    }
+
+    #[test]
+    fn identity_config_parses_top_level_section() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[identity]
+soul_path = "persona/SOUL.md"
+user_path = "persona/USER.md"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.identity.soul_path, "persona/SOUL.md");
+        assert_eq!(config.identity.user_path, "persona/USER.md");
+    }
+
+    #[test]
+    fn identity_config_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "identity": {
+                "soul_path": "soul.md",
+                "user_path": "user.md"
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert_eq!(config.identity.soul_path, "soul.md");
+        assert_eq!(config.identity.user_path, "user.md");
+        assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
     }
 }

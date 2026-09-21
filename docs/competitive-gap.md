@@ -98,6 +98,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 |------|----------|--------------|---------|--------|---------------|
 | **短期记忆** | ✅ 会话历史 | ✅ 上下文窗口 | ✅ 基础（ChatRequest） | P0 | - |
 | **工作区 MEMORY.md** | ✅ 文件注入 | ✅ MEMORY.md 注入 | ✅ **每次 chat 注入 + memory_append** | P1 | - |
+| **工作区 SOUL.md / USER.md** | ✅ 人格与用户画像 | ✅ SOUL/USER 注入 | ✅ **每次 chat 注入 + soul_write/user_write** | P1 | - |
 | **长期记忆（向量）** | ✅ 向量数据库 (ChromaDB/Pinecone) | ✅ 嵌入检索 | ⏳ 计划中（M3） | P1 | StateKnot 持久化层 |
 | **语义搜索** | ✅ 完整 | ✅ 完整 | ⏳ 计划中（M3） | P1 | 通过 MCP 或本地工具 |
 | **记忆编辑** | ✅ API 支持 | ⏳ 部分 | ⏳ 计划中（M3） | P2 | - |
@@ -112,6 +113,14 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - 超过 32KiB 截断并 `warn`
   - 工具 `memory_append`：`content` 追加 Markdown，可选 `replace`（默认 false）；只能写约定路径，禁止穿越；追加为读-改-写 + 原子 rename，带换行分隔
   - `jiaclaw doctor` 报告 MEMORY 是否存在及大小；`jiaclaw memory show` 查看内容
+- ✅ **工作区 `SOUL.md` / `USER.md` 人格与用户画像注入**（对照 OpenClaw/Hermes 身份文件）
+  - 约定路径：`{workspace}/SOUL.md`、`USER.md`，可用 `[identity] soul_path` / `user_path` 覆盖（缺省配置兼容）
+  - 每次 `chat` / `build_system_prompt` 重读；存在且非空则分别注入 `## Soul（人格）`、`## User（用户画像）`
+  - 各文件独立 32KiB 截断并 `warn`；无文件不报错
+  - 路径安全复用 MEMORY 的 resolve（禁 `..`、绝对路径、symlink 逃逸）
+  - 工具 `soul_write` / `user_write`：`content` + 可选 `replace`（默认 true 覆盖）；只能写约定路径
+  - `jiaclaw doctor` 报告 SOUL/USER 是否存在及大小；`jiaclaw soul show` / `jiaclaw user show`
+  - 与 MEMORY 并存，互不覆盖
 - ⏳ 向量检索式长期记忆仍待 M3
 - ✅ 时间旅行和 Fork 能力由 StateKnot Checkpoint 提供（待实现）
 
@@ -326,7 +335,7 @@ triggers:
 - ✅ Cargo 工作空间已配置
 - ✅ `jiaclaw init` 命令创建工作空间
 - ✅ HTTP 配置支持（bind、webhook_secret、cors_allow_origins、可选限流、可选 Session TTL）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Session TTL、MEMORY 文件）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Session TTL、MEMORY/SOUL/USER 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
@@ -338,7 +347,7 @@ triggers:
   - 可选会话闲置 TTL（`session_ttl_secs`，过期清理内存 store；落盘开启时同步 save）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
-  - 检查 workspace 可读性、工具数量、技能数量、MEMORY 是否存在及大小
+  - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER 是否存在及大小
   - HTTP 配置摘要（bind、webhook 鉴权状态、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
@@ -443,6 +452,7 @@ triggers:
 | PostgreSQL 持久化 | M1 | [#94](https://github.com/StateKnot/StateKnot/issues/94) |
 | 长期记忆（向量数据库） | M3 | - |
 | 工作区 MEMORY.md 注入 | ✅ 本切片 | - |
+| 工作区 SOUL.md / USER.md 注入 | ✅ 本切片 | - |
 
 ### P2 - 中优先级（Medium）
 | 功能 | 计划时间 |

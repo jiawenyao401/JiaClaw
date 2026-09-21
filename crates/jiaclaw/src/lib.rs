@@ -10,18 +10,25 @@
 //! - 持久化运行（支持重启后恢复）
 
 pub use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpConfig, JiaClawError, MemoryConfig,
-    MessageRole, ProviderConfig, RunStatus, ToolCall, DEFAULT_MEMORY_PATH, MEMORY_PROMPT_MAX_BYTES,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpConfig, IdentityConfig, JiaClawError,
+    MemoryConfig, MessageRole, ProviderConfig, RunStatus, ToolCall, DEFAULT_MEMORY_PATH,
+    DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MEMORY_PROMPT_MAX_BYTES,
 };
 
+mod identity;
 mod memory;
 mod provider;
 mod skills;
 mod tools;
 mod workspace;
 
+pub use identity::{
+    inspect_identity_file, load_identity_for_prompt, resolve_identity_path, write_identity,
+    IdentityKind, IdentityWriteTool,
+};
 pub use memory::{
-    inspect_memory_file, load_memory_for_prompt, resolve_memory_path, write_memory,
+    inspect_memory_file, inspect_workspace_file, load_memory_for_prompt, load_prompt_file,
+    resolve_memory_path, resolve_workspace_relative_path, write_memory, write_workspace_file,
     MemoryAppendTool, MemoryFileStatus,
 };
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
@@ -92,6 +99,14 @@ impl JiaClawAgent {
         tools.register(Box::new(MemoryAppendTool::new(
             &config.workspace_path,
             config.memory.path.clone(),
+        )));
+        tools.register(Box::new(IdentityWriteTool::soul(
+            &config.workspace_path,
+            config.identity.soul_path.clone(),
+        )));
+        tools.register(Box::new(IdentityWriteTool::user(
+            &config.workspace_path,
+            config.identity.user_path.clone(),
         )));
 
         // 文件操作工具
@@ -246,32 +261,37 @@ impl JiaClawAgent {
         }
     }
 
-    /// 构建系统提示（包含工作空间内容；每次调用重读 MEMORY）
+    /// 构建系统提示（包含工作空间内容；每次调用重读 SOUL / USER / MEMORY）
     fn build_system_prompt(&self, request: &ChatRequest) -> String {
         let mut prompt = self.config.system_instructions.clone();
 
-        // 添加工作空间内容
-        if let Some(ref soul) = self.workspace.soul {
-            prompt.push_str("\n\n## Agent Soul\n");
-            prompt.push_str(soul);
-        }
-
-        if let Some(ref user) = self.workspace.user {
-            prompt.push_str("\n\n## User Profile\n");
-            prompt.push_str(user);
-        }
-
-        // 每次对话开始时重读约定 MEMORY 路径（工具写入对后续 chat 可见）
-        match load_memory_for_prompt(&self.config.workspace_path, &self.config.memory.path) {
-            Ok(Some(memory)) => {
-                prompt.push_str("\n\n## Long-term Memory（长期记忆）\n");
-                prompt.push_str(&memory);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!("读取长期记忆失败，跳过注入: {e}");
-            }
-        }
+        // 每次对话开始时重读约定身份与记忆路径（工具写入对后续 chat 可见）
+        Self::inject_prompt_section(
+            &mut prompt,
+            IdentityKind::Soul.prompt_heading(),
+            load_identity_for_prompt(
+                &self.config.workspace_path,
+                &self.config.identity.soul_path,
+                IdentityKind::Soul,
+            ),
+            "人格",
+        );
+        Self::inject_prompt_section(
+            &mut prompt,
+            IdentityKind::User.prompt_heading(),
+            load_identity_for_prompt(
+                &self.config.workspace_path,
+                &self.config.identity.user_path,
+                IdentityKind::User,
+            ),
+            "用户画像",
+        );
+        Self::inject_prompt_section(
+            &mut prompt,
+            "Long-term Memory（长期记忆）",
+            load_memory_for_prompt(&self.config.workspace_path, &self.config.memory.path),
+            "长期记忆",
+        );
 
         // 添加技能摘要
         if !self.skills.is_empty() {
@@ -323,6 +343,26 @@ impl JiaClawAgent {
         }
 
         prompt
+    }
+
+    fn inject_prompt_section(
+        prompt: &mut String,
+        heading: &str,
+        loaded: Result<Option<String>, JiaClawError>,
+        warn_label: &str,
+    ) {
+        match loaded {
+            Ok(Some(content)) => {
+                prompt.push_str("\n\n## ");
+                prompt.push_str(heading);
+                prompt.push('\n');
+                prompt.push_str(&content);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("读取{warn_label}失败，跳过注入: {e}");
+            }
+        }
     }
 
     /// 解析 assistant 消息中的工具调用
@@ -673,6 +713,8 @@ impl JiaClawAgent {
              • `jiaclaw chat <消息>` - 发送单次聊天消息\n\
              • `jiaclaw doctor` - 检查配置和连接\n\
              • `jiaclaw memory show` - 显示长期记忆\n\
+             • `jiaclaw soul show` - 显示人格\n\
+             • `jiaclaw user show` - 显示用户画像\n\
              • `jiaclaw serve` - 启动 HTTP 服务（计划中）\n\n\
              配置:\n\
              • 使用 `--config <文件>` 指定配置文件\n\
@@ -1038,6 +1080,143 @@ mod tests {
         let agent = JiaClawAgent::new(config).unwrap();
         let prompt = agent.build_system_prompt(&sample_request());
         assert!(prompt.contains("custom-rel-path-token"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_without_soul_or_user_file_does_not_error() {
+        let dir = unique_workspace("jiaclaw_agent_no_id");
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(
+            !prompt.contains("## Soul（人格）"),
+            "无 SOUL 文件时不应注入人格区块: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## User（用户画像）"),
+            "无 USER 文件时不应注入用户画像区块: {prompt}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_prompt_includes_soul_and_user_file_content() {
+        let dir = unique_workspace("jiaclaw_agent_with_id");
+        std::fs::write(dir.join("SOUL.md"), "UNIQUE_SOUL_TOKEN_be_concise").unwrap();
+        std::fs::write(dir.join("USER.md"), "UNIQUE_USER_TOKEN_likes_rust").unwrap();
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(prompt.contains("## Soul（人格）"));
+        assert!(prompt.contains("UNIQUE_SOUL_TOKEN_be_concise"));
+        assert!(prompt.contains("## User（用户画像）"));
+        assert!(prompt.contains("UNIQUE_USER_TOKEN_likes_rust"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn soul_user_and_memory_coexist_in_prompt() {
+        let dir = unique_workspace("jiaclaw_agent_id_mem");
+        std::fs::write(dir.join("SOUL.md"), "SOUL_TOKEN_AAA").unwrap();
+        std::fs::write(dir.join("USER.md"), "USER_TOKEN_BBB").unwrap();
+        std::fs::write(dir.join("MEMORY.md"), "MEMORY_TOKEN_CCC").unwrap();
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(prompt.contains("SOUL_TOKEN_AAA"));
+        assert!(prompt.contains("USER_TOKEN_BBB"));
+        assert!(prompt.contains("MEMORY_TOKEN_CCC"));
+        assert!(prompt.contains("## Soul（人格）"));
+        assert!(prompt.contains("## User（用户画像）"));
+        assert!(prompt.contains("Long-term Memory"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn soul_write_then_prompt_sees_file_without_clobbering_memory() {
+        let dir = unique_workspace("jiaclaw_agent_soul_write");
+        std::fs::write(dir.join("MEMORY.md"), "keep-memory-xyz").unwrap();
+        std::fs::write(dir.join("USER.md"), "keep-user-xyz").unwrap();
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+
+        let call = ToolCall {
+            tool_name: "soul_write".to_string(),
+            arguments: serde_json::json!({"content": "new-soul-xyz"}),
+            result: None,
+        };
+        let result = agent.tools().execute(&call).await.unwrap();
+        assert!(result.contains("覆盖") || result.contains("SOUL"));
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("SOUL.md")).unwrap(),
+            "new-soul-xyz"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("MEMORY.md")).unwrap(),
+            "keep-memory-xyz"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("USER.md")).unwrap(),
+            "keep-user-xyz"
+        );
+
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(prompt.contains("new-soul-xyz"));
+        assert!(prompt.contains("keep-memory-xyz"));
+        assert!(prompt.contains("keep-user-xyz"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_identity_paths_injected_into_prompt() {
+        let dir = unique_workspace("jiaclaw_agent_custom_id");
+        std::fs::create_dir_all(dir.join("persona")).unwrap();
+        std::fs::write(dir.join("persona/soul.md"), "custom-soul-rel").unwrap();
+        std::fs::write(dir.join("persona/user.md"), "custom-user-rel").unwrap();
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            identity: IdentityConfig {
+                soul_path: "persona/soul.md".to_string(),
+                user_path: "persona/user.md".to_string(),
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(prompt.contains("custom-soul-rel"));
+        assert!(prompt.contains("custom-user-rel"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_path_traversal_is_skipped_not_injected() {
+        let dir = unique_workspace("jiaclaw_agent_id_trav");
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            identity: IdentityConfig {
+                soul_path: "../evil.md".to_string(),
+                user_path: "/etc/passwd".to_string(),
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(!prompt.contains("## Soul（人格）"));
+        assert!(!prompt.contains("## User（用户画像）"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
