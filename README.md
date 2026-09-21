@@ -66,6 +66,9 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **可选 Session TTL** - 闲置超时自动清理内存会话（长时间 `serve` 防堆积）
   - 配置 `session_ttl_secs` 或环境变量 `JIACLAW_SESSION_TTL_SECS`（正整数才启用；`0`/非法=关闭）
   - create/chat/get/list 触达刷新；过期后 list 不返回，GET/DELETE 与不存在一致（404）
+- ✅ **可选工具超时** - 单次 `shell_exec` / `http_get` 等不会无限卡住 tool loop
+  - 配置 `[agent] tool_timeout_secs` 或环境变量 `JIACLAW_TOOL_TIMEOUT_SECS`（正整数才启用；`0`/非法=关闭）
+  - 超时把 `Tool timed out after Ns` 写入 tool result，不 panic，继续循环
 - ✅ **请求追踪** - 所有 HTTP 响应回写 `X-Request-Id`（请求未带则生成 UUID）
 - ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
 - ✅ **Session 查询 API** - `GET /api/sessions` 列表、`GET /api/sessions/:id` 读取历史（不存在 404）
@@ -155,6 +158,11 @@ persist_path = ".jiaclaw/sessions.json"
 # 未设置或 0：不启用。create/chat/get/list 触达会刷新。
 # session_ttl_secs = 3600
 
+# 工具调用超时写在 [agent] 段（环境变量 JIACLAW_TOOL_TIMEOUT_SECS 优先）
+# 正整数启用；未设置或 0 不限制（默认）。超时写入 tool result 并继续 loop。
+# [agent]
+# tool_timeout_secs = 30
+
 [memory]
 # 工作区长期记忆（相对于 workspace，默认 MEMORY.md；缺省本段即可）
 path = "MEMORY.md"
@@ -173,6 +181,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 # 可选：Session 闲置 TTL（秒，优先于配置文件）
 # export JIACLAW_SESSION_TTL_SECS=3600
+# 可选：单次工具调用超时（秒，优先于配置文件）
+# export JIACLAW_TOOL_TIMEOUT_SECS=30
 ```
 
 ### 运行示例
@@ -302,6 +312,7 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - StateKnot 持久化功能尚未集成
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET 为 404
+- 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
 - Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
@@ -395,6 +406,9 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Optional Session TTL** - idle sessions are expired to avoid unbounded memory growth during long `serve`
   - Configure `session_ttl_secs` or `JIACLAW_SESSION_TTL_SECS` (positive integer enables; `0`/invalid disables)
   - create/chat/get/list refresh last access; expired ids are omitted from list and GET/DELETE match not-found (404)
+- ✅ **Optional tool timeout** - a long `shell_exec` / `http_get` cannot stall the whole tool loop
+  - Configure `[agent] tool_timeout_secs` or `JIACLAW_TOOL_TIMEOUT_SECS` (positive integer enables; `0`/invalid disables)
+  - Timeout writes `Tool timed out after Ns` into the tool result, does not panic, and continues the loop
 - ✅ **Request tracing** - every HTTP response writes `X-Request-Id` (generated UUID if missing)
 - ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
 - ✅ **Session query API** - `GET /api/sessions` list, `GET /api/sessions/:id` history (404 if missing)
@@ -484,6 +498,11 @@ persist_path = ".jiaclaw/sessions.json"
 # Unset or 0: disabled. create/chat/get/list refresh last access.
 # session_ttl_secs = 3600
 
+# Per-tool timeout lives on [agent] (JIACLAW_TOOL_TIMEOUT_SECS env var takes priority)
+# Positive integer enables; unset or 0 is unlimited (default). Timeout writes into the tool result and the loop continues.
+# [agent]
+# tool_timeout_secs = 30
+
 [memory]
 # Workspace long-term memory (relative to workspace, default MEMORY.md)
 path = "MEMORY.md"
@@ -502,6 +521,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 # Optional: session idle TTL in seconds (overrides config file)
 # export JIACLAW_SESSION_TTL_SECS=3600
+# Optional: per-tool timeout in seconds (overrides config file)
+# export JIACLAW_TOOL_TIMEOUT_SECS=30
 ```
 
 #### Run Examples
@@ -619,6 +640,7 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - StateKnot persistence features not yet integrated
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*` and `/hooks/inbound` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET of an expired id returns 404
+- Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
 - Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)

@@ -69,6 +69,44 @@ impl ToolRegistry {
 
         tool.execute(tool_call.arguments.clone()).await
     }
+
+    /// 执行工具调用，可选超时。
+    ///
+    /// `timeout_secs` 为 `None` 时与 [`Self::execute`] 行为相同（不限制）。
+    /// 超时时返回 `JiaClawError::ToolExecution("Tool timed out after Ns")`，不 panic。
+    ///
+    /// # 策略
+    ///
+    /// 对 `Tool::execute` 的 Future 使用 `tokio::time::timeout`。
+    /// `shell_exec` / `http_get` 等同步工作已在工具内部 `spawn_blocking`，
+    /// 超时后本调用立即把错误交还给 tool loop；后台阻塞任务可能仍会跑完，
+    /// 但不会继续卡住本轮循环。
+    ///
+    /// # Errors
+    ///
+    /// 如果工具不存在、执行失败或超时，返回错误。
+    pub async fn execute_with_timeout(
+        &self,
+        tool_call: &ToolCall,
+        timeout_secs: Option<u64>,
+    ) -> Result<String, JiaClawError> {
+        match timeout_secs {
+            Some(secs) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(secs),
+                    self.execute(tool_call),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(JiaClawError::ToolExecution(format!(
+                        "Tool timed out after {secs}s"
+                    ))),
+                }
+            }
+            None => self.execute(tool_call).await,
+        }
+    }
 }
 
 impl Default for ToolRegistry {
@@ -1156,6 +1194,67 @@ mod tests {
 
         let tools = registry.list();
         assert!(tools.contains(&"workspace_list"));
+    }
+
+    struct SlowSleepTool {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl Tool for SlowSleepTool {
+        fn name(&self) -> &str {
+            "slow_sleep"
+        }
+
+        fn description(&self) -> &str {
+            "test-only slow tool"
+        }
+
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<String, JiaClawError> {
+            tokio::time::sleep(self.delay).await;
+            Ok("slept".to_string())
+        }
+    }
+
+    fn slow_sleep_call() -> ToolCall {
+        ToolCall {
+            tool_name: "slow_sleep".to_string(),
+            arguments: serde_json::json!({}),
+            result: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_without_timeout_completes_slow_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowSleepTool {
+            delay: std::time::Duration::from_millis(50),
+        }));
+        let result = registry
+            .execute_with_timeout(&slow_sleep_call(), None)
+            .await
+            .unwrap();
+        assert_eq!(result, "slept");
+    }
+
+    #[tokio::test]
+    async fn execute_with_short_timeout_returns_timeout_error() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowSleepTool {
+            delay: std::time::Duration::from_secs(10),
+        }));
+        let err = registry
+            .execute_with_timeout(&slow_sleep_call(), Some(1))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Tool timed out after 1s"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

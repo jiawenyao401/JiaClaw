@@ -18,6 +18,11 @@ Always be polite, concise, and accurate.
 # 最大对话轮次
 max_turns = 10
 
+# 工具调用超时（可选，环境变量 JIACLAW_TOOL_TIMEOUT_SECS 优先）
+# 正整数：单次 tool 执行超过该秒数则把超时错误写入 tool result 并继续 loop
+# 未设置或 0：不限制（默认，保持现状）
+# tool_timeout_secs = 30
+
 [runtime]
 # StateKnot 运行时配置（当 StateKnot 集成可用时）
 # 
@@ -137,8 +142,8 @@ max_message_length = 10000
 # 最大会话历史长度
 max_history_length = 100
 
-# 工具调用超时（秒）
-tool_timeout = 30
+# 工具调用超时（秒）—— 实际生效字段为 [agent] tool_timeout_secs / JIACLAW_TOOL_TIMEOUT_SECS
+# tool_timeout = 30
 
 # 模型调用超时（秒）
 model_timeout = 120
