@@ -137,7 +137,7 @@
   - 工具 `soul_write` / `user_write` / `memory_append` / `memory_write` 只能写约定路径（禁止穿越）
   - 工具 `memory_search` 在 MEMORY / SOUL / USER（或安全相对路径）中按关键词检索行窗片段
   - 工具 `memory_write` 向配置的 MEMORY.md 追加或覆盖（`mode=append|overwrite`，结果上限 32KiB，原子写）
-  - 工具 `read_file` / `list_dir` / `write_file` / `delete_file` 读取、列出、写入或删除工作区相对路径（禁 `..` / 绝对路径 / symlink 逃逸；`read_file` / `write_file` 上限 256KiB；`list_dir` 默认不递归；`write_file` 支持 overwrite/append 原子写；`delete_file` 只删常规文件、拒绝目录、缺文件报错）
+  - 工具 `read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` 读取、列出、写入、删除或精确替换工作区相对路径（禁 `..` / 绝对路径 / symlink 逃逸；`read_file` / `write_file` / `str_replace` 上限 256KiB；`list_dir` 默认不递归；`write_file` 支持 overwrite/append 原子写；`delete_file` 只删常规文件、拒绝目录、缺文件报错；`str_replace` 默认恰好匹配 1 次，`replace_all` 可替换全部）
 
 #### 3. `jiaclaw-host` - 可执行宿主
 
@@ -146,7 +146,7 @@
 - **CLI 接口**
   - `jiaclaw serve` - 启动 HTTP 服务
   - `jiaclaw chat <message>` - 单次聊天
-  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔；工具循环上限生效值；web_search / web_fetch / memory_search / memory_write / read_file / list_dir / write_file / delete_file 是否启用；可选 CORS 是否启用；日志 format；serve 优雅退出宽限期）
+  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔；工具循环上限生效值；web_search / web_fetch / memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace 是否启用；可选 CORS 是否启用；日志 format；serve 优雅退出宽限期）
   - `jiaclaw memory show` - 显示工作区长期记忆
   - `jiaclaw session export <id> [-o file]` - 从落盘 store 只读导出 JSONL
   - `jiaclaw session import <file> [--id ID] [--overwrite]` - 导入 JSONL/JSON 到落盘 store（不调用 LLM）

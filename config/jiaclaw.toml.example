@@ -220,6 +220,12 @@ enabled = true
 # 禁止 .. / 绝对路径 / symlink 逃逸。不递归、无 shell、不调用 LLM。enabled = false 不注册。
 enabled = true
 
+[tools.str_replace]
+# 可选工作区精确字符串替换（默认启用并注册）。path / old_str / new_str 必填；replace_all 默认 false（必须恰好 1 次）。
+# 读入或写出超过 256KiB（与 read/write 对齐）明确报错且不落盘。tmp + rename 原子写。拒绝二进制。
+# 禁止 .. / 绝对路径 / symlink 逃逸。enabled = false 不注册。无 shell、不调用 LLM。
+enabled = true
+
 [skills]
 # 启用的技能列表（示例）
 enabled = [
