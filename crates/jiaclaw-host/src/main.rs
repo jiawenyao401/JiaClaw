@@ -653,6 +653,7 @@ fn classify_slack_envelope(envelope: &SlackEnvelope) -> SlackInboundKind {
     }
 }
 
+#[cfg(test)]
 fn encode_hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -700,6 +701,7 @@ fn slack_timestamp_fresh(timestamp: &str, now_secs: u64) -> bool {
 }
 
 /// 计算 Slack 官方 `v0=` HMAC-SHA256 签名（用于测试与对照已知向量）。
+#[cfg(test)]
 fn slack_v0_signature(secret: &str, timestamp: &str, body: &[u8]) -> Option<String> {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(b"v0:");
