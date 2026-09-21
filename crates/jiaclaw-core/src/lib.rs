@@ -217,6 +217,9 @@ pub const DEFAULT_HEARTBEAT_SESSION_ID: &str = "heartbeat";
 /// 默认心跳间隔（秒）
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 3600;
 
+/// `jiaclaw serve` 优雅退出时等待进行中请求的默认宽限期（秒）
+pub const DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
+
 /// 默认工具循环上限（与历史硬编码 `MAX_ITERATIONS = 5` 保持兼容）
 pub const DEFAULT_MAX_TOOL_ITERATIONS: usize = 5;
 
@@ -462,8 +465,9 @@ pub fn parse_metrics_require_auth(raw: &str) -> Option<bool> {
 #[must_use]
 pub fn resolve_metrics_public(configured_public: bool, env_require_auth: Option<&str>) -> bool {
     match env_require_auth {
-        Some(raw) => parse_metrics_require_auth(raw)
-            .map_or(configured_public, |require_auth| !require_auth),
+        Some(raw) => {
+            parse_metrics_require_auth(raw).map_or(configured_public, |require_auth| !require_auth)
+        }
         None => configured_public,
     }
 }
@@ -678,6 +682,13 @@ pub struct HttpConfig {
     #[serde(default)]
     pub session_ttl_secs: Option<u64>,
 
+    /// 优雅退出宽限期（秒，环境变量 `JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先）
+    ///
+    /// 收到 SIGINT/SIGTERM 后停止 accept，并等待进行中请求结束；超时则丢弃剩余连接。
+    /// 正整数生效；未设置、`0` 或无法解析时回退 [`DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS`]。
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+
     /// `GET /metrics` 是否无需 API Bearer（默认 `true`，便于 Prometheus scrape）。
     ///
     /// 设为 `false` 时与 `/api/*` 相同鉴权。环境变量 `JIACLAW_METRICS_REQUIRE_AUTH=1`
@@ -702,6 +713,10 @@ fn default_metrics_public() -> bool {
     true
 }
 
+fn default_shutdown_timeout_secs() -> u64 {
+    DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -719,6 +734,7 @@ impl Default for HttpConfig {
             persist_path: default_persist_path(),
             rate_limit_per_minute: None,
             session_ttl_secs: None,
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
             metrics_public: default_metrics_public(),
         }
     }
@@ -775,6 +791,33 @@ pub fn resolve_session_ttl_secs(configured: Option<u64>, env_value: Option<&str>
     match env_value {
         Some(raw) => parse_positive_session_ttl(raw),
         None => configured.filter(|&n| n > 0),
+    }
+}
+
+/// 解析正整数优雅退出宽限期（秒）；`0` 或无法解析时返回 `None`。
+#[must_use]
+pub fn parse_positive_shutdown_timeout(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+fn fallback_shutdown_timeout(configured: u64) -> u64 {
+    if configured > 0 {
+        configured
+    } else {
+        DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+    }
+}
+
+/// 根据配置文件值与可选环境变量解析优雅退出宽限期（秒）。
+///
+/// 环境变量 `JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先（仅正整数）；非法 / `0` 回退配置，
+/// 配置亦非正整数时回退 [`DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS`]。
+#[must_use]
+pub fn resolve_shutdown_timeout_secs(configured: u64, env_value: Option<&str>) -> u64 {
+    match env_value {
+        Some(raw) => parse_positive_shutdown_timeout(raw)
+            .unwrap_or_else(|| fallback_shutdown_timeout(configured)),
+        None => fallback_shutdown_timeout(configured),
     }
 }
 
@@ -847,6 +890,20 @@ impl HttpConfig {
         resolve_session_ttl_secs(
             self.session_ttl_secs,
             std::env::var("JIACLAW_SESSION_TTL_SECS").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的优雅退出宽限期（秒）。
+    ///
+    /// 环境变量 `JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先于配置文件。
+    /// 仅正整数生效；非法 / `0` 回退配置或默认 15 秒。
+    #[must_use]
+    pub fn effective_shutdown_timeout_secs(&self) -> u64 {
+        resolve_shutdown_timeout_secs(
+            self.shutdown_timeout_secs,
+            std::env::var("JIACLAW_SHUTDOWN_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -1166,15 +1223,18 @@ mod tests {
     use super::{
         parse_boolish_flag, parse_metrics_require_auth, parse_positive_heartbeat_interval,
         parse_positive_max_tool_iterations, parse_positive_rate_limit, parse_positive_session_ttl,
-        parse_positive_tool_timeout, parse_session_summarize_on_overflow,
-        resolve_heartbeat_interval_secs, resolve_max_tool_iterations, resolve_metrics_public,
-        resolve_optional_secret, resolve_rate_limit_per_minute, resolve_session_keep_recent,
-        resolve_session_summarize_on_overflow, resolve_session_ttl_secs, resolve_tool_timeout_secs,
-        AgentConfig, HeartbeatConfig, HttpConfig, MemorySearchToolConfig, SessionConfig,
-        ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-        DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MAX_TOOL_ITERATIONS,
-        DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
-        MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
+        parse_positive_shutdown_timeout, parse_positive_tool_timeout,
+        parse_session_summarize_on_overflow, resolve_heartbeat_interval_secs,
+        resolve_max_tool_iterations, resolve_metrics_public, resolve_optional_secret,
+        resolve_rate_limit_per_minute, resolve_session_keep_recent,
+        resolve_session_summarize_on_overflow, resolve_session_ttl_secs,
+        resolve_shutdown_timeout_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
+        HttpConfig, MemorySearchToolConfig, SessionConfig, ToolsConfig, WebFetchToolConfig,
+        WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
+        DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS,
+        DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
+        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
+        MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -1190,6 +1250,23 @@ mod tests {
     fn http_config_session_ttl_defaults_to_none() {
         assert_eq!(HttpConfig::default().session_ttl_secs, None);
         assert_eq!(HttpConfig::default().effective_session_ttl_secs(), None);
+    }
+
+    #[test]
+    fn http_config_shutdown_timeout_defaults_to_15() {
+        assert_eq!(DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, 15);
+        assert_eq!(
+            HttpConfig::default().shutdown_timeout_secs,
+            DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_shutdown_timeout_secs(0, None),
+            DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_shutdown_timeout_secs(DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, None),
+            DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -1258,6 +1335,40 @@ mod tests {
         assert_eq!(resolve_session_ttl_secs(Some(30), None), Some(30));
         assert_eq!(resolve_session_ttl_secs(Some(0), None), None);
         assert_eq!(resolve_session_ttl_secs(None, None), None);
+    }
+
+    #[test]
+    fn parse_positive_shutdown_timeout_accepts_only_positive_integers() {
+        assert_eq!(parse_positive_shutdown_timeout("15"), Some(15));
+        assert_eq!(parse_positive_shutdown_timeout(" 1 "), Some(1));
+        assert_eq!(parse_positive_shutdown_timeout("0"), None);
+        assert_eq!(parse_positive_shutdown_timeout(""), None);
+        assert_eq!(parse_positive_shutdown_timeout("abc"), None);
+        assert_eq!(parse_positive_shutdown_timeout("-1"), None);
+    }
+
+    #[test]
+    fn resolve_shutdown_timeout_env_overrides_and_falls_back() {
+        assert_eq!(resolve_shutdown_timeout_secs(15, Some("30")), 30);
+        assert_eq!(
+            resolve_shutdown_timeout_secs(20, Some("0")),
+            20,
+            "env 0 应忽略并回退配置"
+        );
+        assert_eq!(
+            resolve_shutdown_timeout_secs(20, Some("nope")),
+            20,
+            "非法 env 应忽略并回退配置"
+        );
+        assert_eq!(resolve_shutdown_timeout_secs(8, None), 8);
+        assert_eq!(
+            resolve_shutdown_timeout_secs(0, None),
+            DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_shutdown_timeout_secs(0, Some("bad")),
+            DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -1372,6 +1483,10 @@ session_ttl_secs = 3600
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.http.rate_limit_per_minute, Some(60));
         assert_eq!(config.http.session_ttl_secs, Some(3600));
+        assert_eq!(
+            config.http.shutdown_timeout_secs,
+            DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
         assert!(config.http.metrics_public);
         assert_eq!(config.http.api_token, None);
         assert_eq!(config.http.webhook_secret, None);
@@ -1383,6 +1498,23 @@ session_ttl_secs = 3600
         assert_eq!(config.http.discord_bot_token, None);
         assert_eq!(config.tool_timeout_secs, None);
         assert_eq!(config.max_tool_iterations, DEFAULT_MAX_TOOL_ITERATIONS);
+    }
+
+    #[test]
+    fn http_config_parses_shutdown_timeout_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:8080"
+shutdown_timeout_secs = 5
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.http.shutdown_timeout_secs, 5);
     }
 
     #[test]
@@ -1568,6 +1700,10 @@ tool_timeout_secs = 30
         assert_eq!(config.http.bind, "0.0.0.0:8080");
         assert_eq!(config.http.rate_limit_per_minute, None);
         assert_eq!(config.http.session_ttl_secs, None);
+        assert_eq!(
+            config.http.shutdown_timeout_secs,
+            DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
         assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
         assert_eq!(config.identity.user_path, DEFAULT_USER_PATH);

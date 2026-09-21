@@ -70,6 +70,9 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 配置 `session_ttl_secs` 或环境变量 `JIACLAW_SESSION_TTL_SECS`（正整数才启用；`0`/非法=关闭）
   - create/chat/get/list 触达刷新；过期后 list 不返回，GET/DELETE/export 与不存在一致（404）
   - `GET /api/sessions/:id/export` 只读导出（默认 JSONL），不刷新 TTL、不触发摘要
+- ✅ **serve 优雅退出** - `jiaclaw serve` 支持 SIGINT/SIGTERM
+  - 停止接受新连接，尽量完成进行中请求；宽限期 `[http] shutdown_timeout_secs`（默认 15 秒），`JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先（正整数；非法回退默认）
+  - 落盘开启时关闭路径原子刷盘 sessions；失败打 error 日志仍退出。Heartbeat 后台任务会被 abort
 - ✅ **可选 Session 摘要压缩** - 接近消息条数上限时把旧消息折叠成一条摘要，避免硬截断丢上下文
   - 配置 `[session] summarize_on_overflow`（默认 `false`，保持现有丢弃最旧消息行为）或环境变量 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` 强制开启
   - `keep_recent` 默认 10；复用当前 LLM provider，固定中英 prompt，无工具且限制 `max_tokens`；失败 warn 并回退硬截断，不让 chat 失败
@@ -239,6 +242,11 @@ persist_path = ".jiaclaw/sessions.json"
 # 未设置或 0：不启用。create/chat/get/list 触达会刷新。
 # session_ttl_secs = 3600
 
+# 优雅退出宽限期（可选，环境变量 JIACLAW_SHUTDOWN_TIMEOUT_SECS 优先）
+# SIGINT/SIGTERM 后停止 accept，等待进行中请求；正整数生效，非法/0 回退默认 15 秒。
+# 落盘开启时关闭路径会原子刷盘 sessions。
+# shutdown_timeout_secs = 15
+
 [session]
 # 接近消息条数上限（50）时是否摘要压缩（默认 false，保持硬截断）
 # 环境变量 JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true 可强制开启
@@ -298,6 +306,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_METRICS_REQUIRE_AUTH=1
 # 可选：Session 闲置 TTL（秒，优先于配置文件）
 # export JIACLAW_SESSION_TTL_SECS=3600
+# 可选：serve 优雅退出宽限期（秒，优先于 [http] shutdown_timeout_secs；正整数，非法/0 回退 15）
+# export JIACLAW_SHUTDOWN_TIMEOUT_SECS=15
 # 可选：接近消息上限时摘要压缩（1/true 强制开启，优先于 [session] summarize_on_overflow）
 # export JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1
 # 可选：单次工具调用超时（秒，优先于配置文件）
@@ -514,6 +524,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 超限返回 `429` + `Retry-After`；`GET /health` 与 `GET /metrics` 不限流
 - 可选 Prometheus 指标：`GET /metrics` 默认公开；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。进程内计数（HTTP 路由族、session 数、工具调用、build_info），不引入 telemetry SDK
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET/export 为 404
+- serve 优雅退出：`jiaclaw serve` 支持 SIGINT/SIGTERM；停止 accept 并等待进行中请求。`[http] shutdown_timeout_secs` 默认 15 秒，`JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先（正整数；非法回退默认）。落盘开启时关闭路径刷盘；Heartbeat 任务 abort
 - 可选 Session 摘要压缩：设置 `[session] summarize_on_overflow = true` 或 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` 后，接近上限时把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`（默认 10）条；未开启则仍硬截断。摘要失败会 warn 并回退截断，chat 不失败
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
 - 可配置工具循环上限：设置 `JIACLAW_MAX_TOOL_ITERATIONS` 或 `[agent] max_tool_iterations`（默认 5）；正整数生效，`0`/非法忽略，钳制 1–32。达上限时写入 tool/assistant 提示并结束本轮
@@ -622,6 +633,9 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Configure `session_ttl_secs` or `JIACLAW_SESSION_TTL_SECS` (positive integer enables; `0`/invalid disables)
   - create/chat/get/list refresh last access; expired ids are omitted from list and GET/DELETE/export match not-found (404)
   - `GET /api/sessions/:id/export` is a read-only dump (JSONL by default); it does not refresh TTL or trigger summarization
+- ✅ **Graceful serve shutdown** - `jiaclaw serve` handles SIGINT/SIGTERM
+  - Stops accepting, drains in-flight requests; grace period `[http] shutdown_timeout_secs` (default 15s), `JIACLAW_SHUTDOWN_TIMEOUT_SECS` wins (positive integer; invalid falls back to default)
+  - When persist is on, shutdown flushes sessions atomically; save failure is logged and the process still exits. Heartbeat background tasks are aborted
 - ✅ **Optional session summary compression** - fold older messages into one summary near the session cap instead of dropping them
   - Configure `[session] summarize_on_overflow` (default `false`, keeps hard truncation) or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` to force-enable
   - `keep_recent` defaults to 10; reuses the current LLM provider with a fixed bilingual prompt, no tools, and a small `max_tokens`; on failure, warn and fall back to truncation without failing chat
@@ -791,6 +805,11 @@ persist_path = ".jiaclaw/sessions.json"
 # Unset or 0: disabled. create/chat/get/list refresh last access.
 # session_ttl_secs = 3600
 
+# Graceful shutdown timeout (JIACLAW_SHUTDOWN_TIMEOUT_SECS env var takes priority)
+# After SIGINT/SIGTERM, stop accepting and wait for in-flight requests; invalid/0 falls back to 15s.
+# When persist is on, the shutdown path flushes sessions with the same atomic write.
+# shutdown_timeout_secs = 15
+
 [session]
 # When approaching the message cap (50), summarize older turns instead of dropping them (default false)
 # JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true force-enables this
@@ -849,6 +868,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_METRICS_REQUIRE_AUTH=1
 # Optional: session idle TTL in seconds (overrides config file)
 # export JIACLAW_SESSION_TTL_SECS=3600
+# Optional: graceful shutdown timeout in seconds (overrides [http] shutdown_timeout_secs; invalid/0 falls back to 15)
+# export JIACLAW_SHUTDOWN_TIMEOUT_SECS=15
 # Optional: summarize older session messages near the cap (1/true force-enables)
 # export JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1
 # Optional: per-tool timeout in seconds (overrides config file)
@@ -1053,6 +1074,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` return `429` + `Retry-After` when exceeded; `GET /health` and `GET /metrics` are never limited
 - Optional Prometheus metrics: `GET /metrics` is public by default; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`. In-process counters (HTTP route family, session gauge, tool calls, build_info); no telemetry SDK
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET/export of an expired id returns 404
+- Graceful serve shutdown: `jiaclaw serve` handles SIGINT/SIGTERM; stops accepting and drains in-flight requests. `[http] shutdown_timeout_secs` defaults to 15s; `JIACLAW_SHUTDOWN_TIMEOUT_SECS` wins (positive integer; invalid falls back to default). Persist flush on shutdown; heartbeat tasks are aborted
 - Optional session summary compression: set `[session] summarize_on_overflow = true` or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` to fold older messages into one `[session-summary]` system message while keeping the latest `keep_recent` (default 10); unset keeps hard truncation. Summary failure warns and falls back; chat still succeeds
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
 - Configurable tool-loop cap: set `JIACLAW_MAX_TOOL_ITERATIONS` or `[agent] max_tool_iterations` (default 5); positive integers apply, `0`/invalid is ignored, clamped to 1–32. Hitting the cap writes a tool/assistant hint and ends the turn
