@@ -395,32 +395,29 @@ pub fn write_workspace_regular_file(
     max_bytes: usize,
 ) -> Result<WriteFileOutput, JiaClawError> {
     let dest = prepare_workspace_write_path(workspace, rel_path)?;
-    let new_bytes = match mode {
-        WriteFileMode::Overwrite => content.as_bytes().to_vec(),
-        WriteFileMode::Append if dest.exists() => {
-            ensure_existing_within_workspace(workspace, &dest)?;
-            let meta = fs::metadata(&dest).map_err(|e| {
-                JiaClawError::ToolExecution(format!("无法读取文件元数据 {rel_path}: {e}"))
-            })?;
-            if !meta.is_file() {
-                return Err(JiaClawError::ToolExecution(format!(
-                    "路径不是文件: {rel_path}"
-                )));
-            }
-            let existing_len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
-            if existing_len.saturating_add(content.len()) > max_bytes {
-                return Err(JiaClawError::ToolExecution(format!(
-                    "文件超过上限 {max_bytes} 字节（将写入 {} 字节）: {rel_path}",
-                    existing_len.saturating_add(content.len())
-                )));
-            }
-            let mut existing = fs::read(&dest).map_err(|e| {
-                JiaClawError::ToolExecution(format!("无法读取文件 {rel_path}: {e}"))
-            })?;
-            existing.extend_from_slice(content.as_bytes());
-            existing
+    let new_bytes = if mode == WriteFileMode::Append && dest.exists() {
+        ensure_existing_within_workspace(workspace, &dest)?;
+        let meta = fs::metadata(&dest).map_err(|e| {
+            JiaClawError::ToolExecution(format!("无法读取文件元数据 {rel_path}: {e}"))
+        })?;
+        if !meta.is_file() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径不是文件: {rel_path}"
+            )));
         }
-        WriteFileMode::Append => content.as_bytes().to_vec(),
+        let existing_len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+        if existing_len.saturating_add(content.len()) > max_bytes {
+            return Err(JiaClawError::ToolExecution(format!(
+                "文件超过上限 {max_bytes} 字节（将写入 {} 字节）: {rel_path}",
+                existing_len.saturating_add(content.len())
+            )));
+        }
+        let mut existing = fs::read(&dest)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法读取文件 {rel_path}: {e}")))?;
+        existing.extend_from_slice(content.as_bytes());
+        existing
+    } else {
+        content.as_bytes().to_vec()
     };
 
     if new_bytes.len() > max_bytes {
