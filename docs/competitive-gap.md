@@ -62,6 +62,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **Session 摘要压缩** | ✅ 支持 | ⏳ 部分 | ✅ **可选溢出摘要** | P1 | - |
 | **工具列表 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/tools** | P1 | - |
 | **技能列表 API** | ✅ 支持 | ❌ 无 | ✅ **GET /api/skills** | P1 | - |
+| **技能热加载** | ⏳ 常需重启 | ⏳ 常需重启 | ✅ **POST /api/skills/reload + Unix SIGHUP** | P1 | - |
 | **Webhook 入站** | ✅ 支持 | ⏳ 部分 | ✅ **POST /hooks/inbound** | P1 | - |
 | **Telegram Bot 入站** | ✅ 支持 | ⏳ 部分 | ✅ **POST /hooks/telegram** | P1 | - |
 | **Telegram Bot 出站** | ✅ 支持 | ⏳ 部分 | ✅ **可选 sendMessage** | P1 | - |
@@ -84,7 +85,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - ✅ 会话管理：`--session <id>` 续聊支持
   - ✅ 会话导出：`jiaclaw session export <id> [-o file]`，默认 stdout JSONL；读落盘 store，不触发摘要
   - ✅ 会话导入：`jiaclaw session import <file> [--id ID] [--overwrite]`，JSONL 或 `{id?, messages}` JSON；已存在需 `--overwrite`；不调用 LLM
-- ✅ HTTP 服务已实现（GET /health, GET /metrics, POST /api/chat，可选 SSE, GET/POST /api/sessions, GET/DELETE /api/sessions/:id, GET /api/sessions/:id/export, POST /api/sessions/import, GET /api/tools, GET /api/skills, GET /api/openapi.json）
+- ✅ HTTP 服务已实现（GET /health, GET /metrics, POST /api/chat，可选 SSE, GET/POST /api/sessions, GET/DELETE /api/sessions/:id, GET /api/sessions/:id/export, POST /api/sessions/import, GET /api/tools, GET /api/skills, POST /api/skills/reload, GET /api/openapi.json）
 - ✅ **可选 HTTP 限流**（`[http] rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`，进程内全局，超限 429 + Retry-After；GET /health 与 GET /metrics 不限流；覆盖 `/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord`）
 - ✅ **可选 Prometheus 指标**（`GET /metrics`，手写 Prometheus 0.0.4 文本；默认公开；`[http] metrics_public = false` / `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。HTTP 路由族计数、sessions_active、tool_calls、build_info；无 telemetry SDK）
 - ✅ **请求追踪**（缺失则生成 UUID，响应回写 `X-Request-Id`；chat/webhook tracing 带 request_id）
@@ -92,6 +93,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ **可选 SSE**（`POST /api/chat`：`Accept: text/event-stream` 或 body `stream: true` → `text/event-stream`；事件 `meta` / `token` / `tool` / `done` / `error`。未请求流式时 JSON 不变；鉴权失败仍 JSON 401。**当前为整轮完成后分块推送；Brokerrouter 真流式后续**）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史；默认硬截断超长历史，可开启摘要压缩）
 - ✅ **serve 优雅退出**（SIGINT/SIGTERM：停止 accept，宽限期等待进行中请求；`[http] shutdown_timeout_secs` 默认 15，`JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先；落盘开启时关闭路径原子刷盘；Heartbeat 任务 abort）
+- ✅ **技能热加载**（`POST /api/skills/reload` 重扫工作区 `skills/` 并替换进程内注册表；失败保留旧表并返回明确错误；鉴权/限流/`X-Request-Id` 与其它 `/api/*` 一致。Unix `SIGHUP` 走同一路径；Windows 仅 HTTP。CLI `jiaclaw skills reload` 只扫描当前工作区，不通知已运行的 serve。进行中 chat 使用快照，不长时间持锁）
 - ✅ **Session 查询 API**（`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息，不存在 404；读内存当前状态，落盘开启时与 store 一致）
 - ✅ **Session 导出**（`GET /api/sessions/:id/export` 默认 JSONL，`?format=json` 整包 `{id, messages}`；鉴权/限流/`X-Request-Id` 与其它 `/api/*` 一致；过期 TTL 与不存在同为 404；不触发摘要、不改写 store。CLI：`jiaclaw session export <id> [-o file]`）
 - ✅ **Session 导入**（`POST /api/sessions/import` 默认 JSONL，`Content-Type: application/json` 或 `?format=json` 接受 `{id?, messages}`；可选 `?id=`；已存在默认 409，`?overwrite=true` 替换并刷新 last_accessed；非法行 400；不调用 LLM；超长走 MAX_SESSION_MESSAGES 硬截断/本地摘要。CLI：`jiaclaw session import <file> [--id ID] [--overwrite]`）
@@ -99,7 +101,8 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ **可选 Session 摘要压缩**（`[session] summarize_on_overflow` / `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true`，默认关保持硬截断；开启后把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`；失败 warn 回退截断。HTTP/Telegram/Slack/Discord/webhook/heartbeat 共用 store 写入点，摘要无工具循环）
 - ✅ **Session 可选落盘**（`[http] persist = true`，进程重启后可恢复历史，原子写入，自动处理损坏文件）
 - ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
-- ✅ 技能列表 API（GET /api/skills 列出已发现技能）
+- ✅ 技能列表 API（GET /api/skills 列出进程内已加载技能）
+- ✅ 技能热加载 API（POST /api/skills/reload；失败保留旧表）
 - ✅ Webhook 入站 API（POST /hooks/inbound，支持可选鉴权，自动 session 管理）
 - ✅ **Telegram Bot 入站**（POST /hooks/telegram，手写 serde 解析 Bot API Update 最小子集；session `telegram:{chat.id}`；可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret` 校验 `X-Telegram-Bot-Api-Secret-Token`；无文本 200 跳过；同步回传 `{ ok, reply }`）
 - ✅ **Telegram Bot 可选出站**（`JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token` 优先；成功回复后 POST `sendMessage`，文本按 4096 截断；出站失败 warn + 仍 200 原 JSON，避免 webhook 重试；未配置 token 时行为与仅入站一致。`setWebhook` 指向公网 `/hooks/telegram`）
@@ -179,6 +182,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 |------|----------|--------------|---------|--------|---------------|
 | **技能定义** | ✅ Python 类 + 装饰器 | ✅ 函数 + 描述 | ✅ **SKILL.md + YAML frontmatter** | P1 | [#96](https://github.com/StateKnot/StateKnot/issues/96) 技能组合 |
 | **技能发现** | ✅ 自动扫描 | ⏳ 手动注册 | ✅ **自动扫描 skills/**  | P1 | - |
+| **技能热加载** | ⏳ 常需重启 | ⏳ 常需重启 | ✅ **HTTP + Unix SIGHUP** | P1 | - |
 | **技能激活** | ✅ 动态加载 | ✅ 运行时选择 | ✅ **显式 + 自动触发** | P1 | - |
 | **触发器** | ⏳ 部分支持 | ❌ 无 | ✅ **关键词匹配** | P1 | - |
 | **技能依赖** | ⏳ 部分支持 | ❌ 无 | ⏳ 计划中（M3） | P2 | - |
@@ -188,10 +192,12 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 **JiaClaw 现状**:
 - ✅ 技能定义：`SKILL.md` 格式（YAML frontmatter + Markdown 内容）
 - ✅ 技能发现：启动时自动扫描 `skills/**/SKILL.md`
+- ✅ 技能热加载：`POST /api/skills/reload` / Unix `SIGHUP` 重扫并替换进程内表；失败保留旧表；`jiaclaw skills reload` 仅扫描当前工作区
 - ✅ 技能激活：支持显式启用（`enabled_skills` 字段）和自动触发（`triggers` 关键词）
-- ✅ CLI 命令：`jiaclaw skills` 列出已发现技能
-- ✅ API 端点：`GET /api/skills` 返回技能列表
+- ✅ CLI 命令：`jiaclaw skills` 列出已发现技能；`jiaclaw skills reload` 扫描并打印（不通知 serve）
+- ✅ API 端点：`GET /api/skills` 返回进程内技能列表；`POST /api/skills/reload` 热加载
 - ✅ 示例技能：`search` 和 `calculator`（带触发器）
+- ⏳ 技能市场 / 依赖解析：不在本切片（仍为 M3）
 
 **技能格式示例**:
 ```markdown
@@ -216,6 +222,7 @@ triggers:
 - **P1 技能发现** ✅ 已实现
   - 运行时扫描 `skills/` 目录
   - 解析 YAML frontmatter 和 Markdown 内容
+  - 热加载：`reload_skills` 在锁外扫描，成功后短写锁替换；坏文件使 reload 失败并保留旧表
 - **P1 技能激活** ✅ 已实现
   - 显式启用：通过 `ChatRequest.enabled_skills` 指定
   - 自动触发：用户消息匹配 `triggers` 时自动启用（可配置）

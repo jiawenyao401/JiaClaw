@@ -5,6 +5,7 @@
 
 use jiaclaw_core::JiaClawError;
 use std::path::{Path, PathBuf};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// 技能定义
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -191,39 +192,84 @@ impl SkillDiscovery {
         self
     }
 
-    /// 发现所有技能
-    ///
-    /// # Errors
-    ///
-    /// 如果无法读取技能目录或解析技能文件，返回错误。
-    pub fn discover(&self) -> Result<Vec<Skill>, JiaClawError> {
+    /// 列出 `skills/` 下的一级子目录。目录不存在时返回空列表。
+    fn skill_directories(&self) -> Result<Vec<PathBuf>, JiaClawError> {
         if !self.skills_root.exists() {
             tracing::debug!("技能目录不存在: {}", self.skills_root.display());
             return Ok(Vec::new());
         }
 
-        let mut skills = Vec::new();
-
         let entries = std::fs::read_dir(&self.skills_root)
             .map_err(|e| JiaClawError::Configuration(format!("无法读取技能目录: {e}")))?;
 
+        let mut dirs = Vec::new();
         for entry in entries {
             let entry =
                 entry.map_err(|e| JiaClawError::Configuration(format!("无法读取目录条目: {e}")))?;
-
             let path = entry.path();
-
             if path.is_dir() {
-                match Skill::from_file(&path) {
-                    Ok(skill) => {
-                        tracing::debug!("发现技能: {}", skill.name);
-                        skills.push(skill);
-                    }
-                    Err(e) => {
-                        tracing::warn!("跳过无效技能目录 {}: {e}", path.display());
-                    }
+                dirs.push(path);
+            }
+        }
+        Ok(dirs)
+    }
+
+    /// 发现所有技能（启动时宽松模式：单个坏文件跳过并 warn）。
+    ///
+    /// # Errors
+    ///
+    /// 如果无法读取技能目录，返回错误。
+    pub fn discover(&self) -> Result<Vec<Skill>, JiaClawError> {
+        let mut skills = Vec::new();
+
+        for path in self.skill_directories()? {
+            match Skill::from_file(&path) {
+                Ok(skill) => {
+                    tracing::debug!("发现技能: {}", skill.name);
+                    skills.push(skill);
+                }
+                Err(e) => {
+                    tracing::warn!("跳过无效技能目录 {}: {e}", path.display());
                 }
             }
+        }
+
+        Ok(skills)
+    }
+
+    /// 严格扫描：任一现存 `SKILL.md` 无法读取或解析则失败（热加载用）。
+    ///
+    /// 缺少 `SKILL.md` 的子目录会被跳过（不是技能）。目录本身无法读取时返回错误。
+    ///
+    /// # Errors
+    ///
+    /// 无法读取 `skills/`，或至少一个技能文件无效。
+    pub fn discover_strict(&self) -> Result<Vec<Skill>, JiaClawError> {
+        let mut skills = Vec::new();
+        let mut errors = Vec::new();
+
+        for path in self.skill_directories()? {
+            let skill_file = path.join("SKILL.md");
+            if !skill_file.exists() {
+                tracing::debug!("跳过无 SKILL.md 的目录: {}", path.display());
+                continue;
+            }
+            match Skill::from_file(&path) {
+                Ok(skill) => {
+                    tracing::debug!("发现技能: {}", skill.name);
+                    skills.push(skill);
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {e}", path.display()));
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(JiaClawError::Configuration(format!(
+                "存在无效技能文件: {}",
+                errors.join("; ")
+            )));
         }
 
         Ok(skills)
@@ -275,6 +321,56 @@ impl SkillDiscovery {
         }
 
         triggered
+    }
+}
+
+/// 进程内技能注册表：短读锁快照，热加载时短写锁替换。
+#[derive(Debug)]
+pub struct SkillRegistry {
+    inner: RwLock<Vec<Skill>>,
+}
+
+impl SkillRegistry {
+    /// 用已扫描的技能列表构造注册表。
+    #[must_use]
+    pub fn new(skills: Vec<Skill>) -> Self {
+        Self {
+            inner: RwLock::new(skills),
+        }
+    }
+
+    fn lock_read(&self) -> RwLockReadGuard<'_, Vec<Skill>> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_write(&self) -> RwLockWriteGuard<'_, Vec<Skill>> {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 克隆当前技能列表（持锁时间短，调用方随后不再持锁）。
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<Skill> {
+        self.lock_read().clone()
+    }
+
+    /// 重新扫描工作区 `skills/` 并替换注册表。
+    ///
+    /// 磁盘扫描在锁外完成；仅成功后短时间持写锁替换。失败时保留旧表。
+    ///
+    /// # Errors
+    ///
+    /// 目录无法读取，或任一 `SKILL.md` 无效。此时注册表内容不变。
+    pub fn reload(&self, workspace_path: &Path) -> Result<Vec<Skill>, JiaClawError> {
+        let new_skills = SkillDiscovery::new(workspace_path).discover_strict()?;
+        {
+            let mut guard = self.lock_write();
+            guard.clone_from(&new_skills);
+        }
+        Ok(new_skills)
     }
 }
 
@@ -488,5 +584,123 @@ triggers:
         assert_eq!(triggered.len(), 0);
 
         let _ = fs::remove_dir_all(&temp_workspace);
+    }
+
+    fn unique_workspace(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}_{}_{nanos}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_skill(workspace: &Path, name: &str, body: &str) {
+        let dir = workspace.join("skills").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn discover_strict_loads_valid_skills() {
+        let workspace = unique_workspace("jiaclaw_strict_ok");
+        write_skill(
+            &workspace,
+            "alpha",
+            "# Alpha\n\n## Description\n\nFirst skill\n",
+        );
+
+        let skills = SkillDiscovery::new(&workspace).discover_strict().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "alpha");
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn discover_strict_fails_on_bad_skill_file() {
+        let workspace = unique_workspace("jiaclaw_strict_bad");
+        write_skill(
+            &workspace,
+            "alpha",
+            "# Alpha\n\n## Description\n\nFirst skill\n",
+        );
+        write_skill(
+            &workspace,
+            "broken",
+            "---\nname: [not yaml\n---\n# Broken\n",
+        );
+
+        let err = SkillDiscovery::new(&workspace)
+            .discover_strict()
+            .expect_err("坏文件应使严格扫描失败");
+        assert!(
+            err.to_string().contains("无效技能"),
+            "错误应说明无效技能，实际: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn registry_reload_replaces_table() {
+        let workspace = unique_workspace("jiaclaw_registry_reload");
+        write_skill(
+            &workspace,
+            "alpha",
+            "# Alpha\n\n## Description\n\nFirst skill\n",
+        );
+        let registry = SkillRegistry::new(
+            SkillDiscovery::new(&workspace)
+                .discover()
+                .expect("初始扫描"),
+        );
+        assert_eq!(registry.snapshot().len(), 1);
+
+        write_skill(
+            &workspace,
+            "beta",
+            "# Beta\n\n## Description\n\nSecond skill\n",
+        );
+        let reloaded = registry.reload(&workspace).expect("重载应成功");
+        assert_eq!(reloaded.len(), 2);
+        let names: Vec<_> = registry.snapshot().iter().map(|s| s.name.clone()).collect();
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn registry_reload_keeps_old_table_on_bad_file() {
+        let workspace = unique_workspace("jiaclaw_registry_keep");
+        write_skill(
+            &workspace,
+            "alpha",
+            "# Alpha\n\n## Description\n\nFirst skill\n",
+        );
+        let registry = SkillRegistry::new(
+            SkillDiscovery::new(&workspace)
+                .discover()
+                .expect("初始扫描"),
+        );
+
+        write_skill(
+            &workspace,
+            "broken",
+            "---\nname: [not yaml\n---\n# Broken\n",
+        );
+        let err = registry.reload(&workspace).expect_err("坏文件应使重载失败");
+        assert!(
+            err.to_string().contains("无效技能"),
+            "错误应说明无效技能，实际: {err}"
+        );
+
+        let names: Vec<_> = registry.snapshot().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["alpha".to_string()]);
+
+        let _ = fs::remove_dir_all(&workspace);
     }
 }

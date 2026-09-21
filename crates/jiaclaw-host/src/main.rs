@@ -199,10 +199,13 @@ enum Commands {
         config: Option<PathBuf>,
     },
 
-    /// 列出已发现的技能
+    /// 列出或重载技能
     Skills {
+        #[command(subcommand)]
+        action: Option<SkillsCommands>,
+
         /// 配置文件路径
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", global = true)]
         config: Option<PathBuf>,
 
         /// 显示详细信息
@@ -271,6 +274,13 @@ enum SessionCommands {
     },
 }
 
+/// 技能子命令
+#[derive(Subcommand)]
+enum SkillsCommands {
+    /// 重新扫描工作区 `skills/` 并打印结果（不通知已运行的 serve）
+    Reload,
+}
+
 /// 长期记忆子命令
 #[derive(Subcommand)]
 enum MemoryCommands {
@@ -327,9 +337,18 @@ async fn main() -> Result<()> {
         Commands::Doctor { config } => {
             doctor_command(config)?;
         }
-        Commands::Skills { config, verbose } => {
-            skills_command(config, verbose)?;
-        }
+        Commands::Skills {
+            action,
+            config,
+            verbose,
+        } => match action {
+            Some(SkillsCommands::Reload) => {
+                skills_reload_command(config)?;
+            }
+            None => {
+                skills_command(config, verbose)?;
+            }
+        },
         Commands::Memory { action } => match action {
             MemoryCommands::Show { config } => {
                 memory_show_command(config)?;
@@ -1560,6 +1579,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/sessions/:id/export", get(export_session_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/skills", get(skills_handler))
+        .route("/api/skills/reload", post(reload_skills_handler))
         .route("/api/openapi.json", get(openapi_handler))
         .route("/hooks/inbound", post(hooks_inbound_handler))
         .route("/hooks/telegram", post(hooks_telegram_handler))
@@ -1928,6 +1948,7 @@ fn spawn_session_ttl_sweeper(state: AppState) -> tokio::task::JoinHandle<()> {
 struct BackgroundTasks {
     heartbeat: Option<tokio::task::JoinHandle<()>>,
     ttl_sweeper: Option<tokio::task::JoinHandle<()>>,
+    skill_reloader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BackgroundTasks {
@@ -1938,6 +1959,10 @@ impl BackgroundTasks {
         }
         if let Some(handle) = &self.ttl_sweeper {
             tracing::info!("正在停止 Session TTL 扫描任务");
+            handle.abort();
+        }
+        if let Some(handle) = &self.skill_reloader {
+            tracing::info!("正在停止 SIGHUP 技能重载监听");
             handle.abort();
         }
     }
@@ -2212,7 +2237,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • POST   /api/sessions/import - 导入会话（JSONL / JSON）");
     tracing::info!("   • DELETE /api/sessions/:id    - 删除会话");
     tracing::info!("   • GET    /api/tools           - 列出已注册工具");
-    tracing::info!("   • GET    /api/skills          - 列出已发现技能");
+    tracing::info!("   • GET    /api/skills          - 列出已加载技能（进程内注册表）");
+    tracing::info!("   • POST   /api/skills/reload   - 热加载技能（不重启 serve）");
     tracing::info!("   • GET    /api/openapi.json    - OpenAPI 3 草图");
     tracing::info!("   • POST   /hooks/inbound       - Webhook 入站端点");
     tracing::info!("   • POST   /hooks/telegram      - Telegram Bot 入站端点");
@@ -2257,6 +2283,9 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         tracing::info!("   • Session TTL: 未启用");
     }
     tracing::info!("   • 优雅退出: 支持 SIGINT/SIGTERM（宽限期 {shutdown_timeout_secs} 秒）");
+    tracing::info!(
+        "   • 技能热加载: POST /api/skills/reload；Unix 上 SIGHUP 触发同样路径（Windows 仅 HTTP）"
+    );
     tracing::info!(
         "   • Session 摘要压缩: {}",
         session_summarize_status_line(&config)
@@ -2424,6 +2453,9 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         "   • 优雅退出: ✅ 支持 SIGINT/SIGTERM（宽限期 {shutdown_timeout_secs} 秒，通过 {}）",
         shutdown_timeout_config_source()
     );
+    println!(
+        "   • 技能热加载: ✅ POST /api/skills/reload；Unix SIGHUP 同步 reload（Windows 仅 HTTP）"
+    );
 
     if config.session.effective_summarize_on_overflow() {
         println!(
@@ -2511,8 +2543,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     println!("\n💡 试试：curl http://{}/health", config.http.bind);
     println!("         curl http://{}/metrics", config.http.bind);
     println!("支持 SIGINT/SIGTERM 优雅退出（宽限期 {shutdown_timeout_secs} 秒）");
+    println!("Unix 上可发送 SIGHUP 热加载技能；Windows 请用 POST /api/skills/reload");
     println!("按 Ctrl+C 或发送 SIGTERM 停止服务\n");
 
+    let skill_reloader = spawn_skill_reload_on_sighup(shutdown_state.agent.clone());
     serve_with_graceful_shutdown(
         listener,
         app,
@@ -2522,6 +2556,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         BackgroundTasks {
             heartbeat: heartbeat_handle,
             ttl_sweeper,
+            skill_reloader,
         },
     )
     .await
@@ -3219,6 +3254,24 @@ struct SkillsResponse {
     skills: Vec<SkillInfo>,
 }
 
+/// 技能热加载响应
+#[derive(Debug, Serialize, Deserialize)]
+struct SkillsReloadResponse {
+    reloaded: usize,
+    skills: Vec<SkillInfo>,
+}
+
+fn skill_infos(skills: &[jiaclaw::Skill]) -> Vec<SkillInfo> {
+    skills
+        .iter()
+        .map(|skill| SkillInfo {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            path: skill.path.to_string_lossy().to_string(),
+        })
+        .collect()
+}
+
 /// 删除会话处理器
 async fn delete_session_handler(
     State(state): State<AppState>,
@@ -3278,7 +3331,7 @@ async fn tools_handler(
     Ok(Json(ToolsResponse { tools }))
 }
 
-/// 技能列表处理器
+/// 技能列表处理器（进程内注册表，需 reload 后才看到磁盘新技能）
 async fn skills_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3288,28 +3341,35 @@ async fn skills_handler(
         tracing::warn!("API 鉴权失败: token 不匹配或缺失");
         return Err(AppError::Unauthorized);
     }
-    let workspace_path = &state.agent.config().workspace_path;
-    let discovery = jiaclaw::SkillDiscovery::new(workspace_path);
+    let skills = skill_infos(&state.agent.skills());
+    tracing::info!("列出技能: {} 个（进程内注册表）", skills.len());
+    Ok(Json(SkillsResponse { skills }))
+}
 
-    let skills = match discovery.discover() {
-        Ok(discovered_skills) => {
-            tracing::info!("发现技能: {} 个", discovered_skills.len());
-            discovered_skills
-                .into_iter()
-                .map(|skill| SkillInfo {
-                    name: skill.name.clone(),
-                    description: skill.description.clone(),
-                    path: skill.path.to_string_lossy().to_string(),
-                })
-                .collect()
+/// 热加载技能：重扫工作区 `skills/` 并替换进程内注册表。失败保留旧表。
+async fn reload_skills_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SkillsReloadResponse>, AppError> {
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!("API 鉴权失败: token 不匹配或缺失");
+        return Err(AppError::Unauthorized);
+    }
+
+    match state.agent.reload_skills() {
+        Ok(discovered) => {
+            let skills = skill_infos(&discovered);
+            let reloaded = skills.len();
+            tracing::info!(reloaded, "技能重载成功");
+            Ok(Json(SkillsReloadResponse { reloaded, skills }))
         }
         Err(e) => {
-            tracing::warn!("技能发现失败: {}", e);
-            Vec::new()
+            tracing::error!("技能重载失败，已保留旧表: {e}");
+            Err(AppError::BadRequest(format!(
+                "技能重载失败，已保留旧表: {e}"
+            )))
         }
-    };
-
-    Ok(Json(SkillsResponse { skills }))
+    }
 }
 
 fn unauthorized_hook_response() -> Response {
@@ -3717,6 +3777,42 @@ async fn shutdown_signal() {
     tracing::info!("收到 SIGINT/SIGTERM，开始优雅退出");
 }
 
+/// Unix `SIGHUP` 触发与 `POST /api/skills/reload` 相同的重载路径。Windows 无此信号。
+fn spawn_skill_reload_on_sighup(agent: Arc<JiaClawAgent>) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(mut hangup) => Some(tokio::spawn(async move {
+                loop {
+                    if hangup.recv().await.is_none() {
+                        tracing::info!("SIGHUP 监听结束");
+                        break;
+                    }
+                    tracing::info!("收到 SIGHUP，开始重载技能");
+                    match agent.reload_skills() {
+                        Ok(skills) => {
+                            tracing::info!(count = skills.len(), "SIGHUP 技能重载成功");
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "SIGHUP 技能重载失败，已保留旧表");
+                        }
+                    }
+                }
+            })),
+            Err(e) => {
+                tracing::error!("安装 SIGHUP 处理器失败: {e}");
+                None
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = agent;
+        tracing::info!("当前平台不支持 SIGHUP 技能重载，请使用 POST /api/skills/reload");
+        None
+    }
+}
+
 fn persist_path_from_config(config: &AgentConfig) -> PathBuf {
     if config.http.persist_path.starts_with('/') {
         PathBuf::from(&config.http.persist_path)
@@ -4068,6 +4164,7 @@ fn skills_command(config_path: Option<PathBuf>, verbose: bool) -> Result<()> {
                 println!("   • 显式启用: 在 ChatRequest 的 enabled_skills 字段中指定");
                 println!("   • 自动激活: 当用户消息包含触发词时自动启用");
                 println!("   • 详细模式: 使用 --verbose 查看技能完整内容");
+                println!("   • 热加载运行中的 serve: POST /api/skills/reload 或 Unix SIGHUP");
             }
         }
         Err(e) => {
@@ -4077,6 +4174,48 @@ fn skills_command(config_path: Option<PathBuf>, verbose: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn skills_reload_command(config_path: Option<PathBuf>) -> Result<()> {
+    let config = load_agent_config(config_path)?;
+    let skills_dir = config.workspace_path.join("skills");
+
+    println!("🔄 JiaClaw 技能扫描（CLI）\n");
+    println!("📁 工作空间: {}\n", config.workspace_path.display());
+
+    if !skills_dir.exists() {
+        println!("⚠️  技能目录不存在: {}", skills_dir.display());
+        println!("   扫描结果：0 个技能（与空目录相同）");
+        print_skills_reload_serve_hint();
+        return Ok(());
+    }
+
+    match jiaclaw::SkillDiscovery::new(&config.workspace_path).discover_strict() {
+        Ok(skills) => {
+            println!("✅ 扫描成功，将加载 {} 个技能:\n", skills.len());
+            for skill in &skills {
+                println!("   • {}", skill.name);
+            }
+            if skills.is_empty() {
+                println!("   （目录为空或没有 SKILL.md）");
+            }
+            println!();
+            print_skills_reload_serve_hint();
+            Ok(())
+        }
+        Err(e) => {
+            println!("❌ 扫描失败: {e}");
+            println!("   若对运行中的 serve 执行重载，进程内旧表会保留。");
+            print_skills_reload_serve_hint();
+            Err(e.into())
+        }
+    }
+}
+
+fn print_skills_reload_serve_hint() {
+    println!("ℹ️  本命令只扫描当前工作区，不会通知已运行的 `jiaclaw serve`。");
+    println!("   运行中的服务请使用: POST /api/skills/reload");
+    println!("   Unix 也可向 serve 进程发送 SIGHUP；Windows 仅支持 HTTP。");
 }
 
 fn load_agent_config(config_path: Option<PathBuf>) -> Result<AgentConfig> {
@@ -4707,6 +4846,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         "   优雅退出宽限期: {shutdown_timeout_secs} 秒（SIGINT/SIGTERM，通过 {}）",
         shutdown_timeout_config_source()
     );
+    println!("   技能热加载: POST /api/skills/reload；Unix SIGHUP（Windows 仅 HTTP）");
 
     if config.session.effective_summarize_on_overflow() {
         println!(
@@ -4852,6 +4992,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         }
     );
     println!("   • 优雅退出宽限期: {shutdown_timeout_secs} 秒（SIGINT/SIGTERM）");
+    println!("   • 技能热加载: POST /api/skills/reload；Unix SIGHUP（Windows 仅 HTTP）");
     println!(
         "   • Session 摘要压缩: {}",
         session_summarize_status_line(&config)
@@ -6833,6 +6974,7 @@ mod tests {
         let tasks = BackgroundTasks {
             heartbeat: Some(handle),
             ttl_sweeper: None,
+            skill_reloader: None,
         };
         tasks.abort();
         let joined = tasks.heartbeat.expect("handle").await.unwrap_err();
@@ -6879,6 +7021,7 @@ mod tests {
                 BackgroundTasks {
                     heartbeat: None,
                     ttl_sweeper: None,
+                    skill_reloader: None,
                 },
             )
             .await
@@ -7576,6 +7719,127 @@ mod tests {
             assert!(!skill.description.is_empty(), "技能描述不应为空");
             assert!(!skill.path.is_empty(), "技能路径不应为空");
         }
+    }
+
+    fn write_test_skill(workspace: &std::path::Path, name: &str, body: &str) {
+        let dir = workspace.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    async fn get_skills_json(app: Router) -> SkillsResponse {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/skills")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_skills_reload_picks_up_new_skill() {
+        let workspace = unique_workspace("jiaclaw-skills-reload");
+        write_test_skill(
+            &workspace,
+            "alpha",
+            "# Alpha\n\n## Description\n\nFirst skill\n",
+        );
+        let app = build_router(test_state_for_workspace(workspace.clone()));
+
+        let listed = get_skills_json(app.clone()).await;
+        assert!(listed.skills.iter().any(|s| s.name == "alpha"));
+        assert!(!listed.skills.iter().any(|s| s.name == "beta"));
+
+        write_test_skill(
+            &workspace,
+            "beta",
+            "# Beta\n\n## Description\n\nSecond skill\n",
+        );
+
+        let before = get_skills_json(app.clone()).await;
+        assert!(
+            !before.skills.iter().any(|s| s.name == "beta"),
+            "未 reload 前 GET 不应看到磁盘新技能"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/reload")
+                    .header("X-Request-Id", "reload-ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_id_header(&response), "reload-ok");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reload: SkillsReloadResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reload.reloaded, 2);
+        assert!(reload.skills.iter().any(|s| s.name == "beta"));
+
+        let after = get_skills_json(app).await;
+        assert!(after.skills.iter().any(|s| s.name == "beta"));
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn test_skills_reload_keeps_old_table_on_bad_file() {
+        let workspace = unique_workspace("jiaclaw-skills-reload-bad");
+        write_test_skill(
+            &workspace,
+            "alpha",
+            "# Alpha\n\n## Description\n\nFirst skill\n",
+        );
+        let app = build_router(test_state_for_workspace(workspace.clone()));
+
+        write_test_skill(
+            &workspace,
+            "broken",
+            "---\nname: [not yaml\n---\n# Broken\n",
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = json["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("已保留旧表"),
+            "错误应说明保留旧表，实际: {error}"
+        );
+
+        let listed = get_skills_json(app).await;
+        assert!(listed.skills.iter().any(|s| s.name == "alpha"));
+        assert!(!listed.skills.iter().any(|s| s.name == "broken"));
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[tokio::test]
@@ -9587,6 +9851,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_skills_reload_api_requires_auth() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/reload")
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn test_rate_limit_disabled_allows_many_requests() {
         let app = create_test_app();
 
@@ -10144,6 +10439,7 @@ mod tests {
             "/api/sessions/import",
             "/api/tools",
             "/api/skills",
+            "/api/skills/reload",
             "/hooks/inbound",
             "/hooks/telegram",
             "/hooks/slack",
@@ -10160,6 +10456,7 @@ mod tests {
         assert!(paths["/api/sessions/{id}"].get("delete").is_some());
         assert!(paths["/api/sessions/{id}/export"].get("get").is_some());
         assert!(paths["/api/sessions/import"].get("post").is_some());
+        assert!(paths["/api/skills/reload"].get("post").is_some());
     }
 
     #[tokio::test]
@@ -10597,5 +10894,34 @@ mod tests {
     #[test]
     fn test_encode_messages_jsonl_empty() {
         assert_eq!(encode_messages_jsonl(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn test_cli_skills_list_still_parses() {
+        let cli = Cli::try_parse_from(["jiaclaw", "skills", "--verbose"]).expect("应解析 skills");
+        match cli.command {
+            Commands::Skills {
+                action: None,
+                verbose: true,
+                ..
+            } => {}
+            _ => panic!("应为 skills 列表"),
+        }
+    }
+
+    #[test]
+    fn test_cli_skills_reload_parses() {
+        let cli = Cli::try_parse_from(["jiaclaw", "skills", "reload", "-c", "cfg.toml"])
+            .expect("应解析 skills reload");
+        match cli.command {
+            Commands::Skills {
+                action: Some(SkillsCommands::Reload),
+                config,
+                ..
+            } => {
+                assert_eq!(config.as_deref(), Some(std::path::Path::new("cfg.toml")));
+            }
+            _ => panic!("应为 skills reload 子命令"),
+        }
     }
 }

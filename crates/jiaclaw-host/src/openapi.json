@@ -345,8 +345,9 @@
     "/api/skills": {
       "get": {
         "tags": ["catalog"],
-        "summary": "列出已发现技能",
+        "summary": "列出已加载技能",
         "operationId": "listSkills",
+        "description": "返回进程内技能注册表（启动扫描或最近一次热加载的结果）。改 `skills/**/SKILL.md` 后需 `POST /api/skills/reload` 或 Unix SIGHUP 才会反映到本列表与 chat。",
         "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
         "responses": {
           "200": {
@@ -360,6 +361,31 @@
               }
             }
           },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/skills/reload": {
+      "post": {
+        "tags": ["catalog"],
+        "summary": "热加载技能",
+        "operationId": "reloadSkills",
+        "description": "重新扫描工作区 `skills/` 并替换进程内注册表。磁盘扫描在锁外完成；失败（无法读目录或任一现存 SKILL.md 无效）时保留旧表并返回 400。鉴权/限流/`X-Request-Id` 与其它 `/api/*` 一致。Unix 上向 serve 发送 SIGHUP 走同一路径。不实现技能市场或依赖解析。",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "responses": {
+          "200": {
+            "description": "重载成功",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SkillsReloadResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": { "$ref": "#/components/responses/RateLimited" }
         }
@@ -827,6 +853,19 @@
       "SkillsResponse": {
         "type": "object",
         "properties": {
+          "skills": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SkillInfo" }
+          }
+        }
+      },
+      "SkillsReloadResponse": {
+        "type": "object",
+        "properties": {
+          "reloaded": {
+            "type": "integer",
+            "description": "本次成功载入的技能数量"
+          },
           "skills": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/SkillInfo" }

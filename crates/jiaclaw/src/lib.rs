@@ -49,7 +49,7 @@ pub use session::{
     ConversationSummarizer, SESSION_SUMMARY_MAX_TOKENS, SESSION_SUMMARY_PREFIX,
     SESSION_SUMMARY_PROMPT, SESSION_SUMMARY_TEMPERATURE,
 };
-pub use skills::{Skill, SkillDiscovery};
+pub use skills::{Skill, SkillDiscovery, SkillRegistry};
 pub use tools::{
     clamp_web_fetch_max_chars, clamp_web_search_max_results, html_to_readable_text,
     parse_web_fetch_args, parse_web_search_args, validate_web_fetch_url, DateTimeTool,
@@ -75,7 +75,7 @@ pub type ToolMetricsHook = std::sync::Arc<dyn Fn(&str, bool) + Send + Sync>;
 pub struct JiaClawAgent {
     config: AgentConfig,
     workspace: Workspace,
-    skills: Vec<Skill>,
+    skills: SkillRegistry,
     tools: ToolRegistry,
     /// 可选：每次真实 tool 执行后回调（serve 的 Prometheus 计数）。
     tool_metrics: Option<ToolMetricsHook>,
@@ -118,6 +118,7 @@ impl JiaClawAgent {
         if !skills.is_empty() {
             tracing::info!("发现 {} 个技能", skills.len());
         }
+        let skills = SkillRegistry::new(skills);
 
         // 初始化工具注册表
         let mut tools = ToolRegistry::new();
@@ -211,10 +212,30 @@ impl JiaClawAgent {
         &self.workspace
     }
 
-    /// 获取技能列表
+    /// 获取技能列表快照（不持锁）。
     #[must_use]
-    pub fn skills(&self) -> &[Skill] {
-        &self.skills
+    pub fn skills(&self) -> Vec<Skill> {
+        self.skills.snapshot()
+    }
+
+    /// 重新扫描工作区 `skills/` 并替换进程内注册表。
+    ///
+    /// 扫描在锁外完成；失败时保留旧表。进行中的 `chat` 使用各自开始时的快照，不会 panic。
+    ///
+    /// # Errors
+    ///
+    /// 目录无法读取，或任一现存 `SKILL.md` 无效。此时旧表保持不变。
+    pub fn reload_skills(&self) -> Result<Vec<Skill>, JiaClawError> {
+        match self.skills.reload(&self.config.workspace_path) {
+            Ok(skills) => {
+                tracing::info!(count = skills.len(), "技能已重载");
+                Ok(skills)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "技能重载失败，已保留旧表");
+                Err(e)
+            }
+        }
     }
 
     /// 获取工具注册表
@@ -251,6 +272,8 @@ impl JiaClawAgent {
     ///
     /// 本方法会自动处理工具调用循环（上限见 [`AgentConfig::effective_max_tool_iterations`]）。
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, JiaClawError> {
+        // 短锁快照：reload 期间进行中的 chat 继续使用本轮技能表，不持锁。
+        let skills = self.skills.snapshot();
         // 检查是否有技能应该被自动触发（仅在 auto_skills 为 true 时）
         let mut enabled_skills = request.enabled_skills.clone();
 
@@ -262,8 +285,7 @@ impl JiaClawAgent {
                 .find(|m| matches!(m.role, MessageRole::User))
             {
                 let discovery = SkillDiscovery::new(&self.config.workspace_path);
-                let auto_triggered =
-                    discovery.auto_trigger_skills(&last_user_msg.content, &self.skills);
+                let auto_triggered = discovery.auto_trigger_skills(&last_user_msg.content, &skills);
 
                 for skill_name in auto_triggered {
                     if !enabled_skills.contains(&skill_name) {
@@ -285,7 +307,7 @@ impl JiaClawAgent {
         };
 
         // 构建完整的系统提示（包含工作空间内容）
-        let system_prompt = self.build_system_prompt(&request_with_skills);
+        let system_prompt = self.build_system_prompt_with_skills(&request_with_skills, &skills);
 
         // 从配置或环境变量获取 API key
         let env_key = std::env::var("JIACLAW_API_KEY").ok();
@@ -449,7 +471,13 @@ impl JiaClawAgent {
     }
 
     /// 构建系统提示（包含工作空间内容；每次调用重读 SOUL / USER / MEMORY）
+    #[cfg(test)]
     fn build_system_prompt(&self, request: &ChatRequest) -> String {
+        let skills = self.skills.snapshot();
+        self.build_system_prompt_with_skills(request, &skills)
+    }
+
+    fn build_system_prompt_with_skills(&self, request: &ChatRequest, skills: &[Skill]) -> String {
         let mut prompt = self.config.system_instructions.clone();
 
         // 每次对话开始时重读约定身份与记忆路径（工具写入对后续 chat 可见）
@@ -481,9 +509,9 @@ impl JiaClawAgent {
         );
 
         // 添加技能摘要
-        if !self.skills.is_empty() {
+        if !skills.is_empty() {
             prompt.push_str("\n\n## Available Skills\n\n");
-            for skill in &self.skills {
+            for skill in skills {
                 prompt.push_str(&format!("- {}\n", skill.summary()));
             }
 
@@ -491,7 +519,7 @@ impl JiaClawAgent {
             if !request.enabled_skills.is_empty() {
                 prompt.push_str("\n### Enabled Skills (详细)\n");
                 for skill_name in &request.enabled_skills {
-                    if let Some(skill) = self.skills.iter().find(|s| &s.name == skill_name) {
+                    if let Some(skill) = skills.iter().find(|s| &s.name == skill_name) {
                         prompt.push_str(&format!("\n#### {}\n", skill.name));
                         prompt.push_str(&skill.content);
                         prompt.push('\n');
@@ -791,6 +819,7 @@ impl JiaClawAgent {
         _system_prompt: &str,
     ) -> String {
         let user_lower = user_message.to_lowercase();
+        let skills = self.skills.snapshot();
 
         #[cfg(test)]
         if let Some(tool_name) = &self.test_repeat_tool {
@@ -885,7 +914,7 @@ impl JiaClawAgent {
                 self.config.description,
                 self.config.max_turns,
                 self.count_workspace_files(),
-                self.skills.len(),
+                skills.len(),
                 self.tools.list().len()
             )
         } else if user_lower.contains("工具") || user_lower.contains("tool") {
@@ -910,11 +939,11 @@ impl JiaClawAgent {
                 response
             }
         } else if user_lower.contains("技能") || user_lower.contains("skill") {
-            if self.skills.is_empty() {
+            if skills.is_empty() {
                 "目前没有发现任何技能。\n\n运行 'jiaclaw init' 会创建示例技能。".to_string()
             } else {
-                let mut response = format!("🎯 发现 {} 个技能：\n\n", self.skills.len());
-                for skill in &self.skills {
+                let mut response = format!("🎯 发现 {} 个技能：\n\n", skills.len());
+                for skill in &skills {
                     response.push_str(&format!("• {}\n\n", skill.summary()));
                 }
                 response.push_str("完整的技能系统将在 M3 实现。");
@@ -929,10 +958,10 @@ impl JiaClawAgent {
             } else {
                 request.enabled_tools.join(", ")
             };
-            let skills_str = if self.skills.is_empty() {
+            let skills_str = if skills.is_empty() {
                 "无".to_string()
             } else {
-                format!("{} 个技能", self.skills.len())
+                format!("{} 个技能", skills.len())
             };
 
             format!(
@@ -996,7 +1025,7 @@ impl JiaClawAgent {
                 self.config.max_turns,
                 request.messages.len(),
                 self.count_workspace_files(),
-                self.skills.len(),
+                skills.len(),
                 self.tools.list().len()
             )
         } else if user_message.trim().is_empty() {
@@ -2029,5 +2058,76 @@ mod tests {
         let compacted = agent.compact_session_messages(overflow_messages(60)).await;
         let expected = hard_truncate_session_messages(overflow_messages(60), MAX_SESSION_MESSAGES);
         assert_eq!(compacted, expected);
+    }
+
+    fn write_skill(workspace: &std::path::Path, name: &str, body: &str) {
+        let dir = workspace.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn reload_skills_picks_up_new_skill_file() {
+        let dir = unique_workspace("jiaclaw_agent_reload_ok");
+        write_skill(&dir, "alpha", "# Alpha\n\n## Description\n\nFirst skill\n");
+        let agent = JiaClawAgent::new(AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        })
+        .unwrap();
+        assert!(agent.skills().iter().any(|s| s.name == "alpha"));
+        assert!(!agent.skills().iter().any(|s| s.name == "beta"));
+
+        write_skill(&dir, "beta", "# Beta\n\n## Description\n\nSecond skill\n");
+        let reloaded = agent.reload_skills().expect("重载应成功");
+        assert!(reloaded.iter().any(|s| s.name == "beta"));
+        assert!(agent.skills().iter().any(|s| s.name == "beta"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_skills_keeps_old_table_on_bad_file() {
+        let dir = unique_workspace("jiaclaw_agent_reload_bad");
+        write_skill(&dir, "alpha", "# Alpha\n\n## Description\n\nFirst skill\n");
+        let agent = JiaClawAgent::new(AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        })
+        .unwrap();
+
+        write_skill(&dir, "broken", "---\nname: [not yaml\n---\n# Broken\n");
+        let err = agent.reload_skills().expect_err("坏文件应使重载失败");
+        assert!(
+            err.to_string().contains("无效技能"),
+            "错误应说明无效技能，实际: {err}"
+        );
+        let names: Vec<_> = agent.skills().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["alpha".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reload_skills_does_not_panic_during_concurrent_chat() {
+        let dir = unique_workspace("jiaclaw_agent_reload_conc");
+        write_skill(&dir, "alpha", "# Alpha\n\n## Description\n\nFirst skill\n");
+        let agent = std::sync::Arc::new(
+            JiaClawAgent::new(AgentConfig {
+                workspace_path: dir.clone(),
+                ..AgentConfig::default()
+            })
+            .unwrap(),
+        );
+
+        let chatting = agent.clone();
+        let chat = tokio::spawn(async move { chatting.chat(&sample_request()).await });
+        let reloading = agent.clone();
+        let reload = tokio::task::spawn_blocking(move || reloading.reload_skills());
+        let (chat_result, reload_result) = tokio::join!(chat, reload);
+        assert!(chat_result.expect("chat join").is_ok());
+        assert!(reload_result.expect("reload join").is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
