@@ -62,10 +62,11 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 自动处理文件损坏情况
 - ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*`、`/hooks/inbound`、`/hooks/telegram`、`/hooks/slack` 与 `/hooks/discord`
   - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
-  - 超限返回 429 + `Retry-After`；`GET /health` 与 `GET /metrics` 始终不限流
+  - 启用时受保护路径带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`（Unix 纪元秒，配额补满时刻）
+  - 超限返回 429 + `Retry-After`（秒）；关闭限流时不发送这些头。`GET /health` 与 `GET /metrics` 始终不限流
 - ✅ **可选 CORS** - 默认关闭（无 CORS 头）。本地浏览器前端可开 `[http.cors]`
   - `enabled` 默认 `false`；`JIACLAW_CORS_ENABLED` 覆盖。`allowed_origins` 精确匹配；`*` 仅在显式配置或 `JIACLAW_CORS_ORIGINS=*` 时
-  - 默认方法 GET/POST/DELETE/OPTIONS；允许头 Authorization / Content-Type / X-Request-Id / Accept；暴露 `X-Request-Id`
+  - 默认方法 GET/POST/DELETE/OPTIONS；允许头 Authorization / Content-Type / X-Request-Id / Accept；暴露 `X-Request-Id` 与限流头（`X-RateLimit-*` / `Retry-After`）
   - OPTIONS preflight 不要求 API Bearer，仍回写 `X-Request-Id`；未匹配 Origin 不回声
 - ✅ **可选 GET /metrics** - 进程内 Prometheus 文本（不引入 telemetry SDK）
   - 默认无需 API Bearer（便于 scrape）；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权
@@ -262,7 +263,7 @@ bind = "127.0.0.1:8080"
 # allowed_origins = ["http://localhost:5173"]
 # allowed_methods = ["GET", "POST", "DELETE", "OPTIONS"]
 # allowed_headers = ["Authorization", "Content-Type", "X-Request-Id", "Accept"]
-# expose_headers = ["X-Request-Id"]
+# expose_headers = ["X-Request-Id", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Retry-After"]
 # max_age_secs = 600
 
 # Session 持久化配置（可选）
@@ -271,7 +272,9 @@ persist_path = ".jiaclaw/sessions.json"
 
 # HTTP 限流（可选，环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE 优先）
 # 正整数：对 /api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack、/hooks/discord 做进程内全局限流（次/分钟）
-# 未设置或 0：不限流。GET /health 与 GET /metrics 始终不限流；超限返回 429 + Retry-After。
+# 未设置或 0：不限流。GET /health 与 GET /metrics 始终不限流。
+# 启用时受保护路径带 X-RateLimit-Limit / Remaining / Reset（Unix 秒，配额补满时刻）；超限 429 + Retry-After（秒）。
+# 关闭时不发送这些头。
 # rate_limit_per_minute = 60
 
 # GET /metrics 是否公开（默认 true）。false 或 JIACLAW_METRICS_REQUIRE_AUTH=1 时与 /api/* 相同鉴权
@@ -615,7 +618,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 使用 Brokerrouter 需要有效的虚拟密钥（`brk_live_...`）
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
-- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 超限返回 `429` + `Retry-After`；`GET /health` 与 `GET /metrics` 不限流
+- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`（Unix 纪元秒，表示剩余配额补满到 Limit 的时刻）；超限返回 `429` + `Retry-After`（秒）。未启用则不发送这些头。`GET /health` 与 `GET /metrics` 不限流
 - 可选 CORS：默认关闭、不发送 CORS 头。`[http.cors] enabled = true` 或 `JIACLAW_CORS_ENABLED=1` 后，匹配的 `Origin` 获得 `Access-Control-Allow-Origin`；`JIACLAW_CORS_ORIGINS` 逗号分隔覆盖 `allowed_origins`。`*` 仅在显式配置时允许所有来源。OPTIONS preflight 不要求 API Bearer，仍回写 `X-Request-Id`。未匹配 Origin 不回声
 - 可选 Prometheus 指标：`GET /metrics` 默认公开；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。进程内计数（HTTP 路由族、session 数、工具调用、build_info），不引入 telemetry SDK
 - 可选 JSON 结构化日志：默认 `[logging] format = "text"` 与当前人类可读 tracing 一致。`format = "json"` 或 `JIACLAW_LOG_FORMAT=json` 时每行一条 JSON（含 `timestamp` / `level` / `target` / `fields` / `message`，`request_id` 作为字段）。`JIACLAW_LOG_LEVEL` 优先于 `RUST_LOG`。doctor / serve 启动打印生效 format，不打印 secret
@@ -726,10 +729,11 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Automatic handling of corrupted files
 - ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord`
   - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
-  - Over-limit returns 429 + `Retry-After`; `GET /health` and `GET /metrics` are never limited
+  - When enabled, protected paths send `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` (Unix epoch seconds when remaining returns to Limit)
+  - Over-limit returns 429 + `Retry-After` (seconds); headers are omitted when rate limiting is off. `GET /health` and `GET /metrics` are never limited
 - ✅ **Optional CORS** - off by default (no CORS headers). Enable `[http.cors]` for a local browser UI
   - `enabled` defaults to `false`; override with `JIACLAW_CORS_ENABLED`. `allowed_origins` is exact-match; `*` only when configured explicitly or `JIACLAW_CORS_ORIGINS=*`
-  - Default methods GET/POST/DELETE/OPTIONS; allowed headers Authorization / Content-Type / X-Request-Id / Accept; expose `X-Request-Id`
+  - Default methods GET/POST/DELETE/OPTIONS; allowed headers Authorization / Content-Type / X-Request-Id / Accept; expose `X-Request-Id` and rate-limit headers (`X-RateLimit-*` / `Retry-After`)
   - OPTIONS preflight does not require an API Bearer and still writes `X-Request-Id`; unmatched origins are never echoed
 - ✅ **Optional GET /metrics** - in-process Prometheus text (no telemetry SDK)
   - Public by default for scraping; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`
@@ -926,7 +930,7 @@ bind = "127.0.0.1:8080"
 # allowed_origins = ["http://localhost:5173"]
 # allowed_methods = ["GET", "POST", "DELETE", "OPTIONS"]
 # allowed_headers = ["Authorization", "Content-Type", "X-Request-Id", "Accept"]
-# expose_headers = ["X-Request-Id"]
+# expose_headers = ["X-Request-Id", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Retry-After"]
 # max_age_secs = 600
 
 # Session persistence config (optional)
@@ -935,7 +939,9 @@ persist_path = ".jiaclaw/sessions.json"
 
 # Optional HTTP rate limit (JIACLAW_RATE_LIMIT_PER_MINUTE env var takes priority)
 # Positive integer: process-wide limit for /api/* and /hooks/inbound, /hooks/telegram, /hooks/slack, /hooks/discord (requests/minute)
-# Unset or 0: disabled. GET /health and GET /metrics are never limited; over-limit returns 429 + Retry-After.
+# Unset or 0: disabled. GET /health and GET /metrics are never limited.
+# When enabled, protected paths send X-RateLimit-Limit / Remaining / Reset (Unix seconds, when remaining returns to Limit); 429 adds Retry-After (seconds).
+# Headers are omitted when rate limiting is off.
 # rate_limit_per_minute = 60
 
 # Whether GET /metrics is public (default true). false or JIACLAW_METRICS_REQUIRE_AUTH=1 uses the same auth as /api/*
@@ -1271,7 +1277,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Brokerrouter requires a valid virtual key (`brk_live_...`)
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
-- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` return `429` + `Retry-After` when exceeded; `GET /health` and `GET /metrics` are never limited
+- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` send `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` (Unix epoch seconds when remaining returns to Limit); over-limit returns `429` + `Retry-After` (seconds). Headers are omitted when disabled. `GET /health` and `GET /metrics` are never limited
 - Optional CORS: off by default (no CORS headers). `[http.cors] enabled = true` or `JIACLAW_CORS_ENABLED=1` echoes `Access-Control-Allow-Origin` for matching origins; `JIACLAW_CORS_ORIGINS` (comma-separated) overrides `allowed_origins`. `*` allows all only when configured explicitly. OPTIONS preflight does not require an API Bearer and still writes `X-Request-Id`. Unmatched origins are never echoed
 - Optional Prometheus metrics: `GET /metrics` is public by default; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`. In-process counters (HTTP route family, session gauge, tool calls, build_info); no telemetry SDK
 - Optional JSON structured logs: default `[logging] format = "text"` matches the current human-readable tracing fmt. `format = "json"` or `JIACLAW_LOG_FORMAT=json` emits one JSON object per line (`timestamp` / `level` / `target` / `fields` / `message`; `request_id` is a field). `JIACLAW_LOG_LEVEL` overrides `RUST_LOG`. doctor / serve startup prints the effective format and never prints secrets

@@ -908,7 +908,8 @@ pub struct HttpCorsConfig {
     #[serde(default = "default_cors_allowed_headers")]
     pub allowed_headers: Vec<String>,
 
-    /// 暴露给浏览器的响应头。空则回退默认：`X-Request-Id`。
+    /// 暴露给浏览器的响应头。空则回退默认：`X-Request-Id` 与限流头
+    /// （`X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` / `Retry-After`）。
     #[serde(default = "default_cors_expose_headers")]
     pub expose_headers: Vec<String>,
 
@@ -936,7 +937,13 @@ fn default_cors_allowed_headers() -> Vec<String> {
 }
 
 fn default_cors_expose_headers() -> Vec<String> {
-    vec!["X-Request-Id".to_string()]
+    vec![
+        "X-Request-Id".to_string(),
+        "X-RateLimit-Limit".to_string(),
+        "X-RateLimit-Remaining".to_string(),
+        "X-RateLimit-Reset".to_string(),
+        "Retry-After".to_string(),
+    ]
 }
 
 fn nonempty_or_default(values: &[String], fallback: Vec<String>) -> Vec<String> {
@@ -996,7 +1003,7 @@ impl HttpCorsConfig {
         nonempty_or_default(&self.allowed_headers, default_cors_allowed_headers())
     }
 
-    /// 解析生效的暴露响应头；空配置回退 `X-Request-Id`。
+    /// 解析生效的暴露响应头；空配置回退 `X-Request-Id` 与限流头。
     #[must_use]
     pub fn effective_expose_headers(&self) -> Vec<String> {
         nonempty_or_default(&self.expose_headers, default_cors_expose_headers())
@@ -1854,7 +1861,16 @@ level = "debug"
             cors.effective_allowed_headers(),
             vec!["Authorization", "Content-Type", "X-Request-Id", "Accept"]
         );
-        assert_eq!(cors.effective_expose_headers(), vec!["X-Request-Id"]);
+        assert_eq!(
+            cors.effective_expose_headers(),
+            vec![
+                "X-Request-Id",
+                "X-RateLimit-Limit",
+                "X-RateLimit-Remaining",
+                "X-RateLimit-Reset",
+                "Retry-After"
+            ]
+        );
         assert_eq!(cors.effective_max_age_secs(), None);
     }
 

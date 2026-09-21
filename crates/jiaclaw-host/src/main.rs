@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 use futures_util::{stream, Stream};
 use governor::{
     clock::{Clock, DefaultClock},
+    middleware::StateInformationMiddleware,
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
@@ -52,10 +53,20 @@ mod metrics;
 use metrics::{classify_http_path, Metrics, PROMETHEUS_CONTENT_TYPE};
 
 /// 进程内全局（非按 IP）速率限制器，oneshot 测试无需 `ConnectInfo`。
-type GlobalRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+type GlobalRateLimiter =
+    RateLimiter<NotKeyed, InMemoryState, DefaultClock, StateInformationMiddleware>;
 
 /// 请求追踪头。大小写不敏感，响应回写同名头。
 const X_REQUEST_ID: &str = "x-request-id";
+
+/// 限流配额上限（每分钟 burst）。仅在限流启用且路径受保护时发送。
+const X_RATELIMIT_LIMIT: &str = "x-ratelimit-limit";
+
+/// 本次判定后剩余可立即通过的请求数。仅在限流启用且路径受保护时发送。
+const X_RATELIMIT_REMAINING: &str = "x-ratelimit-remaining";
+
+/// 配额补满到 Limit 的 Unix 纪元秒（UTC）。仅在限流启用且路径受保护时发送。
+const X_RATELIMIT_RESET: &str = "x-ratelimit-reset";
 
 /// 会话 JSONL 导出的 `Content-Type`（NDJSON）。
 const SESSION_EXPORT_NDJSON: &str = "application/x-ndjson";
@@ -1458,7 +1469,12 @@ struct TelegramInboundResponse {
 }
 
 fn build_rate_limiter(per_minute: u32) -> Option<Arc<GlobalRateLimiter>> {
-    NonZeroU32::new(per_minute).map(|nz| Arc::new(RateLimiter::direct(Quota::per_minute(nz))))
+    NonZeroU32::new(per_minute).map(|nz| {
+        Arc::new(
+            RateLimiter::direct(Quota::per_minute(nz))
+                .with_middleware::<StateInformationMiddleware>(),
+        )
+    })
 }
 
 fn is_rate_limited_path(path: &str) -> bool {
@@ -1469,7 +1485,61 @@ fn is_rate_limited_path(path: &str) -> bool {
         || path == "/hooks/discord"
 }
 
+/// 限流响应头快照。`retry_after_secs` 仅 429 设置。
+struct RateLimitInfo {
+    limit: u32,
+    remaining: u32,
+    reset_unix_secs: u64,
+    retry_after_secs: Option<u64>,
+}
+
+/// `X-RateLimit-Reset`：Unix 纪元秒（UTC），剩余配额补满到 `Limit` 的时刻。
+///
+/// 按每分钟 burst 的 replenish 间隔向上取整到秒；429 时 `remaining = 0`，因此约为当前窗口结束。
+fn rate_limit_reset_unix(now: u64, remaining: u32, limit: u32, replenish: Duration) -> u64 {
+    let missing = limit.saturating_sub(remaining);
+    let wait = replenish.saturating_mul(missing);
+    let ceil_secs = wait
+        .as_secs()
+        .saturating_add(u64::from(wait.subsec_nanos() > 0));
+    now.saturating_add(ceil_secs)
+}
+
+fn insert_rate_limit_headers(headers: &mut HeaderMap, info: &RateLimitInfo) {
+    if let Ok(value) = HeaderValue::from_str(&info.limit.to_string()) {
+        headers.insert(X_RATELIMIT_LIMIT, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&info.remaining.to_string()) {
+        headers.insert(X_RATELIMIT_REMAINING, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&info.reset_unix_secs.to_string()) {
+        headers.insert(X_RATELIMIT_RESET, value);
+    }
+    if let Some(retry_after_secs) = info.retry_after_secs {
+        if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+            headers.insert(header::RETRY_AFTER, value);
+        }
+    }
+}
+
+fn rate_limit_info_from_quota(
+    now: u64,
+    remaining: u32,
+    quota: Quota,
+    retry_after_secs: Option<u64>,
+) -> RateLimitInfo {
+    let limit = quota.burst_size().get();
+    RateLimitInfo {
+        limit,
+        remaining,
+        reset_unix_secs: rate_limit_reset_unix(now, remaining, limit, quota.replenish_interval()),
+        retry_after_secs,
+    }
+}
+
 /// 全局限流中间件：返回 `Response`，不依赖 `ConnectInfo`，也不使用 `Err(StatusCode)`。
+///
+/// 限流启用时，受保护路径附加 `X-RateLimit-*`；429 另带 `Retry-After`。关闭时不发送这些头。
 async fn rate_limit_middleware(
     State(limiter): State<Option<Arc<GlobalRateLimiter>>>,
     request: Request,
@@ -1484,13 +1554,29 @@ async fn rate_limit_middleware(
         return next.run(request).await;
     };
 
+    let now = unix_now_secs();
     match limiter.check() {
-        Ok(()) => next.run(request).await,
+        Ok(snapshot) => {
+            let info = rate_limit_info_from_quota(
+                now,
+                snapshot.remaining_burst_capacity(),
+                snapshot.quota(),
+                None,
+            );
+            let mut response = next.run(request).await;
+            insert_rate_limit_headers(response.headers_mut(), &info);
+            response
+        }
         Err(not_until) => {
             let wait = not_until.wait_time_from(DefaultClock::default().now());
             let retry_after_secs = wait.as_secs().max(1);
             tracing::warn!(path, retry_after_secs, "HTTP 请求超过速率限制");
-            rate_limited_response(retry_after_secs)
+            rate_limited_response(rate_limit_info_from_quota(
+                now,
+                0,
+                not_until.quota(),
+                Some(retry_after_secs),
+            ))
         }
     }
 }
@@ -1508,15 +1594,13 @@ async fn metrics_middleware(
     response
 }
 
-fn rate_limited_response(retry_after_secs: u64) -> Response {
+fn rate_limited_response(info: RateLimitInfo) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         Json(json!({"error": "rate_limit_exceeded"})),
     )
         .into_response();
-    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-        response.headers_mut().insert(header::RETRY_AFTER, value);
-    }
+    insert_rate_limit_headers(response.headers_mut(), &info);
     response
 }
 
@@ -2442,7 +2526,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     );
     if let Some(limit) = rate_limit_per_minute {
         tracing::info!(
-            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack、/hooks/discord；GET /health 与 GET /metrics 不限流）"
+            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/* 带 X-RateLimit-*；429 另带 Retry-After；GET /health 与 GET /metrics 不限流）"
         );
     } else {
         tracing::info!("   • HTTP 限流: 未启用");
@@ -5070,7 +5154,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
     if let Some(limit) = rate_limit_per_minute {
         println!(
-            "   HTTP 限流: ✅ 已启用（{limit} 次/分钟，通过 {}）",
+            "   HTTP 限流: ✅ 已启用（{limit} 次/分钟，通过 {}；受保护路径带 X-RateLimit-*，429 另带 Retry-After）",
             rate_limit_config_source()
         );
     } else {
@@ -10658,7 +10742,66 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_no_rate_limit_headers(&response);
         }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_enabled_success_has_quota_headers() {
+        let app = create_test_app_with_rate_limit(5);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_rate_limit_headers(&response, 5, Some(4));
+        assert!(
+            response.headers().get(header::RETRY_AFTER).is_none(),
+            "成功响应不应带 Retry-After"
+        );
+        assert!(!request_id_header(&response).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_remaining_decreases() {
+        let app = create_test_app_with_rate_limit(4);
+        for expected_remaining in [3, 2, 1] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/tools")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_rate_limit_headers(&response, 4, Some(expected_remaining));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_headers_on_unauthorized_api() {
+        let app = create_test_app_with_options(Some("secret-token".to_string()), None, Some(8));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_rate_limit_headers(&response, 8, Some(7));
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        assert!(!request_id_header(&response).is_empty());
     }
 
     #[tokio::test]
@@ -10679,6 +10822,7 @@ mod tests {
                 .unwrap();
             statuses.push(response.status());
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                assert_rate_limit_headers(&response, 2, Some(0));
                 let retry_after = response
                     .headers()
                     .get(header::RETRY_AFTER)
@@ -10693,6 +10837,9 @@ mod tests {
                     .unwrap();
                 let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(payload["error"], "rate_limit_exceeded");
+            } else {
+                assert_rate_limit_headers(&response, 2, None);
+                assert!(response.headers().get(header::RETRY_AFTER).is_none());
             }
         }
 
@@ -10730,7 +10877,7 @@ mod tests {
             .unwrap();
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
 
-        // GET /health 仍应 200，且 oneshot 不依赖 ConnectInfo
+        // GET /health 仍应 200，且 oneshot 不依赖 ConnectInfo，也不带限流头
         for _ in 0..3 {
             let response = app
                 .clone()
@@ -10743,6 +10890,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_no_rate_limit_headers(&response);
         }
     }
 
@@ -10771,6 +10919,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
+        assert_rate_limit_headers(&first, 1, Some(0));
 
         let second = app
             .oneshot(
@@ -10785,6 +10934,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(second.headers().get(header::RETRY_AFTER).is_some());
+        assert_rate_limit_headers(&second, 1, Some(0));
     }
 
     #[tokio::test]
@@ -10794,6 +10944,7 @@ mod tests {
 
         let first = post_telegram(&app, body.clone(), None).await;
         assert_eq!(first.status(), StatusCode::OK);
+        assert_rate_limit_headers(&first, 1, Some(0));
 
         let second = post_telegram(&app, body, None).await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -10808,10 +10959,12 @@ mod tests {
 
         let first = post_slack(&app, body.clone(), None).await;
         assert_eq!(first.status(), StatusCode::OK);
+        assert_rate_limit_headers(&first, 1, Some(0));
 
         let second = post_slack(&app, body, None).await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(second.headers().get(header::RETRY_AFTER).is_some());
+        assert_rate_limit_headers(&second, 1, Some(0));
         assert!(!request_id_header(&second).is_empty());
     }
 
@@ -10822,10 +10975,12 @@ mod tests {
 
         let first = post_discord(&app, body.clone(), None).await;
         assert_eq!(first.status(), StatusCode::OK);
+        assert_rate_limit_headers(&first, 1, Some(0));
 
         let second = post_discord(&app, body, None).await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(second.headers().get(header::RETRY_AFTER).is_some());
+        assert_rate_limit_headers(&second, 1, Some(0));
         assert!(!request_id_header(&second).is_empty());
     }
 
@@ -11032,8 +11187,18 @@ mod tests {
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
 
         for _ in 0..3 {
-            let (status, _, _) = get_metrics(&app).await;
-            assert_eq!(status, StatusCode::OK);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_no_rate_limit_headers(&response);
         }
 
         let health = app
@@ -11046,6 +11211,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+        assert_no_rate_limit_headers(&health);
     }
 
     fn request_id_header(response: &axum::http::Response<Body>) -> String {
@@ -11056,6 +11222,85 @@ mod tests {
             .to_str()
             .expect("X-Request-Id 应为 UTF-8")
             .to_string()
+    }
+
+    fn header_u32(response: &axum::http::Response<Body>, name: &str) -> u32 {
+        response
+            .headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("缺少响应头 {name}"))
+            .to_str()
+            .unwrap_or_else(|_| panic!("{name} 应为 UTF-8"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} 应为整数"))
+    }
+
+    fn header_u64(response: &axum::http::Response<Body>, name: &str) -> u64 {
+        response
+            .headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("缺少响应头 {name}"))
+            .to_str()
+            .unwrap_or_else(|_| panic!("{name} 应为 UTF-8"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} 应为整数"))
+    }
+
+    fn assert_no_rate_limit_headers(response: &axum::http::Response<Body>) {
+        for name in [
+            X_RATELIMIT_LIMIT,
+            X_RATELIMIT_REMAINING,
+            X_RATELIMIT_RESET,
+            header::RETRY_AFTER.as_str(),
+        ] {
+            assert!(
+                response.headers().get(name).is_none(),
+                "限流关闭或豁免路径不应发送 {name}"
+            );
+        }
+    }
+
+    fn assert_rate_limit_headers(
+        response: &axum::http::Response<Body>,
+        limit: u32,
+        expected_remaining: Option<u32>,
+    ) {
+        assert_eq!(header_u32(response, X_RATELIMIT_LIMIT), limit);
+        let remaining = header_u32(response, X_RATELIMIT_REMAINING);
+        if let Some(expected) = expected_remaining {
+            assert_eq!(remaining, expected);
+        } else {
+            assert!(remaining <= limit);
+        }
+        let reset = header_u64(response, X_RATELIMIT_RESET);
+        let now = unix_now_secs();
+        assert!(
+            reset >= now.saturating_sub(1),
+            "X-RateLimit-Reset 应为当前或未来的 Unix 秒，reset={reset} now={now}"
+        );
+        assert!(
+            reset <= now.saturating_add(120),
+            "X-RateLimit-Reset 应在约一分钟窗口内，reset={reset} now={now}"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_reset_unix_is_window_end() {
+        let replenish = Duration::from_secs(1);
+        assert_eq!(
+            rate_limit_reset_unix(1_700_000_000, 60, 60, replenish),
+            1_700_000_000
+        );
+        assert_eq!(
+            rate_limit_reset_unix(1_700_000_000, 59, 60, replenish),
+            1_700_000_001
+        );
+        assert_eq!(
+            rate_limit_reset_unix(1_700_000_000, 0, 60, replenish),
+            1_700_000_060
+        );
+        let subsecond = Duration::from_millis(1500);
+        assert_eq!(rate_limit_reset_unix(100, 0, 1, subsecond), 102);
     }
 
     #[tokio::test]
@@ -11162,6 +11407,8 @@ mod tests {
             .unwrap();
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(request_id_header(&second), client_id);
+        assert_rate_limit_headers(&second, 1, Some(0));
+        assert!(second.headers().get(header::RETRY_AFTER).is_some());
     }
 
     #[tokio::test]
@@ -11212,6 +11459,17 @@ mod tests {
             header_list_contains(expose, "x-request-id"),
             "应暴露 X-Request-Id，实际: {expose}"
         );
+        for header_name in [
+            "x-ratelimit-limit",
+            "x-ratelimit-remaining",
+            "x-ratelimit-reset",
+            "retry-after",
+        ] {
+            assert!(
+                header_list_contains(expose, header_name),
+                "应暴露 {header_name}，实际: {expose}"
+            );
+        }
         assert_eq!(request_id_header(&response), "cors-match-1");
     }
 
@@ -11421,6 +11679,31 @@ mod tests {
         assert!(paths["/api/sessions/{id}/export"].get("get").is_some());
         assert!(paths["/api/sessions/import"].get("post").is_some());
         assert!(paths["/api/skills/reload"].get("post").is_some());
+        for header_name in [
+            "XRateLimitLimit",
+            "XRateLimitRemaining",
+            "XRateLimitReset",
+            "RetryAfter",
+        ] {
+            assert!(
+                spec["components"]["headers"].get(header_name).is_some(),
+                "OpenAPI components.headers 缺少 {header_name}"
+            );
+        }
+        let limited = &spec["components"]["responses"]["RateLimited"]["headers"];
+        assert!(limited.get("X-RateLimit-Limit").is_some());
+        assert!(limited.get("X-RateLimit-Remaining").is_some());
+        assert!(limited.get("X-RateLimit-Reset").is_some());
+        assert!(limited.get("Retry-After").is_some());
+        let description = spec["info"]["description"].as_str().unwrap_or("");
+        assert!(
+            description.contains("X-RateLimit-Limit"),
+            "OpenAPI 描述应说明 X-RateLimit-* 头"
+        );
+        assert!(
+            description.contains("Unix"),
+            "OpenAPI 描述应说明 X-RateLimit-Reset 为 Unix 秒"
+        );
     }
 
     #[tokio::test]
