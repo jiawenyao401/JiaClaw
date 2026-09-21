@@ -1486,6 +1486,7 @@ fn is_rate_limited_path(path: &str) -> bool {
 }
 
 /// 限流响应头快照。`retry_after_secs` 仅 429 设置。
+#[derive(Clone, Copy)]
 struct RateLimitInfo {
     limit: u32,
     remaining: u32,
@@ -11224,18 +11225,7 @@ mod tests {
             .to_string()
     }
 
-    fn header_u32(response: &axum::http::Response<Body>, name: &str) -> u32 {
-        response
-            .headers()
-            .get(name)
-            .unwrap_or_else(|| panic!("缺少响应头 {name}"))
-            .to_str()
-            .unwrap_or_else(|_| panic!("{name} 应为 UTF-8"))
-            .parse()
-            .unwrap_or_else(|_| panic!("{name} 应为整数"))
-    }
-
-    fn header_u64(response: &axum::http::Response<Body>, name: &str) -> u64 {
+    fn header_number(response: &axum::http::Response<Body>, name: &str) -> u64 {
         response
             .headers()
             .get(name)
@@ -11265,14 +11255,14 @@ mod tests {
         limit: u32,
         expected_remaining: Option<u32>,
     ) {
-        assert_eq!(header_u32(response, X_RATELIMIT_LIMIT), limit);
-        let remaining = header_u32(response, X_RATELIMIT_REMAINING);
+        assert_eq!(header_number(response, X_RATELIMIT_LIMIT), u64::from(limit));
+        let remaining = header_number(response, X_RATELIMIT_REMAINING);
         if let Some(expected) = expected_remaining {
-            assert_eq!(remaining, expected);
+            assert_eq!(remaining, u64::from(expected));
         } else {
-            assert!(remaining <= limit);
+            assert!(remaining <= u64::from(limit));
         }
-        let reset = header_u64(response, X_RATELIMIT_RESET);
+        let reset = header_number(response, X_RATELIMIT_RESET);
         let now = unix_now_secs();
         assert!(
             reset >= now.saturating_sub(1),
