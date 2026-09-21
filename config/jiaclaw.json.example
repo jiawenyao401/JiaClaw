@@ -43,5 +43,9 @@
       "interval_secs": 3600,
       "path": "HEARTBEAT.md",
       "session_id": "heartbeat"
+    },
+    "session": {
+      "summarize_on_overflow": false,
+      "keep_recent": 10
     }
 }

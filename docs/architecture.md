@@ -39,6 +39,7 @@
 │  │  - ChatMessage / MessageRole           │                 │
 │  │  - ToolCall / RunStatus                │                 │
 │  │  - AgentConfig / ProviderConfig        │                 │
+│  │  - SessionConfig（可选溢出摘要）        │                 │
 │  └──────────────────┬────────────────────┘                 │
 └────────────────────┬┬────────────────────────────────────┬─┘
                      ││                                    │

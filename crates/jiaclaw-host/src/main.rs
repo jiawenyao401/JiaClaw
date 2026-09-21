@@ -28,7 +28,10 @@ use jiaclaw::{
     inspect_heartbeat_file, inspect_identity_file, inspect_memory_file, load_heartbeat_message,
     resolve_heartbeat_path, JiaClawAgent, Workspace,
 };
-use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole, ToolCall};
+use jiaclaw_core::{
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole, ToolCall,
+    MAX_SESSION_MESSAGES,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
@@ -305,9 +308,6 @@ fn init_command(path: Option<PathBuf>, force: bool) -> Result<()> {
 
     Ok(())
 }
-
-/// 每个 session 保留的最大消息数（防止内存涨爆）
-const MAX_SESSION_MESSAGES: usize = 50;
 
 /// 会话闲置 TTL 后台扫描间隔。
 const SESSION_TTL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -1039,6 +1039,26 @@ fn heartbeat_interval_config_source() -> &'static str {
     }
 }
 
+fn session_summarize_config_source() -> &'static str {
+    if std::env::var("JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW").is_ok() {
+        "环境变量 JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW"
+    } else {
+        "配置文件"
+    }
+}
+
+fn session_summarize_status_line(config: &AgentConfig) -> String {
+    if config.session.effective_summarize_on_overflow() {
+        format!(
+            "已启用（keep_recent={}, 通过 {}）",
+            config.session.effective_keep_recent(),
+            session_summarize_config_source()
+        )
+    } else {
+        "未启用（超过上限硬截断）".to_string()
+    }
+}
+
 fn heartbeat_file_status_label(config: &AgentConfig) -> String {
     match inspect_heartbeat_file(&config.workspace_path, &config.heartbeat.path) {
         Ok(status) if status.exists => format!("存在 ({} bytes)", status.size_bytes),
@@ -1162,6 +1182,66 @@ fn persist_session_map(state: &AppState, sessions: &HashMap<String, SessionRecor
     if let Err(e) = save_sessions(&state.persist_path, &raw) {
         tracing::error!("保存 sessions 失败: {}", e);
     }
+}
+
+/// 合并 session 历史与本轮入站消息，并在超过上限时压缩（共享写入前的唯一裁剪点）。
+///
+/// HTTP `/api/chat`、webhook / Telegram / Slack / heartbeat 都走这里，避免通道分叉。
+async fn prepare_session_chat_messages(
+    state: &AppState,
+    session_id: &str,
+    incoming: Vec<ChatMessage>,
+    request_id: &str,
+    channel_label: &str,
+) -> Vec<ChatMessage> {
+    let history = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(session_id).map(|rec| rec.messages.clone())
+    };
+
+    let Some(history) = history else {
+        tracing::info!(
+            request_id = %request_id,
+            "创建新 {channel_label} session: {session_id}"
+        );
+        return incoming;
+    };
+
+    let mut all_messages = history;
+    all_messages.extend(incoming);
+    let before = all_messages.len();
+    if before > MAX_SESSION_MESSAGES {
+        tracing::info!(
+            request_id = %request_id,
+            "{channel_label} session {session_id} 消息数 {before} 超过上限 {MAX_SESSION_MESSAGES}，开始压缩"
+        );
+    }
+
+    let compacted = state.agent.compact_session_messages(all_messages).await;
+    tracing::info!(
+        request_id = %request_id,
+        "使用 {channel_label} session {session_id}, 合并后消息数: {} (压缩前 {before})",
+        compacted.len()
+    );
+    compacted
+}
+
+/// 将压缩后的完整历史写回共享 session store（含可选落盘）。
+fn commit_session_messages(
+    state: &AppState,
+    session_id: &str,
+    messages: Vec<ChatMessage>,
+    request_id: &str,
+    channel_label: &str,
+) {
+    let mut sessions = state.sessions.lock().unwrap();
+    let message_count = messages.len();
+    sessions.insert(session_id.to_string(), SessionRecord::new(messages));
+    tracing::info!(
+        request_id = %request_id,
+        "更新 {channel_label} session {session_id}, 当前消息数: {message_count}"
+    );
+    persist_session_map(state, &sessions);
 }
 
 fn purge_expired_sessions(state: &AppState) -> usize {
@@ -1390,6 +1470,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • Session TTL: 未启用");
     }
+    tracing::info!(
+        "   • Session 摘要压缩: {}",
+        session_summarize_status_line(&config)
+    );
     if let Some(secs) = config.effective_tool_timeout_secs() {
         tracing::info!("   • 工具超时: 已启用（每调用 {secs} 秒）");
     } else {
@@ -1493,6 +1577,18 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         );
     } else {
         println!("   • Session TTL: ⚠️  未启用（会话不会因闲置过期）");
+    }
+
+    if config.session.effective_summarize_on_overflow() {
+        println!(
+            "   • Session 摘要压缩: ✅ {}",
+            session_summarize_status_line(&config)
+        );
+    } else {
+        println!(
+            "   • Session 摘要压缩: ⚠️  {}；可设置 [session] summarize_on_overflow = true 或 JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1",
+            session_summarize_status_line(&config)
+        );
     }
 
     if let Some(secs) = config.effective_tool_timeout_secs() {
@@ -1748,64 +1844,15 @@ async fn chat_handler(
 
     purge_expired_sessions(&state);
 
-    // 如果提供了 session_id，从 session 中获取历史消息
     if let Some(ref sid) = session_id {
-        let sessions = state.sessions.lock().unwrap();
-        if let Some(history) = sessions.get(sid) {
-            // 将历史消息和新消息合并
-            let mut all_messages = history.messages.clone();
-            all_messages.extend(request.messages.clone());
-
-            // 检查消息数上限，防止内存涨爆
-            if all_messages.len() > MAX_SESSION_MESSAGES {
-                tracing::info!(
-                    request_id = %request_id,
-                    "Session {} 消息数 {} 超过上限 {}，开始截断",
-                    sid,
-                    all_messages.len(),
-                    MAX_SESSION_MESSAGES
-                );
-
-                // 保留 system 消息（如果有）和最新的消息
-                let system_messages: Vec<_> = all_messages
-                    .iter()
-                    .filter(|m| m.role == MessageRole::System)
-                    .cloned()
-                    .collect();
-
-                let non_system_messages: Vec<_> = all_messages
-                    .into_iter()
-                    .filter(|m| m.role != MessageRole::System)
-                    .collect();
-
-                // 计算可以保留多少非 system 消息
-                let system_count = system_messages.len();
-                let available_slots = MAX_SESSION_MESSAGES.saturating_sub(system_count);
-                let skip_count = non_system_messages.len().saturating_sub(available_slots);
-
-                // 重新组合：system 消息 + 最新的非 system 消息
-                all_messages = system_messages;
-                all_messages.extend(non_system_messages.into_iter().skip(skip_count));
-
-                tracing::info!(
-                    request_id = %request_id,
-                    "截断后消息数: {} (system: {}, 其他: {})",
-                    all_messages.len(),
-                    system_count,
-                    all_messages.len() - system_count
-                );
-            }
-
-            request.messages = all_messages;
-            tracing::info!(
-                request_id = %request_id,
-                "使用 session {}, 合并后消息数: {}",
-                sid,
-                request.messages.len()
-            );
-        } else {
-            tracing::info!(request_id = %request_id, "创建新 session: {}", sid);
-        }
+        request.messages = prepare_session_chat_messages(
+            &state,
+            sid,
+            request.messages.clone(),
+            &request_id,
+            "http",
+        )
+        .await;
     }
 
     let response = match state.agent.chat(&request).await {
@@ -1827,20 +1874,9 @@ async fn chat_handler(
 
     // 如果提供了 session_id，更新 session 历史
     if let Some(ref sid) = session_id {
-        let mut sessions = state.sessions.lock().unwrap();
         let mut messages = request.messages.clone();
         messages.push(response.message.clone());
-        let message_count = messages.len();
-        sessions.insert(sid.clone(), SessionRecord::new(messages));
-        tracing::info!(
-            request_id = %request_id,
-            "更新 session {}, 当前消息数: {}",
-            sid,
-            message_count
-        );
-
-        // 持久化到磁盘（如果启用）
-        persist_session_map(&state, &sessions);
+        commit_session_messages(&state, sid, messages, &request_id, "http");
     }
 
     tracing::info!(
@@ -2144,70 +2180,24 @@ async fn run_session_user_chat(
 
     purge_expired_sessions(state);
 
-    let mut request = ChatRequest {
-        messages: vec![ChatMessage {
-            role: MessageRole::User,
-            content: user_text.to_string(),
-        }],
+    let incoming = vec![ChatMessage {
+        role: MessageRole::User,
+        content: user_text.to_string(),
+    }];
+    let request = ChatRequest {
+        messages: prepare_session_chat_messages(
+            state,
+            session_id,
+            incoming,
+            request_id,
+            channel_label,
+        )
+        .await,
         enabled_tools: vec![],
         enabled_skills: vec![],
         auto_skills: true,
         session_id: Some(session_id.to_string()),
     };
-
-    {
-        let sessions = state.sessions.lock().unwrap();
-        if let Some(history) = sessions.get(session_id) {
-            let mut all_messages = history.messages.clone();
-            all_messages.extend(request.messages.clone());
-
-            if all_messages.len() > MAX_SESSION_MESSAGES {
-                tracing::info!(
-                    request_id = %request_id,
-                    "{channel_label} session {session_id} 消息数 {} 超过上限 {MAX_SESSION_MESSAGES}，开始截断",
-                    all_messages.len()
-                );
-
-                let system_messages: Vec<_> = all_messages
-                    .iter()
-                    .filter(|m| m.role == MessageRole::System)
-                    .cloned()
-                    .collect();
-
-                let non_system_messages: Vec<_> = all_messages
-                    .into_iter()
-                    .filter(|m| m.role != MessageRole::System)
-                    .collect();
-
-                let system_count = system_messages.len();
-                let available_slots = MAX_SESSION_MESSAGES.saturating_sub(system_count);
-                let skip_count = non_system_messages.len().saturating_sub(available_slots);
-
-                all_messages = system_messages;
-                all_messages.extend(non_system_messages.into_iter().skip(skip_count));
-
-                tracing::info!(
-                    request_id = %request_id,
-                    "截断后消息数: {} (system: {}, 其他: {})",
-                    all_messages.len(),
-                    system_count,
-                    all_messages.len() - system_count
-                );
-            }
-
-            request.messages = all_messages;
-            tracing::info!(
-                request_id = %request_id,
-                "使用 {channel_label} session {session_id}, 合并后消息数: {}",
-                request.messages.len()
-            );
-        } else {
-            tracing::info!(
-                request_id = %request_id,
-                "创建新 {channel_label} session: {session_id}"
-            );
-        }
-    }
 
     let response = state
         .agent
@@ -2216,17 +2206,9 @@ async fn run_session_user_chat(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     {
-        let mut sessions = state.sessions.lock().unwrap();
         let mut messages = request.messages.clone();
         messages.push(response.message.clone());
-        let message_count = messages.len();
-        sessions.insert(session_id.to_string(), SessionRecord::new(messages));
-        tracing::info!(
-            request_id = %request_id,
-            "更新 {channel_label} session {session_id}, 当前消息数: {message_count}"
-        );
-
-        persist_session_map(state, &sessions);
+        commit_session_messages(state, session_id, messages, request_id, channel_label);
     }
 
     tracing::info!(
@@ -3293,6 +3275,21 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_SESSION_TTL_SECS=3600");
     }
 
+    if config.session.effective_summarize_on_overflow() {
+        println!(
+            "   Session 摘要压缩: ✅ {}",
+            session_summarize_status_line(&config)
+        );
+    } else {
+        println!(
+            "   Session 摘要压缩: ⚠️  {}",
+            session_summarize_status_line(&config)
+        );
+        println!(
+            "   💡 设置 [session] summarize_on_overflow = true，或 export JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1"
+        );
+    }
+
     let heartbeat_interval_secs = config.heartbeat.effective_interval_secs();
     if config.heartbeat.enabled {
         println!(
@@ -3398,6 +3395,10 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         }
     );
     println!(
+        "   • Session 摘要压缩: {}",
+        session_summarize_status_line(&config)
+    );
+    println!(
         "   • 工具超时: {}",
         if let Some(secs) = tool_timeout_secs {
             format!("已启用（每调用 {secs} 秒）")
@@ -3441,7 +3442,8 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use jiaclaw_core::{ChatMessage, ChatRequest, HeartbeatConfig, MessageRole};
+    use jiaclaw::SESSION_SUMMARY_PREFIX;
+    use jiaclaw_core::{ChatMessage, ChatRequest, HeartbeatConfig, MessageRole, SessionConfig};
     use tower::ServiceExt;
 
     fn create_test_app() -> Router {
@@ -3734,6 +3736,42 @@ mod tests {
         };
 
         build_router(state)
+    }
+
+    fn create_test_state_from_config(config: AgentConfig) -> AppState {
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+        }
+    }
+
+    fn overflow_history(user_count: usize) -> Vec<ChatMessage> {
+        let mut messages = vec![ChatMessage {
+            role: MessageRole::System,
+            content: "你是一个助手".to_string(),
+        }];
+        for i in 0..user_count {
+            messages.push(ChatMessage {
+                role: MessageRole::User,
+                content: format!("消息 {i}"),
+            });
+        }
+        messages
     }
 
     async fn http_create_session(app: &Router) -> String {
@@ -4729,50 +4767,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_message_limit() {
-        let config = AgentConfig::default();
-        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
-        let persist_path =
-            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
-        let state = AppState {
-            agent: Arc::new(agent),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            api_token: None,
-            webhook_secret: None,
-            telegram_secret: None,
-            telegram_bot_token: None,
-            telegram_api_base: TELEGRAM_API_BASE.to_string(),
-            slack_signing_secret: None,
-            slack_bot_token: None,
-            slack_api_base: SLACK_API_BASE.to_string(),
-            persist_enabled: false,
-            persist_path: Arc::new(persist_path),
-            rate_limiter: None,
-            session_ttl: None,
-        };
-
+        let state = create_test_state_from_config(AgentConfig::default());
         let session_id = "test-limit-session".to_string();
 
-        // 创建超过上限的消息
-        let mut messages = vec![ChatMessage {
-            role: MessageRole::System,
-            content: "你是一个助手".to_string(),
-        }];
-
-        // 添加 60 条消息（超过 MAX_SESSION_MESSAGES = 50）
-        for i in 0..60 {
-            messages.push(ChatMessage {
-                role: MessageRole::User,
-                content: format!("消息 {}", i),
-            });
-        }
-
-        // 手动设置 session 历史
         {
             let mut sessions = state.sessions.lock().unwrap();
-            sessions.insert(session_id.clone(), SessionRecord::new(messages.clone()));
+            sessions.insert(session_id.clone(), SessionRecord::new(overflow_history(60)));
         }
 
-        // 创建请求并通过 chat_handler 处理
         let request = ChatRequest {
             messages: vec![ChatMessage {
                 role: MessageRole::User,
@@ -4786,7 +4788,7 @@ mod tests {
 
         let app = Router::new()
             .route("/api/chat", post(chat_handler))
-            .with_state(state);
+            .with_state(state.clone());
 
         let request_body = serde_json::to_string(&request).unwrap();
 
@@ -4804,18 +4806,164 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // 检查 session 中的消息数是否被限制
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let chat_response: ChatResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(chat_response.session_id, Some(session_id.clone()));
 
-        assert_eq!(chat_response.session_id, Some(session_id));
+        let stored = {
+            let sessions = state.sessions.lock().unwrap();
+            sessions
+                .get(&session_id)
+                .expect("session 应存在")
+                .messages
+                .clone()
+        };
 
-        // 注意: 由于实现细节，实际存储的消息数可能略超过 MAX_SESSION_MESSAGES
-        // 但应该在合理范围内（< MAX_SESSION_MESSAGES + 2，考虑新消息和响应）
-        // 这里我们主要验证截断逻辑被触发了
-        // 可以通过日志验证，或者检查消息内容包含 system 消息
+        // 硬截断后写入 assistant，可能略超上限
+        assert!(
+            stored.len() <= MAX_SESSION_MESSAGES + 1,
+            "截断后应接近上限，实际 {}",
+            stored.len()
+        );
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert_eq!(stored[0].content, "你是一个助手");
+        assert!(stored.iter().any(|m| m.content == "新消息"));
+        assert!(
+            !stored
+                .iter()
+                .any(|m| m.role == MessageRole::User && m.content == "消息 0"),
+            "最旧用户消息应被丢弃"
+        );
+        assert!(!stored[0].content.contains(SESSION_SUMMARY_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn test_session_summarize_on_overflow_replaces_old_messages() {
+        let config = AgentConfig {
+            session: SessionConfig {
+                summarize_on_overflow: true,
+                keep_recent: 10,
+            },
+            ..AgentConfig::default()
+        };
+        let state = create_test_state_from_config(config);
+        let session_id = "test-summarize-session".to_string();
+
+        {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.insert(session_id.clone(), SessionRecord::new(overflow_history(60)));
+        }
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "新消息".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: Some(session_id.clone()),
+        };
+
+        let app = Router::new()
+            .route("/api/chat", post(chat_handler))
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored = {
+            let sessions = state.sessions.lock().unwrap();
+            sessions
+                .get(&session_id)
+                .expect("session 应存在")
+                .messages
+                .clone()
+        };
+
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert!(
+            stored[0].content.contains(SESSION_SUMMARY_PREFIX),
+            "旧消息应折叠为带标记的摘要: {}",
+            stored[0].content
+        );
+        assert!(stored.iter().any(|m| m.content == "新消息"));
+        assert!(stored
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "消息 59"));
+        assert!(
+            !stored
+                .iter()
+                .any(|m| m.role == MessageRole::User && m.content == "消息 0"),
+            "被摘要的旧用户消息不应再作为独立条目"
+        );
+        assert!(
+            stored.len() < 20,
+            "摘要压缩后历史应远小于硬截断上限，实际 {}",
+            stored.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webhook_session_summarize_on_overflow() {
+        let config = AgentConfig {
+            session: SessionConfig {
+                summarize_on_overflow: true,
+                keep_recent: 10,
+            },
+            ..AgentConfig::default()
+        };
+        let state = create_test_state_from_config(config);
+        let session_id = "webhook:overflow-chat".to_string();
+        {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.insert(session_id.clone(), SessionRecord::new(overflow_history(60)));
+        }
+
+        let app = build_router(state.clone());
+        let webhook_request = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "overflow-chat".to_string(),
+            text: "新消息".to_string(),
+            username: None,
+        };
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&webhook_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored = {
+            let sessions = state.sessions.lock().unwrap();
+            sessions
+                .get(&session_id)
+                .expect("webhook session 应存在")
+                .messages
+                .clone()
+        };
+        assert!(stored[0].content.contains(SESSION_SUMMARY_PREFIX));
+        assert!(stored.iter().any(|m| m.content == "新消息"));
+        assert!(!stored
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "消息 0"));
     }
 
     #[tokio::test]
