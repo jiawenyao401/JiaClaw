@@ -730,11 +730,15 @@ fn default_glob_enabled() -> bool {
     true
 }
 
+fn default_mkdir_enabled() -> bool {
+    true
+}
+
 /// 本地工具总配置（缺省本段不影响现有 `[http]` / `[memory]` 等段）
 ///
 /// 历史示例里的 `[tools] enabled = [...]` 列表仍可出现在文件中（未知字段忽略），
 /// 当前真正生效的是嵌套表 `[tools.web_search]`、`[tools.web_fetch]`、
-/// `[tools.memory_search]`、`[tools.memory_write]`、`[tools.read_file]`、`[tools.list_dir]`、`[tools.write_file]`、`[tools.delete_file]`、`[tools.str_replace]`、`[tools.grep]` 与 `[tools.glob]`。
+/// `[tools.memory_search]`、`[tools.memory_write]`、`[tools.read_file]`、`[tools.list_dir]`、`[tools.write_file]`、`[tools.delete_file]`、`[tools.str_replace]`、`[tools.grep]`、`[tools.glob]` 与 `[tools.mkdir]`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
     /// `web_search` 工具配置
@@ -780,6 +784,10 @@ pub struct ToolsConfig {
     /// `glob` 工具配置
     #[serde(default)]
     pub glob: GlobToolConfig,
+
+    /// `mkdir` 工具配置
+    #[serde(default)]
+    pub mkdir: MkdirToolConfig,
 }
 
 /// 可选 `web_search` 联网检索配置
@@ -982,6 +990,22 @@ impl Default for GlobToolConfig {
     fn default() -> Self {
         Self {
             enabled: default_glob_enabled(),
+        }
+    }
+}
+
+/// 可选 `mkdir` 工作区创建目录配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MkdirToolConfig {
+    /// 是否注册 `mkdir` 工具（默认 `true`）
+    #[serde(default = "default_mkdir_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for MkdirToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_mkdir_enabled(),
         }
     }
 }
@@ -1827,8 +1851,8 @@ mod tests {
         resolve_session_ttl_secs, resolve_shutdown_timeout_secs, resolve_tool_timeout_secs,
         AgentConfig, DeleteFileToolConfig, GlobToolConfig, GrepToolConfig, HeartbeatConfig,
         HttpConfig, HttpCorsConfig, ListDirToolConfig, LogFormat, LoggingConfig,
-        MemorySearchToolConfig, MemoryWriteToolConfig, ReadFileToolConfig, SessionConfig,
-        StrReplaceToolConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+        MemorySearchToolConfig, MemoryWriteToolConfig, MkdirToolConfig, ReadFileToolConfig,
+        SessionConfig, StrReplaceToolConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
         WriteFileToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
         DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_MAX_BODY_BYTES,
         DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_LOG_LEVEL, DEFAULT_MAX_TOOL_ITERATIONS,
@@ -3037,6 +3061,7 @@ bind = "127.0.0.1:8080"
         assert!(config.tools.str_replace.enabled);
         assert!(config.tools.grep.enabled);
         assert!(config.tools.glob.enabled);
+        assert!(config.tools.mkdir.enabled);
         assert_eq!(config.http.bind, "127.0.0.1:8080");
     }
 
@@ -3108,6 +3133,10 @@ path = "MEMORY.md"
         assert!(
             config.tools.glob.enabled,
             "omitted [tools.glob] should keep default enabled"
+        );
+        assert!(
+            config.tools.mkdir.enabled,
+            "omitted [tools.mkdir] should keep default enabled"
         );
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.memory.path, "MEMORY.md");
@@ -3329,6 +3358,7 @@ enabled = false
         assert!(config.tools.str_replace.enabled);
         assert!(config.tools.grep.enabled);
         assert!(config.tools.glob.enabled);
+        assert!(config.tools.mkdir.enabled);
     }
 
     #[test]
@@ -3340,6 +3370,7 @@ enabled = false
         assert!(StrReplaceToolConfig::default().enabled);
         assert!(GrepToolConfig::default().enabled);
         assert!(GlobToolConfig::default().enabled);
+        assert!(MkdirToolConfig::default().enabled);
         assert!(ToolsConfig::default().read_file.enabled);
         assert!(ToolsConfig::default().list_dir.enabled);
         assert!(ToolsConfig::default().write_file.enabled);
@@ -3347,6 +3378,7 @@ enabled = false
         assert!(ToolsConfig::default().str_replace.enabled);
         assert!(ToolsConfig::default().grep.enabled);
         assert!(ToolsConfig::default().glob.enabled);
+        assert!(ToolsConfig::default().mkdir.enabled);
         assert!(AgentConfig::default().tools.read_file.enabled);
         assert!(AgentConfig::default().tools.list_dir.enabled);
         assert!(AgentConfig::default().tools.write_file.enabled);
@@ -3354,6 +3386,7 @@ enabled = false
         assert!(AgentConfig::default().tools.str_replace.enabled);
         assert!(AgentConfig::default().tools.grep.enabled);
         assert!(AgentConfig::default().tools.glob.enabled);
+        assert!(AgentConfig::default().tools.mkdir.enabled);
     }
 
     #[test]
@@ -3636,6 +3669,10 @@ enabled = false
             config.tools.glob.enabled,
             "omitted [tools.glob] should keep default enabled"
         );
+        assert!(
+            config.tools.mkdir.enabled,
+            "omitted [tools.mkdir] should keep default enabled"
+        );
     }
 
     #[test]
@@ -3662,6 +3699,7 @@ enabled = false
         assert!(config.tools.list_dir.enabled);
         assert!(config.tools.web_search.enabled);
         assert!(config.tools.glob.enabled);
+        assert!(config.tools.mkdir.enabled);
     }
 
     #[test]
@@ -3686,6 +3724,10 @@ enabled = false
             config.tools.read_file.enabled,
             "omitted [tools.read_file] should keep default enabled"
         );
+        assert!(
+            config.tools.mkdir.enabled,
+            "omitted [tools.mkdir] should keep default enabled"
+        );
     }
 
     #[test]
@@ -3705,6 +3747,58 @@ enabled = false
         }"#;
         let config = AgentConfig::from_json_str(json).expect("parse json");
         assert!(!config.tools.glob.enabled);
+        assert!(config.tools.grep.enabled);
+        assert!(config.tools.str_replace.enabled);
+        assert!(config.tools.write_file.enabled);
+        assert!(config.tools.delete_file.enabled);
+        assert!(config.tools.read_file.enabled);
+        assert!(config.tools.list_dir.enabled);
+        assert!(config.tools.web_search.enabled);
+        assert!(config.tools.mkdir.enabled);
+    }
+
+    #[test]
+    fn tools_mkdir_parses_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools.mkdir]
+enabled = false
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.mkdir.enabled);
+        assert!(
+            config.tools.glob.enabled,
+            "omitted [tools.glob] should keep default enabled"
+        );
+        assert!(
+            config.tools.read_file.enabled,
+            "omitted [tools.read_file] should keep default enabled"
+        );
+    }
+
+    #[test]
+    fn tools_mkdir_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "tools": {
+                "mkdir": {
+                    "enabled": false
+                }
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(!config.tools.mkdir.enabled);
+        assert!(config.tools.glob.enabled);
         assert!(config.tools.grep.enabled);
         assert!(config.tools.str_replace.enabled);
         assert!(config.tools.write_file.enabled);

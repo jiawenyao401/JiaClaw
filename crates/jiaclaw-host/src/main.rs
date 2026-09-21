@@ -2100,6 +2100,13 @@ fn glob_status_line(config: &AgentConfig) -> String {
     "已启用（工作区 glob 按模式找文件；默认最多 100 条；禁穿越/symlink 逃逸）".to_string()
 }
 
+fn mkdir_status_line(config: &AgentConfig) -> String {
+    if !config.tools.mkdir.enabled {
+        return "已关闭（[tools.mkdir] enabled = false，未注册）".to_string();
+    }
+    "已启用（工作区相对路径创建目录；默认 mkdir -p；禁穿越/symlink 逃逸）".to_string()
+}
+
 fn session_summarize_status_line(config: &AgentConfig) -> String {
     if config.session.effective_summarize_on_overflow() {
         format!(
@@ -2746,6 +2753,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • glob: 已关闭（未注册）");
     }
+    if config.tools.mkdir.enabled {
+        tracing::info!("   • mkdir: 已启用（工作区相对路径创建目录，默认 mkdir -p）");
+    } else {
+        tracing::info!("   • mkdir: 已关闭（未注册）");
+    }
     if config.heartbeat.enabled {
         tracing::info!(
             "   • Heartbeat: 已启用（间隔 {heartbeat_interval_secs} 秒，session={}, 文件 {}）",
@@ -3000,6 +3012,12 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         println!("   • glob: ✅ {}", glob_status_line(&config));
     } else {
         println!("   • glob: ⚠️  {}", glob_status_line(&config));
+    }
+
+    if config.tools.mkdir.enabled {
+        println!("   • mkdir: ✅ {}", mkdir_status_line(&config));
+    } else {
+        println!("   • mkdir: ⚠️  {}", mkdir_status_line(&config));
     }
 
     if config.heartbeat.enabled {
@@ -5178,6 +5196,12 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   glob: ⚠️  {}", glob_status_line(&config));
     }
 
+    if config.tools.mkdir.enabled {
+        println!("   mkdir: ✅ {}", mkdir_status_line(&config));
+    } else {
+        println!("   mkdir: ⚠️  {}", mkdir_status_line(&config));
+    }
+
     // 3. 检查提供商配置
     println!("\n🔌 提供商配置");
     println!("   类型: {}", config.provider.provider_type);
@@ -5608,9 +5632,9 @@ mod tests {
     use jiaclaw_core::{
         resolve_log_format, ChatMessage, ChatRequest, DeleteFileToolConfig, GlobToolConfig,
         GrepToolConfig, HeartbeatConfig, ListDirToolConfig, LogFormat, LoggingConfig,
-        MemorySearchToolConfig, MemoryWriteToolConfig, MessageRole, ReadFileToolConfig,
-        SessionConfig, StrReplaceToolConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
-        WriteFileToolConfig,
+        MemorySearchToolConfig, MemoryWriteToolConfig, MessageRole, MkdirToolConfig,
+        ReadFileToolConfig, SessionConfig, StrReplaceToolConfig, ToolsConfig, WebFetchToolConfig,
+        WebSearchToolConfig, WriteFileToolConfig,
     };
     use tower::ServiceExt;
 
@@ -8132,6 +8156,10 @@ mod tests {
             tools_response.tools.iter().any(|t| t.name == "glob"),
             "应注册默认 glob 工具"
         );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "mkdir"),
+            "应注册默认 mkdir 工具"
+        );
 
         // 验证工具信息包含名称和描述
         for tool in &tools_response.tools {
@@ -8791,6 +8819,10 @@ mod tests {
             tools_response.tools.iter().any(|t| t.name == "glob"),
             "关闭 grep 不应影响 glob"
         );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "mkdir"),
+            "关闭 grep 不应影响 mkdir"
+        );
     }
 
     #[tokio::test]
@@ -8854,6 +8886,74 @@ mod tests {
         assert!(
             tools_response.tools.iter().any(|t| t.name == "read_file"),
             "关闭 glob 不应影响 read_file"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "mkdir"),
+            "关闭 glob 不应影响 mkdir"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_endpoint_omits_mkdir_when_disabled() {
+        let config = AgentConfig {
+            workspace_path: unique_workspace("jiaclaw-mkdir-off"),
+            tools: ToolsConfig {
+                mkdir: MkdirToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            discord_public_key: None,
+            discord_bot_token: None,
+            discord_api_base: DISCORD_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tools_response: ToolsResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            tools_response.tools.iter().all(|t| t.name != "mkdir"),
+            "enabled=false 时不应出现 mkdir"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "glob"),
+            "关闭 mkdir 不应影响 glob"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "read_file"),
+            "关闭 mkdir 不应影响 read_file"
         );
     }
 
@@ -9127,6 +9227,22 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(glob_status_line(&disabled).contains("已关闭"));
+    }
+
+    #[test]
+    fn mkdir_status_line_reports_enabled_and_disabled() {
+        let enabled = AgentConfig::default();
+        assert!(mkdir_status_line(&enabled).contains("已启用"));
+        assert!(mkdir_status_line(&enabled).contains("mkdir"));
+
+        let disabled = AgentConfig {
+            tools: ToolsConfig {
+                mkdir: MkdirToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(mkdir_status_line(&disabled).contains("已关闭"));
     }
 
     #[test]
