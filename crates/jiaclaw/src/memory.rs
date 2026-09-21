@@ -3,9 +3,11 @@
 
 //! 工作区 `MEMORY.md` 长期记忆：路径校验、提示注入读取、原子写入。
 
+#![allow(clippy::module_name_repetitions)]
+
 use crate::tools::Tool;
 use async_trait::async_trait;
-use jiaclaw_core::{JiaClawError, DEFAULT_MEMORY_PATH, MEMORY_PROMPT_MAX_BYTES};
+use jiaclaw_core::{JiaClawError, MEMORY_PROMPT_MAX_BYTES};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
@@ -365,6 +367,7 @@ impl Tool for MemoryAppendTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiaclaw_core::DEFAULT_MEMORY_PATH;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
