@@ -72,6 +72,28 @@
       }
     },
     "/api/sessions": {
+      "get": {
+        "tags": ["chat"],
+        "summary": "列出会话",
+        "operationId": "listSessions",
+        "description": "返回内存中当前会话摘要（id 与 message_count）。落盘开启时也以内存 store 为准，与 chat/delete 一致。",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "responses": {
+          "200": {
+            "description": "会话列表",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListSessionsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      },
       "post": {
         "tags": ["chat"],
         "summary": "创建会话",
@@ -95,6 +117,37 @@
       }
     },
     "/api/sessions/{id}": {
+      "get": {
+        "tags": ["chat"],
+        "summary": "读取会话历史",
+        "operationId": "getSession",
+        "description": "返回内存中该会话的消息列表。不存在返回 404。落盘开启时也以内存 store 为准。",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "会话消息",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GetSessionResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      },
       "delete": {
         "tags": ["chat"],
         "summary": "删除会话",
@@ -279,6 +332,17 @@
           }
         }
       },
+      "NotFound": {
+        "description": "会话不存在。JSON `error` 为 `session_not_found`。",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorBody" }
+          }
+        }
+      },
       "RateLimited": {
         "description": "超过进程内全局限流（429）。JSON `error` 为 `rate_limit_exceeded`。",
         "headers": {
@@ -359,6 +423,35 @@
         "type": "object",
         "properties": {
           "session_id": { "type": "string" }
+        }
+      },
+      "SessionSummary": {
+        "type": "object",
+        "required": ["id", "message_count"],
+        "properties": {
+          "id": { "type": "string" },
+          "message_count": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "ListSessionsResponse": {
+        "type": "object",
+        "required": ["sessions"],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SessionSummary" }
+          }
+        }
+      },
+      "GetSessionResponse": {
+        "type": "object",
+        "required": ["id", "messages"],
+        "properties": {
+          "id": { "type": "string" },
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ChatMessage" }
+          }
         }
       },
       "DeleteSessionResponse": {

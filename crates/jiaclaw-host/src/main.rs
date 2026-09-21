@@ -9,7 +9,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use clap::{Parser, Subcommand};
@@ -353,8 +353,14 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/api/chat", post(chat_handler))
-        .route("/api/sessions", post(create_session_handler))
-        .route("/api/sessions/:id", delete(delete_session_handler))
+        .route(
+            "/api/sessions",
+            get(list_sessions_handler).post(create_session_handler),
+        )
+        .route(
+            "/api/sessions/:id",
+            get(get_session_handler).delete(delete_session_handler),
+        )
         .route("/api/tools", get(tools_handler))
         .route("/api/skills", get(skills_handler))
         .route("/api/openapi.json", get(openapi_handler))
@@ -491,7 +497,9 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("✅ HTTP 服务已启动于 http://{}", config.http.bind);
     tracing::info!("   • GET    /health              - 健康检查");
     tracing::info!("   • POST   /api/chat            - 聊天端点");
+    tracing::info!("   • GET    /api/sessions        - 列出会话");
     tracing::info!("   • POST   /api/sessions        - 创建会话");
+    tracing::info!("   • GET    /api/sessions/:id    - 读取会话历史");
     tracing::info!("   • DELETE /api/sessions/:id    - 删除会话");
     tracing::info!("   • GET    /api/tools           - 列出已注册工具");
     tracing::info!("   • GET    /api/skills          - 列出已发现技能");
@@ -753,10 +761,102 @@ async fn chat_handler(
     Ok(Json(response))
 }
 
+/// 会话列表项
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionSummary {
+    id: String,
+    message_count: usize,
+}
+
+/// 列出会话响应
+#[derive(Debug, Serialize, Deserialize)]
+struct ListSessionsResponse {
+    sessions: Vec<SessionSummary>,
+}
+
+/// 读取会话响应
+#[derive(Debug, Serialize, Deserialize)]
+struct GetSessionResponse {
+    id: String,
+    messages: Vec<ChatMessage>,
+}
+
 /// 创建会话响应
 #[derive(Debug, Serialize, Deserialize)]
 struct CreateSessionResponse {
     session_id: String,
+}
+
+/// 列出会话：读内存中的当前 store（落盘开启时也以内存为准，与 chat/delete 一致）。
+async fn list_sessions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ListSessionsResponse>, AppError> {
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!(
+            request_id = request_id_log_value(&headers),
+            "API 鉴权失败: token 不匹配或缺失"
+        );
+        return Err(AppError::Unauthorized);
+    }
+
+    let mut sessions: Vec<SessionSummary> = {
+        let map = state.sessions.lock().unwrap();
+        map.iter()
+            .map(|(id, messages)| SessionSummary {
+                id: id.clone(),
+                message_count: messages.len(),
+            })
+            .collect()
+    };
+    sessions.sort_by(|a, b| a.id.cmp(&b.id));
+
+    tracing::info!(
+        request_id = request_id_log_value(&headers),
+        "列出 sessions: {} 个",
+        sessions.len()
+    );
+    Ok(Json(ListSessionsResponse { sessions }))
+}
+
+/// 读取会话历史；不存在返回 404。读内存 store，不重新扫盘。
+async fn get_session_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<GetSessionResponse>, AppError> {
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!(
+            request_id = request_id_log_value(&headers),
+            "API 鉴权失败: token 不匹配或缺失"
+        );
+        return Err(AppError::Unauthorized);
+    }
+
+    let messages = {
+        let map = state.sessions.lock().unwrap();
+        map.get(&session_id).cloned()
+    };
+
+    if let Some(messages) = messages {
+        tracing::info!(
+            request_id = request_id_log_value(&headers),
+            "读取 session {}，消息数: {}",
+            session_id,
+            messages.len()
+        );
+        Ok(Json(GetSessionResponse {
+            id: session_id,
+            messages,
+        }))
+    } else {
+        tracing::info!(
+            request_id = request_id_log_value(&headers),
+            "session 不存在: {}",
+            session_id
+        );
+        Err(AppError::NotFound)
+    }
 }
 
 /// 创建会话处理器
@@ -1067,6 +1167,7 @@ async fn hooks_inbound_handler(
 enum AppError {
     Internal(String),
     Unauthorized,
+    NotFound,
 }
 
 impl IntoResponse for AppError {
@@ -1074,6 +1175,7 @@ impl IntoResponse for AppError {
         let (status, message) = match self {
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+            Self::NotFound => (StatusCode::NOT_FOUND, "session_not_found".to_string()),
         };
 
         let body = serde_json::json!({
@@ -2125,6 +2227,304 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_sessions_empty() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(X_REQUEST_ID).is_some());
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: ListSessionsResponse = serde_json::from_slice(&body).unwrap();
+        assert!(list.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_then_list_and_get_session() {
+        let app = create_test_app();
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+        let session_id = created.session_id;
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: ListSessionsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list.sessions.len(), 1);
+        assert_eq!(list.sessions[0].id, session_id);
+        assert_eq!(list.sessions[0].message_count, 0);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let got: GetSessionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(got.id, session_id);
+        assert!(got.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_session_returns_messages_after_chat() {
+        let app = create_test_app();
+        let session_id = "query-session-chat".to_string();
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "你好".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: Some(session_id.clone()),
+        };
+
+        let chat_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat_response.status(), StatusCode::OK);
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let got: GetSessionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(got.id, session_id);
+        assert!(
+            got.messages.len() >= 2,
+            "chat 后应包含用户消息与助手回复，实际: {}",
+            got.messages.len()
+        );
+        assert_eq!(got.messages[0].role, MessageRole::User);
+        assert_eq!(got.messages[0].content, "你好");
+        assert_eq!(got.messages.last().unwrap().role, MessageRole::Assistant);
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: ListSessionsResponse = serde_json::from_slice(&body).unwrap();
+        let summary = list
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .expect("list 应包含刚聊过的 session");
+        assert_eq!(summary.message_count, got.messages.len());
+    }
+
+    #[tokio::test]
+    async fn test_get_session_not_found() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get(X_REQUEST_ID).is_some());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "session_not_found");
+    }
+
+    #[tokio::test]
+    async fn test_get_session_404_after_delete() {
+        let app = create_test_app();
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+        let session_id = created.session_id;
+
+        let delete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: ListSessionsResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!list.sessions.iter().any(|s| s.id == session_id));
+    }
+
+    #[tokio::test]
+    async fn test_get_session_reads_memory_not_disk() {
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let session_id = "mem-session".to_string();
+        let mem_messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: "内存中的消息".to_string(),
+        }];
+        let disk_messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: "磁盘上的旧消息".to_string(),
+        }];
+
+        let mut disk_map = HashMap::new();
+        disk_map.insert(session_id.clone(), disk_messages);
+        save_sessions(&persist_path, &disk_map).expect("保存失败");
+
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let mut mem_map = HashMap::new();
+        mem_map.insert(session_id.clone(), mem_messages);
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(mem_map)),
+            api_token: None,
+            webhook_secret: None,
+            persist_enabled: true,
+            persist_path: Arc::new(persist_path.clone()),
+            rate_limiter: None,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let got: GetSessionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(got.messages.len(), 1);
+        assert_eq!(got.messages[0].content, "内存中的消息");
+
+        std::fs::remove_file(&persist_path).ok();
+    }
+
+    #[tokio::test]
     async fn test_session_message_limit() {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
@@ -2801,8 +3201,35 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        // GET /api/sessions 无 token 应 401
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // GET /api/sessions/:id 无 token 应 401（即使不存在也不应先 404）
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/any-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
         // 带正确 token 应该成功
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2815,6 +3242,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+        let session_id = created.session_id;
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_sessions_query_allows_anonymous_when_no_token() {
+        let app = create_test_app();
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3036,6 +3521,8 @@ mod tests {
     fn test_is_rate_limited_path() {
         assert!(is_rate_limited_path("/api/chat"));
         assert!(is_rate_limited_path("/api/tools"));
+        assert!(is_rate_limited_path("/api/sessions"));
+        assert!(is_rate_limited_path("/api/sessions/abc"));
         assert!(is_rate_limited_path("/api/openapi.json"));
         assert!(is_rate_limited_path("/hooks/inbound"));
         assert!(!is_rate_limited_path("/health"));
@@ -3189,6 +3676,7 @@ mod tests {
             "/health",
             "/api/chat",
             "/api/sessions",
+            "/api/sessions/{id}",
             "/api/tools",
             "/api/skills",
             "/hooks/inbound",
@@ -3198,6 +3686,10 @@ mod tests {
                 "OpenAPI paths 缺少 {required}"
             );
         }
+        assert!(paths["/api/sessions"].get("get").is_some());
+        assert!(paths["/api/sessions"].get("post").is_some());
+        assert!(paths["/api/sessions/{id}"].get("get").is_some());
+        assert!(paths["/api/sessions/{id}"].get("delete").is_some());
     }
 
     #[tokio::test]
