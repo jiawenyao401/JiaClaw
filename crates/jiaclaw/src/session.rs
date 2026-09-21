@@ -163,6 +163,34 @@ pub async fn compact_session_history_default<S: ConversationSummarizer + ?Sized>
     .await
 }
 
+/// 导入会话时压缩超长历史：复用硬截断/摘要策略，摘要只用本地 digest，不调用 LLM。
+pub async fn compact_imported_session_messages(
+    messages: Vec<ChatMessage>,
+    summarize_on_overflow: bool,
+    keep_recent: usize,
+) -> Vec<ChatMessage> {
+    struct ImportLocalSummarizer;
+
+    #[async_trait]
+    impl ConversationSummarizer for ImportLocalSummarizer {
+        async fn summarize_conversation(
+            &self,
+            messages: &[ChatMessage],
+        ) -> Result<String, JiaClawError> {
+            Ok(local_conversation_digest(messages))
+        }
+    }
+
+    compact_session_history(
+        messages,
+        MAX_SESSION_MESSAGES,
+        summarize_on_overflow,
+        keep_recent,
+        &ImportLocalSummarizer,
+    )
+    .await
+}
+
 async fn summarize_overflow<S: ConversationSummarizer + ?Sized>(
     messages: &[ChatMessage],
     max_messages: usize,
@@ -361,5 +389,25 @@ mod tests {
         assert!(digest.contains("12 messages"));
         assert!(digest.contains("消息 0"));
         assert!(digest.contains("消息 11"));
+    }
+
+    #[tokio::test]
+    async fn import_compact_off_hard_truncates_without_llm() {
+        let messages: Vec<_> = (0..60).map(user).collect();
+        let expected = hard_truncate_session_messages(messages.clone(), MAX_SESSION_MESSAGES);
+        let actual = compact_imported_session_messages(messages, false, 10).await;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), MAX_SESSION_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn import_compact_on_uses_local_digest_not_provider() {
+        let messages: Vec<_> = (0..51).map(user).collect();
+        let compacted = compact_imported_session_messages(messages, true, 10).await;
+        assert_eq!(compacted.len(), 11);
+        assert_eq!(compacted[0].role, MessageRole::System);
+        assert!(compacted[0].content.contains(SESSION_SUMMARY_PREFIX));
+        assert!(compacted[0].content.contains("51 messages"));
+        assert_eq!(compacted.last().unwrap().content, "消息 50");
     }
 }

@@ -254,6 +254,71 @@
         }
       }
     },
+    "/api/sessions/import": {
+      "post": {
+        "tags": ["chat"],
+        "summary": "导入会话历史",
+        "operationId": "importSession",
+        "description": "将消息导入内存 store（落盘开启时走现有 save）。默认每行一条消息 JSON（`application/x-ndjson`）。`Content-Type: application/json` 或 `?format=json` 接受 `{id?, messages:[...]}`。可选 `?id=` 或 JSON `id`；缺省新建 UUID。id 已存在默认 409（`session_already_exists`）；`?overwrite=true` 替换消息并刷新 last_accessed。非法 role/content 或坏行返回 400。不调用 LLM；超长按 MAX_SESSION_MESSAGES 硬截断/本地摘要。",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": false,
+            "description": "目标会话 ID。省略则使用 JSON body 的 `id` 或新建 UUID。",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "description": "导入格式。默认 `jsonl`。`json` 接受整包 JSON。",
+            "schema": {
+              "type": "string",
+              "enum": ["jsonl", "json"],
+              "default": "jsonl"
+            }
+          },
+          {
+            "name": "overwrite",
+            "in": "query",
+            "required": false,
+            "description": "为 true 时替换已存在会话的消息。默认 false（冲突 409）。",
+            "schema": { "type": "boolean", "default": false }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-ndjson": {
+              "schema": { "type": "string" },
+              "example": "{\"role\":\"user\",\"content\":\"你好\"}\\n{\"role\":\"assistant\",\"content\":\"你好！我是 JiaClaw。\"}\\n"
+            },
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ImportSessionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "导入后的会话（可能已按上限截断/摘要）",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GetSessionResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
     "/api/tools": {
       "get": {
         "tags": ["catalog"],
@@ -575,6 +640,28 @@
           }
         }
       },
+      "BadRequest": {
+        "description": "导入体非法（坏行、非法 role/content、非 UTF-8）。JSON `error` 以 `invalid_session_import` 开头。",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorBody" }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "会话 ID 已存在且未指定 overwrite。JSON `error` 为 `session_already_exists`。",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorBody" }
+          }
+        }
+      },
       "RateLimited": {
         "description": "超过进程内全局限流（429）。JSON `error` 为 `rate_limit_exceeded`。",
         "headers": {
@@ -687,6 +774,17 @@
       "GetSessionResponse": {
         "type": "object",
         "required": ["id", "messages"],
+        "properties": {
+          "id": { "type": "string" },
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ChatMessage" }
+          }
+        }
+      },
+      "ImportSessionRequest": {
+        "type": "object",
+        "required": ["messages"],
         "properties": {
           "id": { "type": "string" },
           "messages": {
