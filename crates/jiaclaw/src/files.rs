@@ -1,7 +1,7 @@
 // Copyright 2026 JiaClaw contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` / `grep` / `glob`。
+//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` / `grep` / `glob` / `mkdir`。
 //!
 //! 路径解析复用 [`crate::memory::resolve_workspace_relative_path`]（禁 `..`、绝对路径、symlink 逃逸）。
 //! 不调用 LLM，不执行 shell。
@@ -188,6 +188,15 @@ pub struct GlobArgs {
     pub max_results: usize,
 }
 
+/// 解析后的 `mkdir` 参数。`recursive` / `parents` 为别名，默认 `true`（等价 `mkdir -p`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MkdirArgs {
+    /// 工作区相对路径
+    pub path: String,
+    /// 是否创建中间目录（默认 `true`）
+    pub recursive: bool,
+}
+
 /// 将 `max_entries` 钳制到 `1..=1000`。
 #[must_use]
 pub fn clamp_list_dir_max_entries(raw: u64) -> usize {
@@ -221,6 +230,20 @@ fn parse_positive_usize(value: &Value, name: &str) -> Result<usize, JiaClawError
             .map_err(|_| JiaClawError::ToolExecution(format!("参数 '{name}' 超出范围"))),
         None => Err(JiaClawError::ToolExecution(format!(
             "参数 '{name}' 必须是正整数"
+        ))),
+    }
+}
+
+fn parse_optional_bool_arg(
+    args: &Value,
+    name: &str,
+    default_hint: &str,
+) -> Result<Option<bool>, JiaClawError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(_) => Err(JiaClawError::ToolExecution(format!(
+            "参数 '{name}' 必须是布尔值（默认 {default_hint}）"
         ))),
     }
 }
@@ -627,9 +650,53 @@ pub fn parse_glob_args(args: &Value) -> Result<GlobArgs, JiaClawError> {
     })
 }
 
-/// 解析写入目标：已存在路径 canonicalize 后必须落在工作区内且为常规文件；
-/// 不存在时沿已存在祖先 canonicalize，再拼回剩余组件（可随后创建中间目录）。
-fn prepare_workspace_write_path(workspace: &Path, rel_path: &str) -> Result<PathBuf, JiaClawError> {
+/// 解析 `mkdir` 参数：必填 `path`；可选 `recursive` / `parents`（默认 `true`，等价 `mkdir -p`）。
+///
+/// `recursive` 与 `parents` 为别名；同时给出时必须一致。
+///
+/// # Errors
+///
+/// `path` 缺失/空白，`recursive`/`parents` 不是布尔值，或两者冲突时返回错误。
+pub fn parse_mkdir_args(args: &Value) -> Result<MkdirArgs, JiaClawError> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            JiaClawError::ToolExecution("缺少参数 'path'（工作区相对路径）".to_string())
+        })?;
+
+    let recursive_opt = parse_optional_bool_arg(args, "recursive", "true")?;
+    let parents_opt = parse_optional_bool_arg(args, "parents", "true")?;
+    let recursive = match (recursive_opt, parents_opt) {
+        (None, None) => true,
+        (Some(flag), None) | (None, Some(flag)) => flag,
+        (Some(left), Some(right)) if left == right => left,
+        (Some(_), Some(_)) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'recursive' 与 'parents' 必须一致（均为 mkdir -p 别名，默认 true）"
+                    .to_string(),
+            ));
+        }
+    };
+
+    Ok(MkdirArgs {
+        path: path.to_string(),
+        recursive,
+    })
+}
+
+/// 解析工作区相对创建目标。
+///
+/// 已存在路径 canonicalize 后必须落在工作区内；不存在时沿已存在祖先
+/// canonicalize，再拼回剩余组件（可随后创建中间目录）。
+///
+/// 返回 `(path, existed)`：`existed` 表示目标路径本身已存在。
+fn prepare_workspace_create_path(
+    workspace: &Path,
+    rel_path: &str,
+) -> Result<(PathBuf, bool), JiaClawError> {
     let joined = resolve_workspace_relative_path(workspace, rel_path)?;
     let ws = canonicalize_existing_or_clone(workspace);
 
@@ -656,7 +723,7 @@ fn prepare_workspace_write_path(workspace: &Path, rel_path: &str) -> Result<Path
 
     if fs::symlink_metadata(&ancestor).is_err() {
         return Err(JiaClawError::ToolExecution(format!(
-            "无法解析写入路径 {rel_path}"
+            "无法解析路径 {rel_path}"
         )));
     }
     if !ancestor.exists() {
@@ -668,7 +735,7 @@ fn prepare_workspace_write_path(workspace: &Path, rel_path: &str) -> Result<Path
     ensure_existing_within_workspace(workspace, &ancestor)?;
     let mut current = ancestor
         .canonicalize()
-        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析写入路径 {rel_path}: {e}")))?;
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析路径 {rel_path}: {e}")))?;
     if !current.starts_with(&ws) {
         return Err(JiaClawError::ToolExecution(format!(
             "安全错误: 路径 {rel_path} 指向工作空间外部"
@@ -676,12 +743,7 @@ fn prepare_workspace_write_path(workspace: &Path, rel_path: &str) -> Result<Path
     }
 
     if suffix.is_empty() {
-        if !current.is_file() {
-            return Err(JiaClawError::ToolExecution(format!(
-                "路径不是文件: {rel_path}"
-            )));
-        }
-        return Ok(current);
+        return Ok((current, true));
     }
 
     if !current.is_dir() {
@@ -696,6 +758,18 @@ fn prepare_workspace_write_path(workspace: &Path, rel_path: &str) -> Result<Path
     if !current.starts_with(&ws) {
         return Err(JiaClawError::ToolExecution(format!(
             "安全错误: 路径 {rel_path} 指向工作空间外部"
+        )));
+    }
+    Ok((current, false))
+}
+
+/// 解析写入目标：已存在路径 canonicalize 后必须落在工作区内且为常规文件；
+/// 不存在时沿已存在祖先 canonicalize，再拼回剩余组件（可随后创建中间目录）。
+fn prepare_workspace_write_path(workspace: &Path, rel_path: &str) -> Result<PathBuf, JiaClawError> {
+    let (current, existed) = prepare_workspace_create_path(workspace, rel_path)?;
+    if existed && !current.is_file() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不是文件: {rel_path}"
         )));
     }
     Ok(current)
@@ -1453,6 +1527,112 @@ pub fn glob_workspace(workspace: &Path, args: &GlobArgs) -> Result<GlobOutput, J
     })
 }
 
+fn mkdir_existing_dir_result(
+    workspace: &Path,
+    dest: &Path,
+    rel_path: &str,
+    recursive: bool,
+) -> Result<MkdirOutput, JiaClawError> {
+    ensure_existing_within_workspace(workspace, dest)?;
+    let canon = dest
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析目录 {rel_path}: {e}")))?;
+    let ws = canonicalize_existing_or_clone(workspace);
+    if !canon.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 路径 {rel_path} 指向工作空间外部"
+        )));
+    }
+    if !canon.is_dir() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径已存在且不是目录: {rel_path}"
+        )));
+    }
+    Ok(MkdirOutput {
+        path: rel_path.to_string(),
+        created: false,
+        existed: true,
+        recursive,
+    })
+}
+
+/// 在工作区相对路径创建目录。默认 `recursive=true`（等价 `mkdir -p`）。
+///
+/// 目标已存在且为目录时幂等成功（`created=false`，`existed=true`）。
+/// 已存在且为文件时报错。创建后 canonicalize 仍须落在工作区内。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、symlink 逃逸、目标是文件、非递归时父目录不存在，或 IO 失败时返回错误。
+pub fn mkdir_workspace(
+    workspace: &Path,
+    rel_path: &str,
+    recursive: bool,
+) -> Result<MkdirOutput, JiaClawError> {
+    let (dest, existed) = prepare_workspace_create_path(workspace, rel_path)?;
+    if existed {
+        return mkdir_existing_dir_result(workspace, &dest, rel_path, recursive);
+    }
+
+    if recursive {
+        fs::create_dir_all(&dest).map_err(|err| {
+            if dest.exists() && !dest.is_dir() {
+                JiaClawError::ToolExecution(format!("路径已存在且不是目录: {rel_path}"))
+            } else {
+                JiaClawError::ToolExecution(format!("无法创建目录 {rel_path}: {err}"))
+            }
+        })?;
+    } else {
+        let parent = dest
+            .parent()
+            .ok_or_else(|| JiaClawError::ToolExecution(format!("无效的目录路径: {rel_path}")))?;
+        if !parent.exists() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "父目录不存在（recursive/parents=false，需先创建上级或使用默认 mkdir -p）: {rel_path}"
+            )));
+        }
+        if !parent.is_dir() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径的父级不是目录: {rel_path}"
+            )));
+        }
+        match fs::create_dir(&dest) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return mkdir_existing_dir_result(workspace, &dest, rel_path, recursive);
+            }
+            Err(err) => {
+                return Err(JiaClawError::ToolExecution(format!(
+                    "无法创建目录 {rel_path}: {err}"
+                )));
+            }
+        }
+    }
+
+    ensure_existing_within_workspace(workspace, &dest)?;
+    let canon = dest
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析目录 {rel_path}: {e}")))?;
+    let ws = canonicalize_existing_or_clone(workspace);
+    if !canon.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 路径 {rel_path} 指向工作空间外部"
+        )));
+    }
+    if !canon.is_dir() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不是目录: {rel_path}"
+        )));
+    }
+
+    Ok(MkdirOutput {
+        path: rel_path.to_string(),
+        created: true,
+        existed: false,
+        recursive,
+    })
+}
+
 fn slice_lines(content: &str, offset: usize, limit: Option<usize>) -> (String, usize, usize, bool) {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -1763,6 +1943,19 @@ pub struct GlobOutput {
     pub match_count: usize,
     /// 工作区相对路径（已排序）
     pub matches: Vec<String>,
+}
+
+/// `mkdir` 的 JSON 返回体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MkdirOutput {
+    /// 调用方传入的工作区相对路径
+    pub path: String,
+    /// 是否新创建了目录（已存在则为 `false`）
+    pub created: bool,
+    /// 调用前目标是否已作为目录存在
+    pub existed: bool,
+    /// 实际使用的 recursive/parents 值
+    pub recursive: bool,
 }
 
 /// `read_file` 工具：读取工作区相对路径下的文本文件（路径沙箱，不调用 LLM）。
@@ -2229,6 +2422,62 @@ impl Tool for WorkspaceGlobTool {
         let output = glob_workspace(&self.workspace_path, &parsed)?;
         serde_json::to_string_pretty(&output)
             .map_err(|e| JiaClawError::ToolExecution(format!("序列化 glob 结果失败: {e}")))
+    }
+}
+
+/// `mkdir` 工具：创建工作区相对路径下的目录（路径沙箱，不调用 LLM）。
+pub struct WorkspaceMkdirTool {
+    workspace_path: PathBuf,
+}
+
+impl WorkspaceMkdirTool {
+    /// 创建工具。
+    #[must_use]
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WorkspaceMkdirTool {
+    fn name(&self) -> &str {
+        "mkdir"
+    }
+
+    fn description(&self) -> &str {
+        "创建工作区相对路径下的目录。path 必填；可选 recursive / parents（默认 true，等价 mkdir -p）。目录已存在则幂等成功（created=false, existed=true）。若路径已存在且为文件则报错。禁止 .. / 绝对路径 / symlink 逃逸。创建后 canonicalize 必须仍落在工作区。不执行 shell，不调用 LLM。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要创建的目录相对路径（相对于工作区根目录）"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "是否创建中间目录（默认 true，等价 mkdir -p；与 parents 为别名）",
+                    "default": true
+                },
+                "parents": {
+                    "type": "boolean",
+                    "description": "recursive 的别名（默认 true，等价 mkdir -p）",
+                    "default": true
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let parsed = parse_mkdir_args(&args)?;
+        let output = mkdir_workspace(&self.workspace_path, &parsed.path, parsed.recursive)?;
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化 mkdir 结果失败: {e}")))
     }
 }
 
@@ -3622,6 +3871,198 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("不存在"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn parse_mkdir_args_requires_path_and_defaults_recursive() {
+        let err = parse_mkdir_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path"), "{err}");
+
+        let err = parse_mkdir_args(&serde_json::json!({"path": "   "}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path"), "{err}");
+
+        let parsed = parse_mkdir_args(&serde_json::json!({"path": " notes/deep "})).unwrap();
+        assert_eq!(parsed.path, "notes/deep");
+        assert!(parsed.recursive);
+
+        let parsed = parse_mkdir_args(&serde_json::json!({
+            "path": "a",
+            "recursive": false
+        }))
+        .unwrap();
+        assert!(!parsed.recursive);
+
+        let parsed = parse_mkdir_args(&serde_json::json!({
+            "path": "a",
+            "parents": false
+        }))
+        .unwrap();
+        assert!(!parsed.recursive);
+
+        let parsed = parse_mkdir_args(&serde_json::json!({
+            "path": "a",
+            "recursive": true,
+            "parents": true
+        }))
+        .unwrap();
+        assert!(parsed.recursive);
+
+        let err = parse_mkdir_args(&serde_json::json!({
+            "path": "a",
+            "recursive": true,
+            "parents": false
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("recursive") && err.contains("parents"),
+            "{err}"
+        );
+
+        let err = parse_mkdir_args(&serde_json::json!({
+            "path": "a",
+            "recursive": "yes"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("recursive"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mkdir_creates_nested_dirs_and_is_idempotent() {
+        let ws = unique_temp("jiaclaw_mkdir_ok");
+        let tool = WorkspaceMkdirTool::new(&ws);
+        assert_eq!(tool.name(), "mkdir");
+
+        let created = tool
+            .execute(serde_json::json!({"path": "notes/deep"}))
+            .await
+            .unwrap();
+        let parsed: MkdirOutput = serde_json::from_str(&created).unwrap();
+        assert_eq!(parsed.path, "notes/deep");
+        assert!(parsed.created);
+        assert!(!parsed.existed);
+        assert!(parsed.recursive);
+        assert!(ws.join("notes").join("deep").is_dir());
+
+        let again = tool
+            .execute(serde_json::json!({"path": "notes/deep"}))
+            .await
+            .unwrap();
+        let parsed: MkdirOutput = serde_json::from_str(&again).unwrap();
+        assert!(!parsed.created);
+        assert!(parsed.existed);
+        assert!(ws.join("notes").join("deep").is_dir());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_existing_file() {
+        let ws = unique_temp("jiaclaw_mkdir_file");
+        fs::write(ws.join("notes.md"), "not-a-dir").unwrap();
+        let tool = WorkspaceMkdirTool::new(&ws);
+        let err = tool
+            .execute(serde_json::json!({"path": "notes.md"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不是目录") || err.contains("文件"), "{err}");
+        assert!(ws.join("notes.md").is_file());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn mkdir_non_recursive_requires_parent() {
+        let ws = unique_temp("jiaclaw_mkdir_norecurse");
+        let tool = WorkspaceMkdirTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "missing/child",
+                "recursive": false
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("父目录不存在"), "{err}");
+        assert!(!ws.join("missing").exists());
+
+        let created = tool
+            .execute(serde_json::json!({
+                "path": "notes",
+                "parents": false
+            }))
+            .await
+            .unwrap();
+        let parsed: MkdirOutput = serde_json::from_str(&created).unwrap();
+        assert!(parsed.created);
+        assert!(!parsed.recursive);
+        assert!(ws.join("notes").is_dir());
+
+        let nested = tool
+            .execute(serde_json::json!({
+                "path": "notes/leaf",
+                "recursive": false
+            }))
+            .await
+            .unwrap();
+        let parsed: MkdirOutput = serde_json::from_str(&nested).unwrap();
+        assert!(parsed.created);
+        assert!(ws.join("notes").join("leaf").is_dir());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_traversal_and_absolute() {
+        let ws = unique_temp("jiaclaw_mkdir_trav");
+        let tool = WorkspaceMkdirTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({"path": "../secret-dir"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+        assert!(!ws.parent().unwrap().join("secret-dir").exists());
+
+        let err = tool
+            .execute(serde_json::json!({"path": "/tmp/jiaclaw-mkdir-escape"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mkdir_rejects_symlink_escape() {
+        let ws = unique_temp("jiaclaw_mkdir_symlink");
+        let outside_dir = ws.parent().unwrap().join(format!(
+            "jiaclaw_mkdir_outside_dir_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, ws.join("escape")).unwrap();
+
+        let tool = WorkspaceMkdirTool::new(&ws);
+        let result = tool.execute(serde_json::json!({"path": "escape"})).await;
+        assert!(result.is_err(), "symlink 目录逃逸应被拒绝: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("安全") || err.contains("工作空间"), "{err}");
+
+        let nested = tool
+            .execute(serde_json::json!({"path": "escape/pwned"}))
+            .await;
+        assert!(nested.is_err(), "经 symlink 创建子目录应被拒绝: {nested:?}");
+        assert!(!outside_dir.join("pwned").exists());
+
+        let _ = fs::remove_dir_all(&outside_dir);
         let _ = fs::remove_dir_all(&ws);
     }
 }
