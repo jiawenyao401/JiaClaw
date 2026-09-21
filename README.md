@@ -73,6 +73,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 默认 `{workspace}/MEMORY.md`，可用 `[memory] path` 覆盖
   - 每次 `chat` 重读；过大截断（32KiB）并 warn
   - 本地工具 `memory_append` 追加/覆盖；`jiaclaw doctor` / `jiaclaw memory show`
+- ✅ **工作区 SOUL.md / USER.md** - 可选人格与用户画像注入系统提示
+  - 默认 `{workspace}/SOUL.md`、`USER.md`，可用 `[identity] soul_path` / `user_path` 覆盖
+  - 每次 `chat` 重读；存在且非空则注入独立区块；各文件独立 32KiB 截断并 warn
+  - 本地工具 `soul_write` / `user_write`（默认覆盖）；`jiaclaw doctor` / `jiaclaw soul show` / `jiaclaw user show`
 
 ### 待实现
 
@@ -154,6 +158,11 @@ persist_path = ".jiaclaw/sessions.json"
 [memory]
 # 工作区长期记忆（相对于 workspace，默认 MEMORY.md；缺省本段即可）
 path = "MEMORY.md"
+
+[identity]
+# 人格 / 用户画像（相对于 workspace；缺省本段即为 SOUL.md / USER.md）
+soul_path = "SOUL.md"
+user_path = "USER.md"
 ```
 
 或使用环境变量：
@@ -180,6 +189,10 @@ cargo run --bin jiaclaw -- doctor
 
 # 查看工作区长期记忆（MEMORY.md）
 cargo run --bin jiaclaw -- memory show
+
+# 查看人格 / 用户画像（可选；缺失不报错）
+cargo run --bin jiaclaw -- soul show
+cargo run --bin jiaclaw -- user show
 
 # 列出已发现的技能
 cargo run --bin jiaclaw -- skills
@@ -305,7 +318,7 @@ JiaClaw/
 │   ├── architecture.md
 │   ├── stateknot-gaps.md
 │   └── roadmap.md
-├── examples/             # 示例工作空间（含空 MEMORY.md 说明）
+├── examples/             # 示例工作空间（含 MEMORY.md / SOUL.md / USER.md 说明）
 ├── Cargo.toml            # 工作空间清单
 └── README.md
 ```
@@ -389,6 +402,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Default `{workspace}/MEMORY.md`, overridable via `[memory] path`
   - Re-read on every `chat`; truncate at 32KiB with a warning
   - Local tool `memory_append`; `jiaclaw doctor` / `jiaclaw memory show`
+- ✅ **Workspace SOUL.md / USER.md** - optional persona and user-profile injection
+  - Default `{workspace}/SOUL.md` and `USER.md`, overridable via `[identity] soul_path` / `user_path`
+  - Re-read on every `chat`; independent 32KiB truncation per file
+  - Local tools `soul_write` / `user_write` (replace by default); `jiaclaw soul show` / `jiaclaw user show`
 
 #### Pending
 
@@ -470,6 +487,11 @@ persist_path = ".jiaclaw/sessions.json"
 [memory]
 # Workspace long-term memory (relative to workspace, default MEMORY.md)
 path = "MEMORY.md"
+
+[identity]
+# Persona / user profile (relative to workspace; omit this section for SOUL.md / USER.md defaults)
+soul_path = "SOUL.md"
+user_path = "USER.md"
 ```
 
 Or use environment variable:
@@ -496,6 +518,10 @@ cargo run --bin jiaclaw -- doctor
 
 # Show workspace long-term memory (MEMORY.md)
 cargo run --bin jiaclaw -- memory show
+
+# Show persona / user profile (optional; missing files are fine)
+cargo run --bin jiaclaw -- soul show
+cargo run --bin jiaclaw -- user show
 
 # Run single chat (requires API key)
 export JIACLAW_API_KEY=brk_live_...
