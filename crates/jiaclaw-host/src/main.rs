@@ -38,6 +38,7 @@ use sha2::Sha256;
 use std::{
     collections::HashMap,
     convert::Infallible,
+    future::Future,
     num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -1571,6 +1572,14 @@ fn session_ttl_config_source() -> &'static str {
     }
 }
 
+fn shutdown_timeout_config_source() -> &'static str {
+    if std::env::var("JIACLAW_SHUTDOWN_TIMEOUT_SECS").is_ok() {
+        "环境变量 JIACLAW_SHUTDOWN_TIMEOUT_SECS"
+    } else {
+        "配置文件"
+    }
+}
+
 fn tool_timeout_config_source() -> &'static str {
     if std::env::var("JIACLAW_TOOL_TIMEOUT_SECS").is_ok() {
         "环境变量 JIACLAW_TOOL_TIMEOUT_SECS"
@@ -1872,7 +1881,7 @@ fn purge_expired_sessions(state: &AppState) -> usize {
     removed
 }
 
-fn spawn_session_ttl_sweeper(state: AppState) {
+fn spawn_session_ttl_sweeper(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(SESSION_TTL_SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1884,7 +1893,112 @@ fn spawn_session_ttl_sweeper(state: AppState) {
                 tracing::info!("Session TTL 扫描移除 {removed} 个过期会话");
             }
         }
+    })
+}
+
+/// serve 进程内后台任务，优雅退出时 abort，避免进程退出后仍跑。
+struct BackgroundTasks {
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    ttl_sweeper: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BackgroundTasks {
+    fn abort(&self) {
+        if let Some(handle) = &self.heartbeat {
+            tracing::info!("正在停止 Heartbeat 后台任务");
+            handle.abort();
+        }
+        if let Some(handle) = &self.ttl_sweeper {
+            tracing::info!("正在停止 Session TTL 扫描任务");
+            handle.abort();
+        }
+    }
+}
+
+/// 关闭路径刷盘：与正常 persist 相同的原子 `save_sessions`。
+///
+/// 失败打 error 并返回 `false`，调用方仍继续退出。
+fn flush_sessions_on_shutdown(state: &AppState) -> bool {
+    if !state.persist_enabled {
+        tracing::info!("Session 持久化未启用，跳过关闭刷盘");
+        return true;
+    }
+
+    let sessions = match state.sessions.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!("关闭时 sessions 锁已毒化，无法刷盘: {poisoned}");
+            return false;
+        }
+    };
+
+    let raw = messages_from_sessions(&sessions);
+    match save_sessions(&state.persist_path, &raw) {
+        Ok(()) => {
+            tracing::info!(
+                count = sessions.len(),
+                path = %state.persist_path.display(),
+                "关闭时已刷盘 sessions"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!("关闭时保存 sessions 失败: {e}");
+            false
+        }
+    }
+}
+
+/// 用 axum `with_graceful_shutdown` 停止 accept，并给进行中请求一个宽限期。
+async fn serve_with_graceful_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    state: AppState,
+    shutdown: F,
+    shutdown_timeout: Duration,
+    background: BackgroundTasks,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown.await;
+        tracing::info!("收到关闭信号，停止接受新连接，等待进行中请求结束");
+        background.abort();
+        let _ = shutdown_started_tx.send(());
     });
+
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => {
+            result.context("服务器运行失败")?;
+        }
+        _ = shutdown_started_rx => {
+            match tokio::time::timeout(shutdown_timeout, &mut server).await {
+                Ok(Ok(())) => {
+                    tracing::info!("进行中请求已完成");
+                }
+                Ok(Err(e)) => {
+                    return Err(e).context("服务器运行失败");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        secs = shutdown_timeout.as_secs(),
+                        "优雅退出宽限期已到，结束剩余连接"
+                    );
+                }
+            }
+        }
+    }
+
+    if !flush_sessions_on_shutdown(&state) {
+        tracing::warn!("关闭时 sessions 刷盘失败，仍继续退出");
+    }
+    tracing::info!("服务器已关闭");
+    Ok(())
 }
 
 /// Webhook 入站响应
@@ -1962,6 +2076,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     // 读取会话闲置 TTL（环境变量优先于配置文件）
     let session_ttl_secs = config.http.effective_session_ttl_secs();
     let session_ttl = session_ttl_secs.map(Duration::from_secs);
+    let shutdown_timeout_secs = config.http.effective_shutdown_timeout_secs();
+    let shutdown_timeout = Duration::from_secs(shutdown_timeout_secs);
     let metrics_public = config.http.effective_metrics_public();
     let metrics_require_auth = !metrics_public;
 
@@ -1999,12 +2115,14 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         metrics_require_auth,
     };
 
+    let mut ttl_sweeper = None;
     if state.session_ttl.is_some() {
-        spawn_session_ttl_sweeper(state.clone());
+        ttl_sweeper = Some(spawn_session_ttl_sweeper(state.clone()));
     }
 
     let heartbeat_interval_secs = config.heartbeat.effective_interval_secs();
-    if maybe_spawn_heartbeat(state.clone(), &config, None).is_some() {
+    let heartbeat_handle = maybe_spawn_heartbeat(state.clone(), &config, None);
+    if heartbeat_handle.is_some() {
         tracing::info!(
             interval_secs = heartbeat_interval_secs,
             session_id = config.heartbeat.effective_session_id(),
@@ -2042,6 +2160,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     };
 
     // 构建路由（限流中间件不依赖 ConnectInfo，oneshot 测试不会 500）
+    let shutdown_state = state.clone();
     let app = build_router(state).layer(cors);
 
     // 绑定地址
@@ -2104,6 +2223,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • Session TTL: 未启用");
     }
+    tracing::info!("   • 优雅退出: 支持 SIGINT/SIGTERM（宽限期 {shutdown_timeout_secs} 秒）");
     tracing::info!(
         "   • Session 摘要压缩: {}",
         session_summarize_status_line(&config)
@@ -2267,6 +2387,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         println!("   • Session TTL: ⚠️  未启用（会话不会因闲置过期）");
     }
 
+    println!(
+        "   • 优雅退出: ✅ 支持 SIGINT/SIGTERM（宽限期 {shutdown_timeout_secs} 秒，通过 {}）",
+        shutdown_timeout_config_source()
+    );
+
     if config.session.effective_summarize_on_overflow() {
         println!(
             "   • Session 摘要压缩: ✅ {}",
@@ -2352,16 +2477,21 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
 
     println!("\n💡 试试：curl http://{}/health", config.http.bind);
     println!("         curl http://{}/metrics", config.http.bind);
-    println!("按 Ctrl+C 停止服务\n");
+    println!("支持 SIGINT/SIGTERM 优雅退出（宽限期 {shutdown_timeout_secs} 秒）");
+    println!("按 Ctrl+C 或发送 SIGTERM 停止服务\n");
 
-    // 启动服务器
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("服务器运行失败")?;
-
-    tracing::info!("服务器已关闭");
-    Ok(())
+    serve_with_graceful_shutdown(
+        listener,
+        app,
+        shutdown_state,
+        shutdown_signal(),
+        shutdown_timeout,
+        BackgroundTasks {
+            heartbeat: heartbeat_handle,
+            ttl_sweeper,
+        },
+    )
+    .await
 }
 
 /// 检查 API Token 鉴权
@@ -3377,10 +3507,33 @@ impl IntoResponse for AppError {
     }
 }
 
-/// 优雅关闭信号
+/// 优雅关闭信号（SIGINT / Ctrl+C 与 Unix SIGTERM）
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c().await.expect("等待 Ctrl+C 信号失败");
-    tracing::info!("收到关闭信号，正在停止服务器...");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("等待 Ctrl+C 信号失败");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("安装 SIGTERM 处理器失败: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    tracing::info!("收到 SIGINT/SIGTERM，开始优雅退出");
 }
 
 fn persist_path_from_config(config: &AgentConfig) -> PathBuf {
@@ -4322,6 +4475,12 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_SESSION_TTL_SECS=3600");
     }
 
+    let shutdown_timeout_secs = config.http.effective_shutdown_timeout_secs();
+    println!(
+        "   优雅退出宽限期: {shutdown_timeout_secs} 秒（SIGINT/SIGTERM，通过 {}）",
+        shutdown_timeout_config_source()
+    );
+
     if config.session.effective_summarize_on_overflow() {
         println!(
             "   Session 摘要压缩: ✅ {}",
@@ -4465,6 +4624,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
             "未启用".to_string()
         }
     );
+    println!("   • 优雅退出宽限期: {shutdown_timeout_secs} 秒（SIGINT/SIGTERM）");
     println!(
         "   • Session 摘要压缩: {}",
         session_summarize_status_line(&config)
@@ -6132,6 +6292,117 @@ mod tests {
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_handle_abort_is_cancelled() {
+        let config = heartbeat_config(true, 3600, "HEARTBEAT.md");
+        let state = test_state_for_workspace(config.workspace_path.clone());
+        let handle = maybe_spawn_heartbeat(state, &config, None).expect("enabled=true 应启动任务");
+        assert!(!handle.is_finished(), "未 abort 前心跳任务应仍在运行");
+        let tasks = BackgroundTasks {
+            heartbeat: Some(handle),
+            ttl_sweeper: None,
+        };
+        tasks.abort();
+        let joined = tasks.heartbeat.expect("handle").await.unwrap_err();
+        assert!(joined.is_cancelled(), "heartbeat handle 应被取消");
+        let _ = std::fs::remove_dir_all(&config.workspace_path);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_flushes_sessions_when_persist_enabled() {
+        let persist_path = std::env::temp_dir().join(format!(
+            "jiaclaw-shutdown-persist-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let session_id = "shutdown-save".to_string();
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            session_id.clone(),
+            SessionRecord::new(vec![ChatMessage {
+                role: MessageRole::User,
+                content: "persist-on-shutdown".to_string(),
+            }]),
+        );
+
+        let mut state = test_state_for_workspace(unique_workspace("jiaclaw-shutdown"));
+        state.persist_enabled = true;
+        state.persist_path = Arc::new(persist_path.clone());
+        state.sessions = Arc::new(Mutex::new(sessions));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let app = build_router(state.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let serve = tokio::spawn(async move {
+            serve_with_graceful_shutdown(
+                listener,
+                app,
+                state,
+                async {
+                    let _ = rx.await;
+                },
+                Duration::from_secs(1),
+                BackgroundTasks {
+                    heartbeat: None,
+                    ttl_sweeper: None,
+                },
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        let _ = tx.send(());
+        serve
+            .await
+            .expect("join serve task")
+            .expect("graceful shutdown");
+
+        let loaded = load_sessions(&persist_path);
+        let rec = loaded.get(&session_id).expect("shutdown 应刷盘 session");
+        assert_eq!(rec[0].content, "persist-on-shutdown");
+        std::fs::remove_file(&persist_path).ok();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_skips_flush_when_persist_disabled() {
+        let persist_path = std::env::temp_dir().join(format!(
+            "jiaclaw-shutdown-nopersist-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s".to_string(),
+            SessionRecord::new(vec![ChatMessage {
+                role: MessageRole::User,
+                content: "should-not-write".to_string(),
+            }]),
+        );
+        let mut state = test_state_for_workspace(unique_workspace("jiaclaw-shutdown-off"));
+        state.persist_enabled = false;
+        state.persist_path = Arc::new(persist_path.clone());
+        state.sessions = Arc::new(Mutex::new(sessions));
+
+        assert!(flush_sessions_on_shutdown(&state));
+        assert!(!persist_path.exists(), "persist=false 时 shutdown 不得写盘");
+    }
+
+    #[test]
+    fn default_shutdown_timeout_parse_is_15() {
+        assert_eq!(
+            jiaclaw_core::resolve_shutdown_timeout_secs(0, None),
+            jiaclaw_core::DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
+        assert_eq!(jiaclaw_core::resolve_shutdown_timeout_secs(15, None), 15);
+        assert_eq!(
+            jiaclaw_core::parse_positive_shutdown_timeout("15"),
+            Some(15)
+        );
+        assert_eq!(jiaclaw_core::parse_positive_shutdown_timeout("0"), None);
+        assert_eq!(jiaclaw_core::parse_positive_shutdown_timeout("abc"), None);
     }
 
     #[tokio::test]

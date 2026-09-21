@@ -124,6 +124,11 @@ persist_path = ".jiaclaw/sessions.json"
 # 未设置或 0：不启用。create/chat/get/list 触达会刷新 last_accessed。
 # session_ttl_secs = 3600
 
+# 优雅退出宽限期（可选，环境变量 JIACLAW_SHUTDOWN_TIMEOUT_SECS 优先）
+# 收到 SIGINT/SIGTERM 后停止接受新连接，尽量完成进行中请求，超时则丢弃剩余连接。
+# 正整数生效；未设置、0 或非法回退默认 15 秒。落盘开启时关闭路径会再刷一次 sessions。
+# shutdown_timeout_secs = 15
+
 [session]
 # 接近消息条数上限（50）时是否摘要压缩（默认 false，保持硬截断）
 # 环境变量 JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true 可强制开启
