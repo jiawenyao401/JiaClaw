@@ -65,6 +65,9 @@
       },
       "memory_search": {
         "enabled": true
+      },
+      "memory_write": {
+        "enabled": true
       }
     }
 }

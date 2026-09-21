@@ -123,12 +123,12 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
 | **短期记忆** | ✅ 会话历史 | ✅ 上下文窗口 | ✅ 基础（ChatRequest） | P0 | - |
-| **工作区 MEMORY.md** | ✅ 文件注入 | ✅ MEMORY.md 注入 | ✅ **每次 chat 注入 + memory_append + memory_search** | P1 | - |
+| **工作区 MEMORY.md** | ✅ 文件注入 | ✅ MEMORY.md 注入 | ✅ **每次 chat 注入 + memory_write + memory_search** | P1 | - |
 | **工作区 SOUL.md / USER.md** | ✅ 人格与用户画像 | ✅ SOUL/USER 注入 | ✅ **每次 chat 注入 + soul_write/user_write** | P1 | - |
 | **工作区 HEARTBEAT.md** | ✅ 定时注入 | ⏳ 部分 | ✅ **serve 内可选定时 chat** | P2 | - |
 | **长期记忆（向量）** | ✅ 向量数据库 (ChromaDB/Pinecone) | ✅ 嵌入检索 | ⏳ 计划中（M3） | P1 | StateKnot 持久化层 |
 | **语义搜索** | ✅ 完整 | ✅ 完整 | ✅ **本地 memory_search（子串/行窗，无向量库）** | P1 | 向量检索仍待 M3 |
-| **记忆编辑** | ✅ API 支持 | ⏳ 部分 | ⏳ 计划中（M3） | P2 | - |
+| **记忆编辑** | ✅ API 支持 | ⏳ 部分 | ✅ **本地 memory_write（append/overwrite）** | P2 | 远程 API 仍待 M3 |
 | **时间旅行** | ❌ 无 | ❌ 无 | ✅ **StateKnot 原生** | P1 | StateKnot Checkpoint |
 | **Fork/Branch** | ❌ 无 | ❌ 无 | ✅ **StateKnot 原生** | P1 | StateKnot Graph Fork |
 
@@ -140,9 +140,11 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - `JiaClawAgent::chat` / `build_system_prompt` 在每次对话开始时重读；存在且非空则注入固定区块（`## Long-term Memory（长期记忆）`，内容原样）
   - 超过 32KiB 截断并 `warn`
   - 工具 `memory_append`：`content` 追加 Markdown，可选 `replace`（默认 false）；只能写约定路径，禁止穿越；追加为读-改-写 + 原子 rename，带换行分隔
+  - 工具 `memory_write`：可选、默认注册；`content` 必填，`mode=append|overwrite`（默认 append）；只写配置的 MEMORY.md / `[memory] path`，忽略 `path` 参数
+  - 结果文件超过 32KiB（与注入截断对齐）时明确报错且不落盘；tmp + rename 原子写；返回 `{path, mode, bytes_written}`，不调用 LLM
   - 工具 `memory_search`：只读关键词/子串检索（大小写不敏感 + 行窗）；默认扫描配置的 MEMORY / SOUL / USER；可选 `paths` 为工作区安全相对路径
   - `query` 必填，`max_results` 默认 5、钳制 1..=20；返回 `{path, line, excerpt}` JSON；单文件超过 512KiB 截断并 warn
-  - 路径安全复用现有 resolve（禁 `..`、绝对路径、symlink 逃逸）；`[tools.memory_search] enabled` 默认 true；**不引入向量数据库**
+  - 路径安全复用现有 resolve（禁 `..`、绝对路径、symlink 逃逸）；`[tools.memory_search]` / `[tools.memory_write] enabled` 默认 true；**不引入向量数据库或远程 sync**
   - `jiaclaw doctor` 报告 MEMORY 是否存在及大小；`jiaclaw memory show` 查看内容
 - ✅ **工作区 `SOUL.md` / `USER.md` 人格与用户画像注入**（对照 OpenClaw/Hermes 身份文件）
   - 约定路径：`{workspace}/SOUL.md`、`USER.md`，可用 `[identity] soul_path` / `user_path` 覆盖（缺省配置兼容）
@@ -270,6 +272,10 @@ triggers:
   - 大小写不敏感子串 + 行窗；返回 `{path, line, excerpt}`；单文件 512KiB 上限
   - 路径安全复用 resolve（禁穿越 / 绝对路径 / symlink 逃逸）；**无向量数据库**
   - `enabled = false` 不注册；`GET /api/tools` / system prompt / doctor 与其它可选工具并列
+- ✅ **可选 memory_write**（默认注册；`content` 必填，`mode=append|overwrite` 默认 append）
+  - 只写配置的 MEMORY.md / `[memory] path`；忽略 `path` 参数，禁止穿越
+  - 结果文件超过 32KiB 明确报错且不落盘；tmp + rename 原子写；返回 `{path, mode, bytes_written}`，不调用 LLM
+  - `enabled = false` 不注册；无危险 shell；不引入向量库或远程 sync
 - ✅ **可选每工具调用超时**（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`，正整数启用；`0`/非法=关闭）
   - 对每次 `Tool::execute` 用 `tokio::time::timeout` 包裹；超时写入 `Tool timed out after Ns` 到 tool result，不 panic，继续 loop
   - 未配置时行为不变（不限制）
@@ -394,7 +400,7 @@ triggers:
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
 | **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
 | **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
-| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/TTL/摘要压缩/工具超时/工具循环上限/Heartbeat/web_search/web_fetch/memory_search/metrics/优雅退出** | P1 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/TTL/摘要压缩/工具超时/工具循环上限/Heartbeat/web_search/web_fetch/memory_search/memory_write/metrics/优雅退出** | P1 | - |
 | **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
 | **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
@@ -408,7 +414,8 @@ triggers:
 - ✅ 可选 `web_search`（`[tools.web_search] enabled` / `brave_api_key`，`JIACLAW_BRAVE_API_KEY` 优先；doctor 不打印 key）
 - ✅ 可选 `web_fetch`（`[tools.web_fetch] enabled` / `allow_private`；默认拒绝私网；doctor 报告是否启用）
 - ✅ 可选 `memory_search`（`[tools.memory_search] enabled` 默认 true；默认扫描 MEMORY / SOUL / USER；doctor 报告是否启用）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Metrics 是否公开、Session TTL、优雅退出宽限期、Session 摘要压缩、工具超时、工具循环上限、web_search key 是否配置、web_fetch 是否启用、memory_search 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
+- ✅ 可选 `memory_write`（`[tools.memory_write] enabled` 默认 true；只写配置的 MEMORY.md；doctor 报告是否启用）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Metrics 是否公开、Session TTL、优雅退出宽限期、Session 摘要压缩、工具超时、工具循环上限、web_search key 是否配置、web_fetch 是否启用、memory_search / memory_write 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
@@ -427,10 +434,11 @@ triggers:
   - 可选 web_search（`[tools.web_search]`，Brave Search；无 key 友好错误；doctor 不打印 key）
   - 可选 web_fetch（`[tools.web_fetch]`，HTML 去标签；默认拒绝私网；最多 5 次重定向 / ~15s）
   - 可选 memory_search（`[tools.memory_search]`，工作区子串/行窗检索；默认扫描 MEMORY / SOUL / USER；无向量库）
+  - 可选 memory_write（`[tools.memory_write]`，只写配置的 MEMORY.md；append/overwrite；上限 32KiB；无向量库/远程 sync）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小
-  - HTTP 配置摘要（bind、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
+  - HTTP 配置摘要（bind、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
@@ -541,6 +549,7 @@ triggers:
 | 长期记忆（向量数据库） | M3 | - |
 | 工作区 MEMORY.md 注入 | ✅ 本切片 | - |
 | 工作区 memory_search 本地检索 | ✅ 本切片 | 无向量库 |
+| 工作区 memory_write 本地写入 | ✅ 本切片 | 无向量库 / 远程 sync |
 | 工作区 SOUL.md / USER.md 注入 | ✅ 本切片 | - |
 | 工作区 HEARTBEAT.md 定时心跳 | ✅ 本切片 | - |
 
