@@ -1961,36 +1961,40 @@ async fn serve_with_graceful_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        shutdown.await;
-        tracing::info!("收到关闭信号，停止接受新连接，等待进行中请求结束");
-        background.abort();
-        let _ = shutdown_started_tx.send(());
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
     });
 
-    tokio::pin!(server);
+    shutdown.await;
+    tracing::info!("收到关闭信号，停止接受新连接，等待进行中请求结束");
+    background.abort();
+    let _ = shutdown_tx.send(());
 
-    tokio::select! {
-        result = &mut server => {
-            result.context("服务器运行失败")?;
+    match tokio::time::timeout(shutdown_timeout, server_task).await {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!("进行中请求已完成");
         }
-        _ = shutdown_started_rx => {
-            match tokio::time::timeout(shutdown_timeout, &mut server).await {
-                Ok(Ok(())) => {
-                    tracing::info!("进行中请求已完成");
-                }
-                Ok(Err(e)) => {
-                    return Err(e).context("服务器运行失败");
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        secs = shutdown_timeout.as_secs(),
-                        "优雅退出宽限期已到，结束剩余连接"
-                    );
-                }
+        Ok(Ok(Err(e))) => {
+            return Err(e).context("服务器运行失败");
+        }
+        Ok(Err(join_err)) => {
+            if join_err.is_cancelled() {
+                tracing::warn!("HTTP 服务任务已取消");
+            } else {
+                return Err(join_err).context("HTTP 服务任务失败");
             }
+        }
+        Err(_) => {
+            tracing::warn!(
+                secs = shutdown_timeout.as_secs(),
+                "优雅退出宽限期已到，结束剩余连接"
+            );
         }
     }
 
