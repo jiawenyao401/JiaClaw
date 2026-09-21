@@ -74,6 +74,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **serve 优雅退出** - `jiaclaw serve` 支持 SIGINT/SIGTERM
   - 停止接受新连接，尽量完成进行中请求；宽限期 `[http] shutdown_timeout_secs`（默认 15 秒），`JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先（正整数；非法回退默认）
   - 落盘开启时关闭路径原子刷盘 sessions；失败打 error 日志仍退出。Heartbeat 后台任务会被 abort
+- ✅ **技能热加载** - 改 `skills/**/SKILL.md` 后无需重启 `serve`
+  - `POST /api/skills/reload` 重扫工作区并替换进程内注册表；失败保留旧表
+  - Unix：向 serve 发送 `SIGHUP` 走同一路径；Windows 仅 HTTP
+  - CLI：`jiaclaw skills reload` 只扫描当前工作区，不通知已运行的 serve
 - ✅ **可选 Session 摘要压缩** - 接近消息条数上限时把旧消息折叠成一条摘要，避免硬截断丢上下文
   - 配置 `[session] summarize_on_overflow`（默认 `false`，保持现有丢弃最旧消息行为）或环境变量 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` 强制开启
   - `keep_recent` 默认 10；复用当前 LLM provider，固定中英 prompt，无工具且限制 `max_tokens`；失败 warn 并回退硬截断，不让 chat 失败
@@ -352,6 +356,10 @@ cargo run --bin jiaclaw -- session import session.jsonl --id restored-id --overw
 cargo run --bin jiaclaw -- skills
 cargo run --bin jiaclaw -- skills --verbose  # 显示详细信息
 
+# 重新扫描工作区 skills/（只扫描本进程；不会通知已运行的 serve）
+cargo run --bin jiaclaw -- skills reload
+# 运行中的 serve：POST /api/skills/reload，或 Unix 向进程发送 SIGHUP（Windows 仅 HTTP）
+
 # 运行单次聊天（需要配置 API key）
 export JIACLAW_API_KEY=brk_live_...
 cargo run --bin jiaclaw -- chat "你好，JiaClaw"
@@ -411,8 +419,11 @@ curl http://127.0.0.1:8080/api/openapi.json
 # 列出已注册的工具
 curl http://127.0.0.1:8080/api/tools
 
-# 列出已发现的技能
+# 列出已发现的技能（进程内注册表；启动或最近一次 reload 的结果）
 curl http://127.0.0.1:8080/api/skills
+
+# 热加载技能（改 skills/**/SKILL.md 后无需重启 serve）
+curl -X POST http://127.0.0.1:8080/api/skills/reload
 
 # 列出会话（创建后可见；message_count 为内存中当前条数）
 curl http://127.0.0.1:8080/api/sessions
@@ -538,6 +549,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 Prometheus 指标：`GET /metrics` 默认公开；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。进程内计数（HTTP 路由族、session 数、工具调用、build_info），不引入 telemetry SDK
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET/export 为 404
 - serve 优雅退出：`jiaclaw serve` 支持 SIGINT/SIGTERM；停止 accept 并等待进行中请求。`[http] shutdown_timeout_secs` 默认 15 秒，`JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先（正整数；非法回退默认）。落盘开启时关闭路径刷盘；Heartbeat 任务 abort
+- 技能热加载：`POST /api/skills/reload` 重扫 `skills/` 并替换进程内表，失败保留旧表。Unix `SIGHUP` 同样路径；Windows 仅 HTTP。`jiaclaw skills reload` 只扫描当前工作区，不通知 serve
 - 可选 Session 摘要压缩：设置 `[session] summarize_on_overflow = true` 或 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` 后，接近上限时把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`（默认 10）条；未开启则仍硬截断。摘要失败会 warn 并回退截断，chat 不失败
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
 - 可配置工具循环上限：设置 `JIACLAW_MAX_TOOL_ITERATIONS` 或 `[agent] max_tool_iterations`（默认 5）；正整数生效，`0`/非法忽略，钳制 1–32。达上限时写入 tool/assistant 提示并结束本轮
@@ -650,6 +662,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Graceful serve shutdown** - `jiaclaw serve` handles SIGINT/SIGTERM
   - Stops accepting, drains in-flight requests; grace period `[http] shutdown_timeout_secs` (default 15s), `JIACLAW_SHUTDOWN_TIMEOUT_SECS` wins (positive integer; invalid falls back to default)
   - When persist is on, shutdown flushes sessions atomically; save failure is logged and the process still exits. Heartbeat background tasks are aborted
+- ✅ **Skill hot-reload** - changing `skills/**/SKILL.md` does not require restarting `serve`
+  - `POST /api/skills/reload` rescan the workspace and replace the in-process registry; failures keep the old table
+  - Unix: `SIGHUP` uses the same path; Windows is HTTP-only
+  - CLI: `jiaclaw skills reload` scans this process only and does not notify a running serve
 - ✅ **Optional session summary compression** - fold older messages into one summary near the session cap instead of dropping them
   - Configure `[session] summarize_on_overflow` (default `false`, keeps hard truncation) or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` to force-enable
   - `keep_recent` defaults to 10; reuses the current LLM provider with a fixed bilingual prompt, no tools, and a small `max_tokens`; on failure, warn and fall back to truncation without failing chat
@@ -923,7 +939,13 @@ cargo run --bin jiaclaw -- session export <session-id> -o session.jsonl
 cargo run --bin jiaclaw -- session import session.jsonl
 cargo run --bin jiaclaw -- session import session.jsonl --id restored-id --overwrite
 
-# Run single chat (requires API key)
+# List discovered skills
+cargo run --bin jiaclaw -- skills
+cargo run --bin jiaclaw -- skills --verbose
+
+# Rescan workspace skills/ (this CLI process only; does not notify a running serve)
+cargo run --bin jiaclaw -- skills reload
+# For a running serve: POST /api/skills/reload, or send SIGHUP on Unix (HTTP only on Windows)
 export JIACLAW_API_KEY=brk_live_...
 cargo run --bin jiaclaw -- chat "Hello, JiaClaw"
 
@@ -976,6 +998,12 @@ curl -D - http://127.0.0.1:8080/metrics
 
 # OpenAPI 3 sketch (anonymous when no API token; Bearer required when token is enabled, same as /api/tools)
 curl http://127.0.0.1:8080/api/openapi.json
+
+# List loaded skills (in-process registry)
+curl http://127.0.0.1:8080/api/skills
+
+# Hot-reload skills without restarting serve
+curl -X POST http://127.0.0.1:8080/api/skills/reload
 
 # List sessions
 curl http://127.0.0.1:8080/api/sessions
@@ -1101,6 +1129,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional Prometheus metrics: `GET /metrics` is public by default; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`. In-process counters (HTTP route family, session gauge, tool calls, build_info); no telemetry SDK
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET/export of an expired id returns 404
 - Graceful serve shutdown: `jiaclaw serve` handles SIGINT/SIGTERM; stops accepting and drains in-flight requests. `[http] shutdown_timeout_secs` defaults to 15s; `JIACLAW_SHUTDOWN_TIMEOUT_SECS` wins (positive integer; invalid falls back to default). Persist flush on shutdown; heartbeat tasks are aborted
+- Skill hot-reload: `POST /api/skills/reload` rescans `skills/` and replaces the in-process table; failures keep the old table. Unix `SIGHUP` uses the same path; Windows is HTTP-only. `jiaclaw skills reload` scans this process only and does not notify serve
 - Optional session summary compression: set `[session] summarize_on_overflow = true` or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` to fold older messages into one `[session-summary]` system message while keeping the latest `keep_recent` (default 10); unset keeps hard truncation. Summary failure warns and falls back; chat still succeeds
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
 - Configurable tool-loop cap: set `JIACLAW_MAX_TOOL_ITERATIONS` or `[agent] max_tool_iterations` (default 5); positive integers apply, `0`/invalid is ignored, clamped to 1–32. Hitting the cap writes a tool/assistant hint and ends the turn

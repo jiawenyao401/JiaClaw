@@ -123,6 +123,7 @@
   - 封装 StateKnot 的 `TypedAgent<ChatRequest, ChatResponse>`
   - 管理聊天会话和对话历史
   - 协调工具调用和技能执行
+  - 技能注册表支持运行时热加载（`reload_skills`：锁外扫描，失败保留旧表）
   - 处理持久化和恢复逻辑
 
 - **Provider 适配器** - 模型提供商抽象
