@@ -407,7 +407,8 @@ mod tests {
         assert_eq!(compacted.len(), 11);
         assert_eq!(compacted[0].role, MessageRole::System);
         assert!(compacted[0].content.contains(SESSION_SUMMARY_PREFIX));
-        assert!(compacted[0].content.contains("51 messages"));
+        assert!(compacted[0].content.contains("消息 0"));
+        assert_eq!(compacted[1].content, "消息 41");
         assert_eq!(compacted.last().unwrap().content, "消息 50");
     }
 }

@@ -1790,10 +1790,9 @@ async fn run_heartbeat_tick(
         }
         Err(e) => {
             let message = match e {
-                AppError::Internal(msg) => msg,
+                AppError::Internal(msg) | AppError::BadRequest(msg) => msg,
                 AppError::Unauthorized => "Unauthorized".to_string(),
                 AppError::NotFound => "NotFound".to_string(),
-                AppError::BadRequest(msg) => msg,
                 AppError::Conflict => "Conflict".to_string(),
             };
             tracing::warn!(session_id, "Heartbeat 本轮 chat 失败: {message}");
@@ -3044,8 +3043,7 @@ fn content_type_is_json(headers: &HeaderMap) -> bool {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
-        .map(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
-        .unwrap_or(false)
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
 }
 
 fn wants_json_import(format: Option<&str>, headers: &HeaderMap) -> bool {
@@ -3095,7 +3093,7 @@ fn parse_session_import_file(body: &str) -> Result<(Option<String>, Vec<ChatMess
     Ok((None, parse_session_import_jsonl(body)?))
 }
 
-/// 导入会话历史。不存在则新建；已存在默认 409，`overwrite=true` 替换消息并刷新 last_accessed。
+/// 导入会话历史。不存在则新建；已存在默认 409，`overwrite=true` 替换消息并刷新 `last_accessed`。
 /// 不调用 LLM；超长走现有硬截断/本地摘要策略。
 async fn import_session_handler(
     State(state): State<AppState>,
@@ -9459,6 +9457,7 @@ mod tests {
         assert_eq!(get_response.status(), StatusCode::OK);
 
         let export_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/sessions/{session_id}/export"))
