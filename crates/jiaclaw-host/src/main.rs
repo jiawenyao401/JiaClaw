@@ -1756,6 +1756,7 @@ fn memory_show_command(config_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 enum IdentityShowKind {
     Soul,
     User,
