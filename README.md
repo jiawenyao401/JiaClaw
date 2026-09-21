@@ -162,6 +162,11 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 目录已存在则幂等成功（`created=false`，`existed=true`）；已存在且为文件则报错
   - 配置 `[tools.mkdir] enabled`（默认 `true`）；路径安全与其它 file 工具对齐：禁止 `..` / 绝对路径 / symlink 逃逸；创建后 canonicalize 必须仍落在工作区
   - `enabled = false` 时不注册；无 shell、不调用 LLM；**不做 exec**
+- ✅ **可选 move** - 默认注册的工作区移动 / 重命名工具（文档主名 `from` / `to`；`source` / `destination` 为别名）
+  - `from` 必须存在；`to` 已存在且 `overwrite=false`（默认）则报错，不默认覆盖
+  - 支持常规文件、空目录与非空目录。优先同卷 `rename`；文件与空目录在跨文件系统时回退 copy+delete；非空目录跨卷报错
+  - 配置 `[tools.move] enabled`（默认 `true`）；两端路径安全与其它 file 工具对齐：禁止 `..` / 绝对路径 / symlink 逃逸；canonicalize 后必须仍落在工作区。不创建中间目录
+  - `enabled = false` 时不注册；无 shell、不调用 LLM；**不做 exec**
 - ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
   - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
@@ -427,6 +432,12 @@ enabled = true
 # 可选工作区创建目录（默认启用并注册）。path 必填（工作区相对路径）。
 # 可选 recursive / parents（默认 true，等价 mkdir -p；两者为别名）。
 # 目录已存在则幂等成功；已存在且为文件则报错。禁止穿越 / symlink 逃逸。无 shell。enabled = false 不注册。
+enabled = true
+
+[tools.move]
+# 可选工作区移动/重命名（默认启用并注册）。文档主名 from / to（source / destination 为别名）。
+# from 必须存在；to 已存在且 overwrite=false（默认）则报错。可选 overwrite 覆盖已存在的同类型目标。
+# 支持文件、空目录与非空目录（非空目录优先同卷 rename；跨卷非空目录报错）。禁止穿越 / symlink 逃逸。无 shell。enabled = false 不注册。
 enabled = true
 ```
 
@@ -712,6 +723,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 grep：默认注册。工作区字面量文本搜索（非正则）；`path` 默认 `.`；可选 `glob` / `case_insensitive` / `max_matches`（默认 50）；禁穿越。`enabled = false` 不注册。无 shell / ripgrep / exec
 - 可选 glob：默认注册。按 glob 模式列出工作区常规文件（不含目录）；`path` 默认 `.`；`max_results` 默认 100（钳制 1..=500）；结果排序，超限 truncated。禁穿越。`enabled = false` 不注册。无 shell / find / exec
 - 可选 mkdir：默认注册。创建工作区相对路径目录；`recursive` / `parents` 默认 true（等价 mkdir -p）；目录已存在幂等成功；已存在文件报错。禁穿越。`enabled = false` 不注册。无 shell / exec
+- 可选 move：默认注册。工作区相对路径移动/重命名；文档主名 `from` / `to`（`source` / `destination` 为别名）；`from` 必须存在；`to` 已存在默认报错（`overwrite` 默认 false）。支持文件、空目录与非空目录（非空目录优先同卷 rename）。禁穿越。`enabled = false` 不注册。无 shell / exec
 
 ## 项目结构
 
@@ -897,6 +909,11 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Optional `recursive` / `parents` (default `true`, equivalent to `mkdir -p`; aliases, must agree if both set)
   - Existing directories succeed idempotently (`created=false`, `existed=true`); existing files error
   - Configure `[tools.mkdir] enabled` (default `true`); same path policy as other file tools: no `..` / absolute / symlink escape; canonicalize after create must stay in workspace
+  - `enabled = false` skips registration; no shell, no LLM; **no exec**
+- ✅ **Optional move** - registered by default (canonical params `from` / `to`; `source` / `destination` are aliases)
+  - `from` must exist; existing `to` errors when `overwrite=false` (default); never overwrites by default
+  - Supports regular files, empty directories, and non-empty directories. Prefers same-volume `rename`; files and empty dirs fall back to copy+delete across filesystems; non-empty dirs error across volumes
+  - Configure `[tools.move] enabled` (default `true`); both ends use the same path policy: no `..` / absolute / symlink escape; canonicalize must stay in workspace. Does not create missing parents
   - `enabled = false` skips registration; no shell, no LLM; **no exec**
 - ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
   - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
@@ -1162,6 +1179,12 @@ enabled = true
 # Optional workspace mkdir (registered by default). path required (workspace-relative).
 # Optional recursive / parents (default true, equivalent to mkdir -p; aliases).
 # Existing directories succeed idempotently; existing files error. No traversal / symlink escape. No shell. enabled = false skips registration.
+enabled = true
+
+[tools.move]
+# Optional workspace move/rename (registered by default). Canonical params from / to (source / destination are aliases).
+# from must exist; existing to errors when overwrite=false (default). Optional overwrite replaces a same-type destination.
+# Supports files, empty dirs, and non-empty dirs (non-empty dirs prefer same-volume rename; cross-device non-empty dirs error). No traversal / symlink escape. No shell. enabled = false skips registration.
 enabled = true
 ```
 
@@ -1440,6 +1463,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional grep: registered by default. Workspace literal text search (not regex); `path` defaults to `.`; optional `glob` / `case_insensitive` / `max_matches` (default 50); no traversal. `enabled = false` skips registration. No shell / ripgrep / exec
 - Optional glob: registered by default. Lists workspace regular files matching a glob (not directories); `path` defaults to `.`; `max_results` defaults to 100 (clamped 1..=500); sorted, truncated when over limit. `enabled = false` skips registration. No shell / find / exec
 - Optional mkdir: registered by default. Creates a workspace-relative directory; `recursive` / `parents` default true (`mkdir -p`); existing directories succeed idempotently; existing files error. `enabled = false` skips registration. No shell / exec
+- Optional move: registered by default. Workspace-relative move/rename; canonical params `from` / `to` (`source` / `destination` aliases); `from` must exist; existing `to` errors by default (`overwrite` defaults to false). Supports files, empty dirs, and non-empty dirs (non-empty dirs prefer same-volume rename). `enabled = false` skips registration. No shell / exec
 
 ### Documentation
 
