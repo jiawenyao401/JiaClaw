@@ -5623,12 +5623,12 @@ mod tests {
         build_router(state)
     }
 
-    fn create_test_app_with_cors(cors: HttpCorsConfig) -> Router {
+    fn create_test_app_with_cors(cors: &HttpCorsConfig) -> Router {
         create_test_app_with_cors_and_token(cors, None)
     }
 
     fn create_test_app_with_cors_and_token(
-        cors: HttpCorsConfig,
+        cors: &HttpCorsConfig,
         api_token: Option<String>,
     ) -> Router {
         let config = AgentConfig::default();
@@ -5660,7 +5660,7 @@ mod tests {
             metrics,
             metrics_require_auth: false,
         };
-        build_router_with_cors(state, build_cors_layer(&cors))
+        build_router_with_cors(state, build_cors_layer(cors))
     }
 
     fn matching_browser_cors() -> HttpCorsConfig {
@@ -10719,7 +10719,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_enabled_echoes_matching_origin() {
-        let app = create_test_app_with_cors(matching_browser_cors());
+        let app = create_test_app_with_cors(&matching_browser_cors());
         let origin = "http://localhost:5173";
         let response = app
             .oneshot(
@@ -10748,7 +10748,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_enabled_does_not_echo_unmatched_origin() {
-        let app = create_test_app_with_cors(matching_browser_cors());
+        let app = create_test_app_with_cors(&matching_browser_cors());
         let evil = "https://evil.example";
         let response = app
             .oneshot(
@@ -10774,7 +10774,7 @@ mod tests {
             allowed_origins: vec!["*".to_string()],
             ..HttpCorsConfig::default()
         };
-        let app = create_test_app_with_cors(cors);
+        let app = create_test_app_with_cors(&cors);
         let response = app
             .oneshot(
                 Request::builder()
@@ -10795,7 +10795,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_preflight_options_for_api_chat() {
-        let app = create_test_app_with_cors(matching_browser_cors());
+        let app = create_test_app_with_cors(&matching_browser_cors());
         let origin = "http://localhost:5173";
         let response = app
             .oneshot(
@@ -10844,7 +10844,7 @@ mod tests {
     #[tokio::test]
     async fn test_cors_preflight_does_not_require_api_token() {
         let app = create_test_app_with_cors_and_token(
-            matching_browser_cors(),
+            &matching_browser_cors(),
             Some("secret-token".to_string()),
         );
         let response = app
@@ -10875,7 +10875,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_preflight_unmatched_origin_does_not_echo() {
-        let app = create_test_app_with_cors(matching_browser_cors());
+        let app = create_test_app_with_cors(&matching_browser_cors());
         let evil = "https://evil.example";
         let response = app
             .oneshot(
