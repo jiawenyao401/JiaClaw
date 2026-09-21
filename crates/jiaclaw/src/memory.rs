@@ -307,7 +307,7 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-fn canonicalize_existing_or_clone(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_existing_or_clone(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 

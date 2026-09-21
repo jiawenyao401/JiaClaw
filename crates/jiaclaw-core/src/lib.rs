@@ -187,7 +187,7 @@ pub struct AgentConfig {
     #[serde(default = "default_max_tool_iterations")]
     pub max_tool_iterations: usize,
 
-    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` / `memory_search` / `memory_write` 默认启用）
+    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` / `memory_search` / `memory_write` / `read_file` / `list_dir` 默认启用）
     #[serde(default)]
     pub tools: ToolsConfig,
 }
@@ -554,11 +554,19 @@ fn default_memory_write_enabled() -> bool {
     true
 }
 
+fn default_read_file_enabled() -> bool {
+    true
+}
+
+fn default_list_dir_enabled() -> bool {
+    true
+}
+
 /// 本地工具总配置（缺省本段不影响现有 `[http]` / `[memory]` 等段）
 ///
 /// 历史示例里的 `[tools] enabled = [...]` 列表仍可出现在文件中（未知字段忽略），
 /// 当前真正生效的是嵌套表 `[tools.web_search]`、`[tools.web_fetch]`、
-/// `[tools.memory_search]` 与 `[tools.memory_write]`。
+/// `[tools.memory_search]`、`[tools.memory_write]`、`[tools.read_file]` 与 `[tools.list_dir]`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
     /// `web_search` 工具配置
@@ -576,6 +584,14 @@ pub struct ToolsConfig {
     /// `memory_write` 工具配置
     #[serde(default)]
     pub memory_write: MemoryWriteToolConfig,
+
+    /// `read_file` 工具配置
+    #[serde(default)]
+    pub read_file: ReadFileToolConfig,
+
+    /// `list_dir` 工具配置
+    #[serde(default)]
+    pub list_dir: ListDirToolConfig,
 }
 
 /// 可选 `web_search` 联网检索配置
@@ -666,6 +682,38 @@ impl Default for MemoryWriteToolConfig {
     fn default() -> Self {
         Self {
             enabled: default_memory_write_enabled(),
+        }
+    }
+}
+
+/// 可选 `read_file` 工作区只读文件配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadFileToolConfig {
+    /// 是否注册 `read_file` 工具（默认 `true`）
+    #[serde(default = "default_read_file_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for ReadFileToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_read_file_enabled(),
+        }
+    }
+}
+
+/// 可选 `list_dir` 工作区列目录配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDirToolConfig {
+    /// 是否注册 `list_dir` 工具（默认 `true`）
+    #[serde(default = "default_list_dir_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for ListDirToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_list_dir_enabled(),
         }
     }
 }
@@ -2436,6 +2484,8 @@ bind = "127.0.0.1:8080"
         assert!(!config.tools.web_fetch.allow_private);
         assert!(config.tools.memory_search.enabled);
         assert!(config.tools.memory_write.enabled);
+        assert!(config.tools.read_file.enabled);
+        assert!(config.tools.list_dir.enabled);
         assert_eq!(config.http.bind, "127.0.0.1:8080");
     }
 
@@ -2479,6 +2529,14 @@ path = "MEMORY.md"
         assert!(
             config.tools.memory_write.enabled,
             "omitted [tools.memory_write] should keep default enabled"
+        );
+        assert!(
+            config.tools.read_file.enabled,
+            "omitted [tools.read_file] should keep default enabled"
+        );
+        assert!(
+            config.tools.list_dir.enabled,
+            "omitted [tools.list_dir] should keep default enabled"
         );
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.memory.path, "MEMORY.md");
@@ -2693,6 +2751,101 @@ enabled = false
         assert!(config.tools.memory_search.enabled);
         assert!(config.tools.web_search.enabled);
         assert!(config.tools.web_fetch.enabled);
+        assert!(config.tools.read_file.enabled);
+        assert!(config.tools.list_dir.enabled);
+    }
+
+    #[test]
+    fn read_file_and_list_dir_config_defaults_to_enabled() {
+        assert!(ReadFileToolConfig::default().enabled);
+        assert!(ListDirToolConfig::default().enabled);
+        assert!(ToolsConfig::default().read_file.enabled);
+        assert!(ToolsConfig::default().list_dir.enabled);
+        assert!(AgentConfig::default().tools.read_file.enabled);
+        assert!(AgentConfig::default().tools.list_dir.enabled);
+    }
+
+    #[test]
+    fn tools_read_file_parses_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools.read_file]
+enabled = false
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.read_file.enabled);
+        assert!(
+            config.tools.list_dir.enabled,
+            "omitted [tools.list_dir] should keep default enabled"
+        );
+        assert!(config.tools.memory_write.enabled);
+    }
+
+    #[test]
+    fn tools_read_file_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "tools": {
+                "read_file": {
+                    "enabled": false
+                }
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(!config.tools.read_file.enabled);
+        assert!(config.tools.list_dir.enabled);
+        assert!(config.tools.memory_search.enabled);
+    }
+
+    #[test]
+    fn tools_list_dir_parses_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools.list_dir]
+enabled = false
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.list_dir.enabled);
+        assert!(
+            config.tools.read_file.enabled,
+            "omitted [tools.read_file] should keep default enabled"
+        );
+    }
+
+    #[test]
+    fn tools_list_dir_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "tools": {
+                "list_dir": {
+                    "enabled": false
+                }
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(!config.tools.list_dir.enabled);
+        assert!(config.tools.read_file.enabled);
+        assert!(config.tools.web_search.enabled);
     }
 
     #[test]
