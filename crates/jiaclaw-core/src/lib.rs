@@ -157,6 +157,10 @@ pub struct AgentConfig {
     /// HTTP 服务配置
     #[serde(default)]
     pub http: HttpConfig,
+
+    /// 工作区长期记忆配置（缺省为 `{workspace}/MEMORY.md`）
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 fn default_workspace_path() -> std::path::PathBuf {
@@ -164,6 +168,32 @@ fn default_workspace_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".jiaclaw")
         .join("workspace")
+}
+
+/// 默认工作区记忆文件名（相对于 `workspace_path`）
+pub const DEFAULT_MEMORY_PATH: &str = "MEMORY.md";
+
+/// 注入系统提示时的最大字节数（32 KiB）
+pub const MEMORY_PROMPT_MAX_BYTES: usize = 32 * 1024;
+
+fn default_memory_path() -> String {
+    DEFAULT_MEMORY_PATH.to_string()
+}
+
+/// 工作区长期记忆配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// 记忆文件路径（相对于 `workspace_path`，默认 `MEMORY.md`）
+    #[serde(default = "default_memory_path")]
+    pub path: String,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            path: default_memory_path(),
+        }
+    }
 }
 
 /// HTTP 服务配置
@@ -333,6 +363,7 @@ impl Default for AgentConfig {
             workspace_path: default_workspace_path(),
             provider: ProviderConfig::default(),
             http: HttpConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -362,17 +393,22 @@ impl AgentConfig {
             provider: Option<ProviderConfig>,
             #[serde(default)]
             http: Option<HttpConfig>,
+            #[serde(default)]
+            memory: Option<MemoryConfig>,
         }
 
         let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
 
-        // 如果顶层有 provider 或 http 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
         if let Some(http) = config_file.http {
             config_file.agent.http = http;
+        }
+        if let Some(memory) = config_file.memory {
+            config_file.agent.memory = memory;
         }
 
         Ok(config_file.agent)
@@ -402,17 +438,22 @@ impl AgentConfig {
             provider: Option<ProviderConfig>,
             #[serde(default)]
             http: Option<HttpConfig>,
+            #[serde(default)]
+            memory: Option<MemoryConfig>,
         }
 
         let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
 
-        // 如果顶层有 provider 或 http 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
         if let Some(http) = config_file.http {
             config_file.agent.http = http;
+        }
+        if let Some(memory) = config_file.memory {
+            config_file.agent.memory = memory;
         }
 
         Ok(config_file.agent)
@@ -423,6 +464,7 @@ impl AgentConfig {
 mod tests {
     use super::{
         parse_positive_rate_limit, resolve_rate_limit_per_minute, AgentConfig, HttpConfig,
+        DEFAULT_MEMORY_PATH,
     };
 
     #[test]
@@ -493,5 +535,52 @@ rate_limit_per_minute = 60
         let config = AgentConfig::from_json_str(json).expect("parse json");
         assert_eq!(config.http.bind, "0.0.0.0:8080");
         assert_eq!(config.http.rate_limit_per_minute, None);
+        assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
+    }
+
+    #[test]
+    fn memory_config_defaults_without_section() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
+    }
+
+    #[test]
+    fn memory_config_parses_top_level_section() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[memory]
+path = "notes/MEMORY.md"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.memory.path, "notes/MEMORY.md");
+    }
+
+    #[test]
+    fn memory_config_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "memory": {
+                "path": "custom.md"
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert_eq!(config.memory.path, "custom.md");
     }
 }

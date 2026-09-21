@@ -18,7 +18,7 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-use jiaclaw::{JiaClawAgent, Workspace};
+use jiaclaw::{inspect_memory_file, JiaClawAgent, Workspace};
 use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -114,6 +114,23 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// 工作区长期记忆（MEMORY.md）
+    Memory {
+        #[command(subcommand)]
+        action: MemoryCommands,
+    },
+}
+
+/// 长期记忆子命令
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// 显示约定 MEMORY 文件内容
+    Show {
+        /// 配置文件路径
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -153,6 +170,11 @@ async fn main() -> Result<()> {
         Commands::Skills { config, verbose } => {
             skills_command(config, verbose)?;
         }
+        Commands::Memory { action } => match action {
+            MemoryCommands::Show { config } => {
+                memory_show_command(config)?;
+            }
+        },
     }
 
     Ok(())
@@ -1422,6 +1444,57 @@ fn skills_command(config_path: Option<PathBuf>, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+fn load_agent_config(config_path: Option<PathBuf>) -> Result<AgentConfig> {
+    if let Some(path) = config_path {
+        let path_str = path.to_string_lossy();
+        if path_str.ends_with(".toml") {
+            Ok(AgentConfig::from_toml_file(&path)?)
+        } else if path_str.ends_with(".json") {
+            Ok(AgentConfig::from_json_file(&path)?)
+        } else {
+            Ok(AgentConfig::from_toml_file(&path)
+                .or_else(|_| AgentConfig::from_json_file(&path))?)
+        }
+    } else {
+        Ok(AgentConfig::default())
+    }
+}
+
+fn memory_show_command(config_path: Option<PathBuf>) -> Result<()> {
+    let config = load_agent_config(config_path)?;
+    let status = inspect_memory_file(&config.workspace_path, &config.memory.path)
+        .context("无法解析 MEMORY 路径")?;
+
+    println!("🧠 长期记忆\n");
+    println!("   工作空间: {}", config.workspace_path.display());
+    println!("   约定路径: {}", config.memory.path);
+    println!("   文件:     {}", status.path.display());
+
+    if !status.exists {
+        println!("   状态:     ⚠️  不存在 (0 bytes)");
+        println!("\n💡 文件缺失时对话仍可进行，不会报错。");
+        println!("   可手动创建该文件，或让 Agent 调用 memory_append。");
+        return Ok(());
+    }
+
+    println!("   状态:     ✅ 存在 ({} bytes)", status.size_bytes);
+
+    let content = std::fs::read_to_string(&status.path)
+        .with_context(|| format!("无法读取 {}", status.path.display()))?;
+
+    if content.trim().is_empty() {
+        println!("\n（文件为空，不会注入系统提示）");
+        return Ok(());
+    }
+
+    println!("\n----- 内容 -----\n{content}");
+    if !content.ends_with('\n') {
+        println!();
+    }
+    println!("----- 结束 -----");
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("🔍 JiaClaw 配置检查\n");
@@ -1476,6 +1549,25 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
                 } else {
                     println!("   文件: {} 个已加载 ({})", files.len(), files.join(", "));
                     workspace_ok = true;
+                }
+
+                match inspect_memory_file(&config.workspace_path, &config.memory.path) {
+                    Ok(status) => {
+                        println!(
+                            "   MEMORY: {} （配置路径: {}）",
+                            status.path.display(),
+                            config.memory.path
+                        );
+                        if status.exists {
+                            println!("           ✅ 存在 ({} bytes)", status.size_bytes);
+                        } else {
+                            println!("           ⚠️  不存在");
+                            println!("           💡 可手动创建，或在对话中使用 memory_append 写入");
+                        }
+                    }
+                    Err(e) => {
+                        println!("   MEMORY: ❌ 无法解析约定路径: {e}");
+                    }
                 }
 
                 // 检查技能
@@ -2139,6 +2231,13 @@ mod tests {
 
         // 应该有一些已注册的工具
         assert!(!tools_response.tools.is_empty(), "应该有已注册的工具");
+        assert!(
+            tools_response
+                .tools
+                .iter()
+                .any(|t| t.name == "memory_append"),
+            "应注册 memory_append 工具"
+        );
 
         // 验证工具信息包含名称和描述
         for tool in &tools_response.tools {

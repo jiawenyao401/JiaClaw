@@ -93,7 +93,8 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
 | **短期记忆** | ✅ 会话历史 | ✅ 上下文窗口 | ✅ 基础（ChatRequest） | P0 | - |
-| **长期记忆** | ✅ 向量数据库 (ChromaDB/Pinecone) | ✅ 嵌入检索 | ⏳ 计划中（M3） | P1 | StateKnot 持久化层 |
+| **工作区 MEMORY.md** | ✅ 文件注入 | ✅ MEMORY.md 注入 | ✅ **每次 chat 注入 + memory_append** | P1 | - |
+| **长期记忆（向量）** | ✅ 向量数据库 (ChromaDB/Pinecone) | ✅ 嵌入检索 | ⏳ 计划中（M3） | P1 | StateKnot 持久化层 |
 | **语义搜索** | ✅ 完整 | ✅ 完整 | ⏳ 计划中（M3） | P1 | 通过 MCP 或本地工具 |
 | **记忆编辑** | ✅ API 支持 | ⏳ 部分 | ⏳ 计划中（M3） | P2 | - |
 | **时间旅行** | ❌ 无 | ❌ 无 | ✅ **StateKnot 原生** | P1 | StateKnot Checkpoint |
@@ -101,7 +102,13 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 
 **JiaClaw 现状**:
 - ✅ 短期记忆（`ChatRequest.messages`）已实现
-- ❌ 长期记忆需要向量数据库集成和 StateKnot 持久化配置
+- ✅ **工作区 `MEMORY.md` 长期记忆注入**（对照 Hermes/OpenClaw 文件记忆）
+  - 约定路径：`{workspace}/MEMORY.md`，可用 `[memory] path` 覆盖（默认 `MEMORY.md`；缺省配置不破坏现有 TOML/JSON）
+  - `JiaClawAgent::chat` / `build_system_prompt` 在每次对话开始时重读；存在且非空则注入固定区块（`## Long-term Memory（长期记忆）`，内容原样）
+  - 超过 32KiB 截断并 `warn`
+  - 工具 `memory_append`：`content` 追加 Markdown，可选 `replace`（默认 false）；只能写约定路径，禁止穿越；追加为读-改-写 + 原子 rename，带换行分隔
+  - `jiaclaw doctor` 报告 MEMORY 是否存在及大小；`jiaclaw memory show` 查看内容
+- ⏳ 向量检索式长期记忆仍待 M3
 - ✅ 时间旅行和 Fork 能力由 StateKnot Checkpoint 提供（待实现）
 
 **目标方案**:
@@ -315,7 +322,7 @@ triggers:
 - ✅ Cargo 工作空间已配置
 - ✅ `jiaclaw init` 命令创建工作空间
 - ✅ HTTP 配置支持（bind、webhook_secret、cors_allow_origins、可选限流）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、MEMORY 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
@@ -326,7 +333,7 @@ triggers:
   - 可选进程内全局限流（`rate_limit_per_minute`，超限 429 + Retry-After）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
-  - 检查 workspace 可读性、工具数量、技能数量
+  - 检查 workspace 可读性、工具数量、技能数量、MEMORY 是否存在及大小
   - HTTP 配置摘要（bind、webhook 鉴权状态、CORS 模式、限流是否开启及数值）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
@@ -430,6 +437,7 @@ triggers:
 | 本地工具（Shell/File/HTTP） | M2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) |
 | PostgreSQL 持久化 | M1 | [#94](https://github.com/StateKnot/StateKnot/issues/94) |
 | 长期记忆（向量数据库） | M3 | - |
+| 工作区 MEMORY.md 注入 | ✅ 本切片 | - |
 
 ### P2 - 中优先级（Medium）
 | 功能 | 计划时间 |

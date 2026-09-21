@@ -110,6 +110,12 @@ enabled = [
 #     "~/.jiaclaw/skills",
 # ]
 
+[memory]
+# 工作区长期记忆文件（相对于 workspace，默认 MEMORY.md）
+# 每次对话开始时若文件存在且非空则注入系统提示；过大时截断到 32KiB。
+# 可用工具 memory_append 追加或覆盖。缺省本段不影响现有配置。
+path = "MEMORY.md"
+
 [limits]
 # 资源限制配置
 

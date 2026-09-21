@@ -10,15 +10,20 @@
 //! - 持久化运行（支持重启后恢复）
 
 pub use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpConfig, JiaClawError, MessageRole,
-    ProviderConfig, RunStatus, ToolCall,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpConfig, JiaClawError, MemoryConfig,
+    MessageRole, ProviderConfig, RunStatus, ToolCall, DEFAULT_MEMORY_PATH, MEMORY_PROMPT_MAX_BYTES,
 };
 
+mod memory;
 mod provider;
 mod skills;
 mod tools;
 mod workspace;
 
+pub use memory::{
+    inspect_memory_file, load_memory_for_prompt, resolve_memory_path, write_memory,
+    MemoryAppendTool, MemoryFileStatus,
+};
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
 pub use skills::{Skill, SkillDiscovery};
 pub use tools::{
@@ -84,6 +89,10 @@ impl JiaClawAgent {
         // 工作空间和记忆工具
         tools.register(Box::new(WorkspaceListTool::new(&config.workspace_path)));
         tools.register(Box::new(MemoryReadTool::new(&config.workspace_path)));
+        tools.register(Box::new(MemoryAppendTool::new(
+            &config.workspace_path,
+            config.memory.path.clone(),
+        )));
 
         // 文件操作工具
         tools.register(Box::new(FileReadTool::new(&config.workspace_path)));
@@ -154,7 +163,7 @@ impl JiaClawAgent {
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, JiaClawError> {
         // 检查是否有技能应该被自动触发（仅在 auto_skills 为 true 时）
         let mut enabled_skills = request.enabled_skills.clone();
-        
+
         if request.auto_skills {
             if let Some(last_user_msg) = request
                 .messages
@@ -163,8 +172,9 @@ impl JiaClawAgent {
                 .find(|m| matches!(m.role, MessageRole::User))
             {
                 let discovery = SkillDiscovery::new(&self.config.workspace_path);
-                let auto_triggered = discovery.auto_trigger_skills(&last_user_msg.content, &self.skills);
-                
+                let auto_triggered =
+                    discovery.auto_trigger_skills(&last_user_msg.content, &self.skills);
+
                 for skill_name in auto_triggered {
                     if !enabled_skills.contains(&skill_name) {
                         tracing::info!("自动激活技能: {}", skill_name);
@@ -175,7 +185,7 @@ impl JiaClawAgent {
         } else {
             tracing::info!("技能自动激活已禁用");
         }
-        
+
         let request_with_skills = ChatRequest {
             messages: request.messages.clone(),
             enabled_tools: request.enabled_tools.clone(),
@@ -183,7 +193,7 @@ impl JiaClawAgent {
             auto_skills: request.auto_skills,
             session_id: request.session_id.clone(),
         };
-        
+
         // 构建完整的系统提示（包含工作空间内容）
         let system_prompt = self.build_system_prompt(&request_with_skills);
 
@@ -210,10 +220,7 @@ impl JiaClawAgent {
                 .await
             }
             (Some(_), unknown_type) => {
-                tracing::warn!(
-                    "未知的提供商类型 '{}', 回退到存根模式",
-                    unknown_type
-                );
+                tracing::warn!("未知的提供商类型 '{}', 回退到存根模式", unknown_type);
                 // 存根模式也支持工具执行
                 self.execute_tool_loop(
                     request_with_skills.messages.clone(),
@@ -239,7 +246,7 @@ impl JiaClawAgent {
         }
     }
 
-    /// 构建系统提示（包含工作空间内容）
+    /// 构建系统提示（包含工作空间内容；每次调用重读 MEMORY）
     fn build_system_prompt(&self, request: &ChatRequest) -> String {
         let mut prompt = self.config.system_instructions.clone();
 
@@ -254,9 +261,16 @@ impl JiaClawAgent {
             prompt.push_str(user);
         }
 
-        if let Some(ref memory) = self.workspace.memory {
-            prompt.push_str("\n\n## Long-term Memory\n");
-            prompt.push_str(memory);
+        // 每次对话开始时重读约定 MEMORY 路径（工具写入对后续 chat 可见）
+        match load_memory_for_prompt(&self.config.workspace_path, &self.config.memory.path) {
+            Ok(Some(memory)) => {
+                prompt.push_str("\n\n## Long-term Memory（长期记忆）\n");
+                prompt.push_str(&memory);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("读取长期记忆失败，跳过注入: {e}");
+            }
         }
 
         // 添加技能摘要
@@ -304,7 +318,7 @@ impl JiaClawAgent {
                  }\n\
                  ```\n\n\
                  你可以在一条消息中调用多个工具，每个工具调用使用一个单独的 ```tool 代码块。\n\
-                 我会执行这些工具并将结果返回给你，然后你可以继续处理。\n\n"
+                 我会执行这些工具并将结果返回给你，然后你可以继续处理。\n\n",
             );
         }
 
@@ -314,7 +328,7 @@ impl JiaClawAgent {
     /// 解析 assistant 消息中的工具调用
     fn parse_tool_calls(content: &str) -> Vec<ToolCall> {
         let mut tool_calls = Vec::new();
-        
+
         // 查找所有 ```tool ... ``` 代码块
         let mut start_idx = 0;
         while let Some(block_start) = content[start_idx..].find("```tool") {
@@ -322,7 +336,7 @@ impl JiaClawAgent {
             if let Some(block_end) = content[block_start + 7..].find("```") {
                 let block_end = block_start + 7 + block_end;
                 let json_str = content[block_start + 7..block_end].trim();
-                
+
                 // 尝试解析 JSON
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
                     if let (Some(tool_name), Some(arguments)) = (
@@ -336,13 +350,13 @@ impl JiaClawAgent {
                         });
                     }
                 }
-                
+
                 start_idx = block_end + 3;
             } else {
                 break;
             }
         }
-        
+
         tool_calls
     }
 
@@ -357,15 +371,16 @@ impl JiaClawAgent {
         const MAX_ITERATIONS: usize = 5;
         let mut iteration = 0;
         let mut all_tool_calls = Vec::new();
-        
+
         loop {
             iteration += 1;
-            
+
             // 调用 LLM
             let response = if let Some(key) = api_key {
                 match provider_type {
                     "brokerrouter" => {
-                        let provider = BrokerrouterProvider::new(&self.config.provider.base_url, key);
+                        let provider =
+                            BrokerrouterProvider::new(&self.config.provider.base_url, key);
                         provider
                             .chat(
                                 &self.config.provider.model,
@@ -377,7 +392,8 @@ impl JiaClawAgent {
                             .await?
                     }
                     "openai_compatible" => {
-                        let provider = OpenAICompatibleProvider::new(&self.config.provider.base_url, key);
+                        let provider =
+                            OpenAICompatibleProvider::new(&self.config.provider.base_url, key);
                         provider
                             .chat(
                                 &self.config.provider.model,
@@ -405,10 +421,10 @@ impl JiaClawAgent {
                 };
                 self.stub_chat(&request, system_prompt)
             };
-            
+
             // 解析工具调用
             let tool_calls = Self::parse_tool_calls(&response.message.content);
-            
+
             if tool_calls.is_empty() || iteration >= MAX_ITERATIONS {
                 // 没有工具调用或达到最大迭代次数，返回结果（包含所有已执行的工具调用）
                 return Ok(ChatResponse {
@@ -418,22 +434,26 @@ impl JiaClawAgent {
                     session_id: None,
                 });
             }
-            
+
             // 执行工具调用
             let mut executed_tool_calls = Vec::new();
             let mut tool_results = Vec::new();
-            
+
             for mut tool_call in tool_calls {
-                tracing::info!("执行工具: {} (迭代 {}/{})", tool_call.tool_name, iteration, MAX_ITERATIONS);
-                
+                tracing::info!(
+                    "执行工具: {} (迭代 {}/{})",
+                    tool_call.tool_name,
+                    iteration,
+                    MAX_ITERATIONS
+                );
+
                 match self.tools.execute(&tool_call).await {
                     Ok(result) => {
                         tool_call.result = Some(serde_json::json!(result.clone()));
                         executed_tool_calls.push(tool_call.clone());
                         tool_results.push(format!(
                             "工具 {} 执行成功:\n{}",
-                            tool_call.tool_name,
-                            result
+                            tool_call.tool_name, result
                         ));
                     }
                     Err(e) => {
@@ -444,10 +464,10 @@ impl JiaClawAgent {
                     }
                 }
             }
-            
+
             // 将所有执行的工具调用添加到累积列表
             all_tool_calls.extend(executed_tool_calls);
-            
+
             // 将 assistant 的响应和工具结果添加到历史
             messages.push(response.message.clone());
             messages.push(ChatMessage {
@@ -501,55 +521,64 @@ impl JiaClawAgent {
         if user_lower.contains("工具执行结果") || user_lower.contains("执行成功") {
             // 工具已经执行完成，返回一个总结
             return "根据工具执行结果，操作已完成。\n\n\
-                 如需了解更多信息，请查看上面的工具输出结果。".to_string();
+                 如需了解更多信息，请查看上面的工具输出结果。"
+                .to_string();
         }
 
         // 检查是否应该触发工具调用（演示）
-        if user_lower.contains("列出工作空间") 
+        if user_lower.contains("列出工作空间")
             || user_lower.contains("list workspace")
-            || user_lower.contains("workspace files") {
+            || user_lower.contains("workspace files")
+        {
             return "好的,让我列出工作空间文件。\n\n\
                  ```tool\n\
                  {\n\
                    \"tool_name\": \"workspace_list\",\n\
                    \"arguments\": {}\n\
                  }\n\
-                 ```".to_string();
+                 ```"
+            .to_string();
         }
-        
-        if user_lower.contains("读取记忆") 
+
+        if user_lower.contains("读取记忆")
             || user_lower.contains("read memory")
-            || (user_lower.contains("memory") && user_lower.contains("read")) {
+            || (user_lower.contains("memory") && user_lower.contains("read"))
+        {
             return "让我读取记忆文件。\n\n\
                  ```tool\n\
                  {\n\
                    \"tool_name\": \"memory_read\",\n\
                    \"arguments\": {\"file\": \"MEMORY\"}\n\
                  }\n\
-                 ```".to_string();
+                 ```"
+            .to_string();
         }
-        
-        if user_lower.contains("当前时间") 
+
+        if user_lower.contains("当前时间")
             || user_lower.contains("current time")
-            || user_lower.contains("what time") {
+            || user_lower.contains("what time")
+        {
             return "让我获取当前时间。\n\n\
                  ```tool\n\
                  {\n\
                    \"tool_name\": \"datetime_now\",\n\
                    \"arguments\": {}\n\
                  }\n\
-                 ```".to_string();
+                 ```"
+            .to_string();
         }
-        
-        if (user_lower.contains("列出") || user_lower.contains("list")) 
-            && user_lower.contains("文件") {
+
+        if (user_lower.contains("列出") || user_lower.contains("list"))
+            && user_lower.contains("文件")
+        {
             return "让我列出当前目录的文件。\n\n\
                  ```tool\n\
                  {\n\
                    \"tool_name\": \"file_list\",\n\
                    \"arguments\": {\"path\": \".\"}\n\
                  }\n\
-                 ```".to_string();
+                 ```"
+            .to_string();
         }
 
         // 简单的关键词匹配响应
@@ -643,6 +672,7 @@ impl JiaClawAgent {
              • `jiaclaw version` - 显示版本信息\n\
              • `jiaclaw chat <消息>` - 发送单次聊天消息\n\
              • `jiaclaw doctor` - 检查配置和连接\n\
+             • `jiaclaw memory show` - 显示长期记忆\n\
              • `jiaclaw serve` - 启动 HTTP 服务（计划中）\n\n\
              配置:\n\
              • 使用 `--config <文件>` 指定配置文件\n\
@@ -775,14 +805,17 @@ mod tests {
         let response = agent.chat(&request).await;
         assert!(response.is_ok());
         let response = response.unwrap();
-        
+
         // 验证工具被执行了
         assert!(
             !response.tool_calls.is_empty(),
             "工具应该被执行，tool_calls 不应为空"
         );
         assert_eq!(response.tool_calls[0].tool_name, "workspace_list");
-        assert!(response.tool_calls[0].result.is_some(), "工具应该有执行结果");
+        assert!(
+            response.tool_calls[0].result.is_some(),
+            "工具应该有执行结果"
+        );
     }
 
     #[tokio::test]
@@ -854,7 +887,7 @@ mod tests {
 
         let response = agent.chat(&request).await;
         assert!(response.is_ok());
-        
+
         // 即使内容可能触发技能，也不应该自动启用
         // （因为默认工作空间没有技能，这个测试主要验证不会崩溃）
     }
@@ -901,5 +934,110 @@ mod tests {
         let response = agent.chat(&request).await;
         assert!(response.is_ok());
         // 显式指定的技能应该在系统提示中
+    }
+
+    fn sample_request() -> ChatRequest {
+        ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "你好".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        }
+    }
+
+    fn unique_workspace(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}_{}_{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn chat_without_memory_file_does_not_error() {
+        let dir = unique_workspace("jiaclaw_agent_no_mem");
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(
+            !prompt.contains("Long-term Memory"),
+            "无 MEMORY 文件时不应注入记忆区块: {prompt}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_prompt_includes_memory_file_content() {
+        let dir = unique_workspace("jiaclaw_agent_with_mem");
+        std::fs::write(
+            dir.join("MEMORY.md"),
+            "UNIQUE_MEMORY_TOKEN_prefer_dark_mode",
+        )
+        .unwrap();
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(prompt.contains("Long-term Memory"));
+        assert!(prompt.contains("UNIQUE_MEMORY_TOKEN_prefer_dark_mode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_append_then_prompt_sees_file() {
+        let dir = unique_workspace("jiaclaw_agent_append_mem");
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+
+        let prompt_before = agent.build_system_prompt(&sample_request());
+        assert!(!prompt_before.contains("learned-fact-xyz"));
+
+        let call = ToolCall {
+            tool_name: "memory_append".to_string(),
+            arguments: serde_json::json!({"content": "- learned-fact-xyz"}),
+            result: None,
+        };
+        let result = agent.tools().execute(&call).await.unwrap();
+        assert!(result.contains("追加") || result.contains("记忆"));
+
+        let on_disk = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+        assert!(on_disk.contains("learned-fact-xyz"));
+
+        let prompt_after = agent.build_system_prompt(&sample_request());
+        assert!(prompt_after.contains("learned-fact-xyz"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_memory_path_injected_into_prompt() {
+        let dir = unique_workspace("jiaclaw_agent_custom_mem");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/keep.md"), "custom-rel-path-token").unwrap();
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            memory: MemoryConfig {
+                path: "notes/keep.md".to_string(),
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let prompt = agent.build_system_prompt(&sample_request());
+        assert!(prompt.contains("custom-rel-path-token"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
