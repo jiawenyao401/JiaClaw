@@ -215,6 +215,11 @@ enabled = true
 # 禁止 .. / 绝对路径 / symlink 逃逸；只写工作区内常规文件。enabled = false 不注册。无 shell、不调用 LLM。
 enabled = true
 
+[tools.delete_file]
+# 可选工作区文件删除（默认启用并注册）。path 必填。只删常规文件，拒绝目录；文件不存在时明确报错（不静默成功）。
+# 禁止 .. / 绝对路径 / symlink 逃逸。不递归、无 shell、不调用 LLM。enabled = false 不注册。
+enabled = true
+
 [skills]
 # 启用的技能列表（示例）
 enabled = [

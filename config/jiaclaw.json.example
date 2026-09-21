@@ -86,6 +86,9 @@
       },
       "write_file": {
         "enabled": true
+      },
+      "delete_file": {
+        "enabled": true
       }
     }
 }

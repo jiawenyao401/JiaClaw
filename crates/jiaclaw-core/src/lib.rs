@@ -187,7 +187,7 @@ pub struct AgentConfig {
     #[serde(default = "default_max_tool_iterations")]
     pub max_tool_iterations: usize,
 
-    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` / `memory_search` / `memory_write` / `read_file` / `list_dir` / `write_file` 默认启用）
+    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` / `memory_search` / `memory_write` / `read_file` / `list_dir` / `write_file` / `delete_file` 默认启用）
     #[serde(default)]
     pub tools: ToolsConfig,
 
@@ -714,11 +714,15 @@ fn default_write_file_enabled() -> bool {
     true
 }
 
+fn default_delete_file_enabled() -> bool {
+    true
+}
+
 /// 本地工具总配置（缺省本段不影响现有 `[http]` / `[memory]` 等段）
 ///
 /// 历史示例里的 `[tools] enabled = [...]` 列表仍可出现在文件中（未知字段忽略），
 /// 当前真正生效的是嵌套表 `[tools.web_search]`、`[tools.web_fetch]`、
-/// `[tools.memory_search]`、`[tools.memory_write]`、`[tools.read_file]`、`[tools.list_dir]` 与 `[tools.write_file]`。
+/// `[tools.memory_search]`、`[tools.memory_write]`、`[tools.read_file]`、`[tools.list_dir]`、`[tools.write_file]` 与 `[tools.delete_file]`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
     /// `web_search` 工具配置
@@ -748,6 +752,10 @@ pub struct ToolsConfig {
     /// `write_file` 工具配置
     #[serde(default)]
     pub write_file: WriteFileToolConfig,
+
+    /// `delete_file` 工具配置
+    #[serde(default)]
+    pub delete_file: DeleteFileToolConfig,
 }
 
 /// 可选 `web_search` 联网检索配置
@@ -886,6 +894,22 @@ impl Default for WriteFileToolConfig {
     fn default() -> Self {
         Self {
             enabled: default_write_file_enabled(),
+        }
+    }
+}
+
+/// 可选 `delete_file` 工作区文件删除配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteFileToolConfig {
+    /// 是否注册 `delete_file` 工具（默认 `true`）
+    #[serde(default = "default_delete_file_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for DeleteFileToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_delete_file_enabled(),
         }
     }
 }
@@ -1729,14 +1753,14 @@ mod tests {
         resolve_metrics_public, resolve_optional_secret, resolve_rate_limit_per_minute,
         resolve_session_keep_recent, resolve_session_summarize_on_overflow,
         resolve_session_ttl_secs, resolve_shutdown_timeout_secs, resolve_tool_timeout_secs,
-        AgentConfig, HeartbeatConfig, HttpConfig, HttpCorsConfig, ListDirToolConfig, LogFormat,
-        LoggingConfig, MemorySearchToolConfig, MemoryWriteToolConfig, ReadFileToolConfig,
-        SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, WriteFileToolConfig,
-        DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-        DEFAULT_HTTP_MAX_BODY_BYTES, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_LOG_LEVEL,
-        DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
-        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
-        MIN_MAX_TOOL_ITERATIONS,
+        AgentConfig, DeleteFileToolConfig, HeartbeatConfig, HttpConfig, HttpCorsConfig,
+        ListDirToolConfig, LogFormat, LoggingConfig, MemorySearchToolConfig, MemoryWriteToolConfig,
+        ReadFileToolConfig, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+        WriteFileToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
+        DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_MAX_BODY_BYTES,
+        DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_LOG_LEVEL, DEFAULT_MAX_TOOL_ITERATIONS,
+        DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
+        MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -2936,6 +2960,7 @@ bind = "127.0.0.1:8080"
         assert!(config.tools.read_file.enabled);
         assert!(config.tools.list_dir.enabled);
         assert!(config.tools.write_file.enabled);
+        assert!(config.tools.delete_file.enabled);
         assert_eq!(config.http.bind, "127.0.0.1:8080");
     }
 
@@ -2991,6 +3016,10 @@ path = "MEMORY.md"
         assert!(
             config.tools.write_file.enabled,
             "omitted [tools.write_file] should keep default enabled"
+        );
+        assert!(
+            config.tools.delete_file.enabled,
+            "omitted [tools.delete_file] should keep default enabled"
         );
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.memory.path, "MEMORY.md");
@@ -3208,6 +3237,7 @@ enabled = false
         assert!(config.tools.read_file.enabled);
         assert!(config.tools.list_dir.enabled);
         assert!(config.tools.write_file.enabled);
+        assert!(config.tools.delete_file.enabled);
     }
 
     #[test]
@@ -3215,12 +3245,15 @@ enabled = false
         assert!(ReadFileToolConfig::default().enabled);
         assert!(ListDirToolConfig::default().enabled);
         assert!(WriteFileToolConfig::default().enabled);
+        assert!(DeleteFileToolConfig::default().enabled);
         assert!(ToolsConfig::default().read_file.enabled);
         assert!(ToolsConfig::default().list_dir.enabled);
         assert!(ToolsConfig::default().write_file.enabled);
+        assert!(ToolsConfig::default().delete_file.enabled);
         assert!(AgentConfig::default().tools.read_file.enabled);
         assert!(AgentConfig::default().tools.list_dir.enabled);
         assert!(AgentConfig::default().tools.write_file.enabled);
+        assert!(AgentConfig::default().tools.delete_file.enabled);
     }
 
     #[test]
@@ -3304,6 +3337,7 @@ enabled = false
         assert!(!config.tools.list_dir.enabled);
         assert!(config.tools.read_file.enabled);
         assert!(config.tools.write_file.enabled);
+        assert!(config.tools.delete_file.enabled);
         assert!(config.tools.web_search.enabled);
     }
 
@@ -3348,6 +3382,58 @@ enabled = false
         }"#;
         let config = AgentConfig::from_json_str(json).expect("parse json");
         assert!(!config.tools.write_file.enabled);
+        assert!(config.tools.read_file.enabled);
+        assert!(config.tools.list_dir.enabled);
+        assert!(config.tools.delete_file.enabled);
+        assert!(config.tools.web_search.enabled);
+    }
+
+    #[test]
+    fn tools_delete_file_parses_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools.delete_file]
+enabled = false
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.delete_file.enabled);
+        assert!(
+            config.tools.write_file.enabled,
+            "omitted [tools.write_file] should keep default enabled"
+        );
+        assert!(
+            config.tools.read_file.enabled,
+            "omitted [tools.read_file] should keep default enabled"
+        );
+        assert!(
+            config.tools.list_dir.enabled,
+            "omitted [tools.list_dir] should keep default enabled"
+        );
+    }
+
+    #[test]
+    fn tools_delete_file_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "tools": {
+                "delete_file": {
+                    "enabled": false
+                }
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(!config.tools.delete_file.enabled);
+        assert!(config.tools.write_file.enabled);
         assert!(config.tools.read_file.enabled);
         assert!(config.tools.list_dir.enabled);
         assert!(config.tools.web_search.enabled);
