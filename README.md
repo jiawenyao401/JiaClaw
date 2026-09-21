@@ -63,6 +63,8 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*` 与 `/hooks/inbound`
   - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - 超限返回 429 + `Retry-After`；`GET /health` 始终不限流
+- ✅ **请求追踪** - 所有 HTTP 响应回写 `X-Request-Id`（请求未带则生成 UUID）
+- ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
 
 ### 待实现
 
@@ -207,7 +209,12 @@ cargo run --bin jiaclaw -- chat
 ### HTTP API 示例
 
 # 测试 HTTP API
-curl http://127.0.0.1:8080/health
+curl -D - http://127.0.0.1:8080/health
+# 响应含 X-Request-Id；也可自行传入：
+# curl -D - -H "X-Request-Id: my-trace-id" http://127.0.0.1:8080/health
+
+# OpenAPI 3 草图（未配置 API token 时可匿名访问；已启用 token 时需 Bearer，与 /api/tools 一致）
+curl http://127.0.0.1:8080/api/openapi.json
 
 # 列出已注册的工具
 curl http://127.0.0.1:8080/api/tools
@@ -250,6 +257,8 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
+- 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
+- OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
 
 ## 项目结构
 
@@ -336,6 +345,8 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*` and `/hooks/inbound`
   - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - Over-limit returns 429 + `Retry-After`; `GET /health` is never limited
+- ✅ **Request tracing** - every HTTP response writes `X-Request-Id` (generated UUID if missing)
+- ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
 
 #### Pending
 
@@ -474,7 +485,12 @@ cargo run --bin jiaclaw -- chat
 - Type `exit` or `quit` to exit, or press `Ctrl+D`
 
 # Test HTTP API
-curl http://127.0.0.1:8080/health
+curl -D - http://127.0.0.1:8080/health
+# Response includes X-Request-Id; you may also send your own:
+# curl -D - -H "X-Request-Id: my-trace-id" http://127.0.0.1:8080/health
+
+# OpenAPI 3 sketch (anonymous when no API token; Bearer required when token is enabled, same as /api/tools)
+curl http://127.0.0.1:8080/api/openapi.json
 
 # Stateless chat
 curl -X POST http://127.0.0.1:8080/api/chat \
@@ -511,6 +527,8 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*` and `/hooks/inbound` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
+- Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
+- OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
 
 ### Documentation
 

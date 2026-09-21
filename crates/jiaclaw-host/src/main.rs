@@ -33,6 +33,12 @@ use tower_http::cors::{Any, CorsLayer};
 /// 进程内全局（非按 IP）速率限制器，oneshot 测试无需 `ConnectInfo`。
 type GlobalRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
+/// 请求追踪头。大小写不敏感，响应回写同名头。
+const X_REQUEST_ID: &str = "x-request-id";
+
+/// 手写 `OpenAPI` 3 草图（不引入代码生成）。
+const OPENAPI_JSON: &str = include_str!("openapi.json");
+
 #[derive(Parser)]
 #[command(name = "jiaclaw")]
 #[command(about = "JiaClaw - 基于 StateKnot 的个人持久化智能体运行时", long_about = None)]
@@ -282,6 +288,44 @@ async fn rate_limit_middleware(
     }
 }
 
+/// 从请求头读取 `X-Request-Id`；缺失或为空则生成 UUID。
+fn resolve_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get(X_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToOwned::to_owned)
+}
+
+/// 供 tracing 日志使用的 `request_id`；中间件保证响应侧必有该头。
+fn request_id_log_value(headers: &HeaderMap) -> &str {
+    headers
+        .get(X_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("-")
+}
+
+/// 请求追踪中间件：缺省生成 UUID，响应回写 `X-Request-Id`（含 `/health` 与 429）。
+async fn request_id_middleware(mut request: Request, next: Next) -> Response {
+    let request_id = resolve_request_id(request.headers());
+    let Ok(header_value) = HeaderValue::from_str(&request_id) else {
+        let mut response = next.run(request).await;
+        if let Ok(generated) = HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
+            response.headers_mut().insert(X_REQUEST_ID, generated);
+        }
+        return response;
+    };
+
+    request
+        .headers_mut()
+        .insert(X_REQUEST_ID, header_value.clone());
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(X_REQUEST_ID, header_value);
+    response
+}
+
 fn build_router(state: AppState) -> Router {
     let limiter = state.rate_limiter.clone();
     Router::new()
@@ -291,11 +335,14 @@ fn build_router(state: AppState) -> Router {
         .route("/api/sessions/:id", delete(delete_session_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/skills", get(skills_handler))
+        .route("/api/openapi.json", get(openapi_handler))
         .route("/hooks/inbound", post(hooks_inbound_handler))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
         ))
+        // 外层：即使限流 429 也回写 X-Request-Id
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
 
@@ -426,7 +473,9 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • DELETE /api/sessions/:id    - 删除会话");
     tracing::info!("   • GET    /api/tools           - 列出已注册工具");
     tracing::info!("   • GET    /api/skills          - 列出已发现技能");
+    tracing::info!("   • GET    /api/openapi.json    - OpenAPI 3 草图");
     tracing::info!("   • POST   /hooks/inbound       - Webhook 入站端点");
+    tracing::info!("   • X-Request-Id                - 请求无该头则生成 UUID 并回写");
     if let Some(limit) = rate_limit_per_minute {
         tracing::info!(
             "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound；GET /health 不限流）"
@@ -534,19 +583,44 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(response)
 }
 
+/// `OpenAPI` 3 草图。鉴权与 `/api/tools` 一致：有 token 则需要鉴权。
+async fn openapi_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!(
+            request_id = request_id_log_value(&headers),
+            "API 鉴权失败: token 不匹配或缺失"
+        );
+        return Err(AppError::Unauthorized);
+    }
+
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        OPENAPI_JSON,
+    ))
+}
+
 /// 聊天处理器
 async fn chat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut request): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
+    let request_id = request_id_log_value(&headers).to_string();
+
     // API Token 鉴权检查
     if !check_api_auth(&state, &headers) {
-        tracing::warn!("API 鉴权失败: token 不匹配或缺失");
+        tracing::warn!(request_id = %request_id, "API 鉴权失败: token 不匹配或缺失");
         return Err(AppError::Unauthorized);
     }
 
     tracing::info!(
+        request_id = %request_id,
         "收到聊天请求，消息数: {}, session_id: {:?}",
         request.messages.len(),
         request.session_id
@@ -565,6 +639,7 @@ async fn chat_handler(
             // 检查消息数上限，防止内存涨爆
             if all_messages.len() > MAX_SESSION_MESSAGES {
                 tracing::info!(
+                    request_id = %request_id,
                     "Session {} 消息数 {} 超过上限 {}，开始截断",
                     sid,
                     all_messages.len(),
@@ -593,6 +668,7 @@ async fn chat_handler(
                 all_messages.extend(non_system_messages.into_iter().skip(skip_count));
 
                 tracing::info!(
+                    request_id = %request_id,
                     "截断后消息数: {} (system: {}, 其他: {})",
                     all_messages.len(),
                     system_count,
@@ -602,12 +678,13 @@ async fn chat_handler(
 
             request.messages = all_messages;
             tracing::info!(
+                request_id = %request_id,
                 "使用 session {}, 合并后消息数: {}",
                 sid,
                 request.messages.len()
             );
         } else {
-            tracing::info!("创建新 session: {}", sid);
+            tracing::info!(request_id = %request_id, "创建新 session: {}", sid);
         }
     }
 
@@ -626,6 +703,7 @@ async fn chat_handler(
             .or_default()
             .push(response.message.clone());
         tracing::info!(
+            request_id = %request_id,
             "更新 session {}, 当前消息数: {}",
             sid,
             sessions.get(sid).unwrap().len()
@@ -634,12 +712,13 @@ async fn chat_handler(
         // 持久化到磁盘（如果启用）
         if state.persist_enabled {
             if let Err(e) = save_sessions(&state.persist_path, &sessions) {
-                tracing::error!("保存 sessions 失败: {}", e);
+                tracing::error!(request_id = %request_id, "保存 sessions 失败: {}", e);
             }
         }
     }
 
     tracing::info!(
+        request_id = %request_id,
         "聊天响应生成，状态: {:?}, 工具调用数: {}",
         response.status,
         response.tool_calls.len()
@@ -815,7 +894,10 @@ async fn hooks_inbound_handler(
     headers: HeaderMap,
     Json(body): Json<InboundWebhookRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let request_id = request_id_log_value(&headers).to_string();
+
     tracing::info!(
+        request_id = %request_id,
         "收到 webhook 入站请求: channel={}, chat_id={}, username={:?}",
         body.channel,
         body.chat_id,
@@ -828,7 +910,7 @@ async fn hooks_inbound_handler(
             .get("X-Webhook-Secret")
             .and_then(|v| v.to_str().ok());
         if provided != Some(expected) {
-            tracing::warn!("Webhook 鉴权失败: secret 不匹配");
+            tracing::warn!(request_id = %request_id, "Webhook 鉴权失败: secret 不匹配");
             return Ok((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"ok": false, "error": "unauthorized"})),
@@ -839,7 +921,7 @@ async fn hooks_inbound_handler(
 
     // 生成 session_id
     let session_id = format!("webhook:{}", body.chat_id);
-    tracing::info!("使用 session_id: {}", session_id);
+    tracing::info!(request_id = %request_id, "使用 session_id: {}", session_id);
 
     // 构建聊天请求
     let mut request = ChatRequest {
@@ -863,6 +945,7 @@ async fn hooks_inbound_handler(
             // 检查消息数上限
             if all_messages.len() > MAX_SESSION_MESSAGES {
                 tracing::info!(
+                    request_id = %request_id,
                     "Webhook session {} 消息数 {} 超过上限 {}，开始截断",
                     session_id,
                     all_messages.len(),
@@ -888,6 +971,7 @@ async fn hooks_inbound_handler(
                 all_messages.extend(non_system_messages.into_iter().skip(skip_count));
 
                 tracing::info!(
+                    request_id = %request_id,
                     "截断后消息数: {} (system: {}, 其他: {})",
                     all_messages.len(),
                     system_count,
@@ -897,12 +981,13 @@ async fn hooks_inbound_handler(
 
             request.messages = all_messages;
             tracing::info!(
+                request_id = %request_id,
                 "使用 webhook session {}, 合并后消息数: {}",
                 session_id,
                 request.messages.len()
             );
         } else {
-            tracing::info!("创建新 webhook session: {}", session_id);
+            tracing::info!(request_id = %request_id, "创建新 webhook session: {}", session_id);
         }
     }
 
@@ -922,6 +1007,7 @@ async fn hooks_inbound_handler(
             .or_default()
             .push(response.message.clone());
         tracing::info!(
+            request_id = %request_id,
             "更新 webhook session {}, 当前消息数: {}",
             session_id,
             sessions.get(&session_id).unwrap().len()
@@ -930,12 +1016,13 @@ async fn hooks_inbound_handler(
         // 持久化到磁盘（如果启用）
         if state.persist_enabled {
             if let Err(e) = save_sessions(&state.persist_path, &sessions) {
-                tracing::error!("保存 sessions 失败: {}", e);
+                tracing::error!(request_id = %request_id, "保存 sessions 失败: {}", e);
             }
         }
     }
 
     tracing::info!(
+        request_id = %request_id,
         "Webhook 聊天响应生成，状态: {:?}, 工具调用数: {}",
         response.status,
         response.tool_calls.len()
@@ -2850,9 +2937,202 @@ mod tests {
     fn test_is_rate_limited_path() {
         assert!(is_rate_limited_path("/api/chat"));
         assert!(is_rate_limited_path("/api/tools"));
+        assert!(is_rate_limited_path("/api/openapi.json"));
         assert!(is_rate_limited_path("/hooks/inbound"));
         assert!(!is_rate_limited_path("/health"));
         assert!(!is_rate_limited_path("/"));
         assert!(!is_rate_limited_path("/api"));
+    }
+
+    fn request_id_header(response: &axum::http::Response<Body>) -> String {
+        response
+            .headers()
+            .get(X_REQUEST_ID)
+            .expect("响应必须回写 X-Request-Id")
+            .to_str()
+            .expect("X-Request-Id 应为 UTF-8")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_health_generates_request_id() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = request_id_header(&response);
+        assert!(
+            uuid::Uuid::parse_str(&request_id).is_ok(),
+            "未提供 X-Request-Id 时应生成 UUID，实际: {request_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_id_echoed_when_provided() {
+        let app = create_test_app();
+        let client_id = "client-trace-abc-123";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("X-Request-Id", client_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_id_header(&response), client_id);
+    }
+
+    #[tokio::test]
+    async fn test_chat_echoes_request_id() {
+        let app = create_test_app();
+        let client_id = "chat-req-001";
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "你好".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .header("X-Request-Id", client_id)
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_id_header(&response), client_id);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_response_has_request_id() {
+        let app = create_test_app_with_rate_limit(1);
+        let client_id = "limited-req-9";
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .header("X-Request-Id", client_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .header("X-Request-Id", client_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(request_id_header(&second), client_id);
+    }
+
+    #[tokio::test]
+    async fn test_openapi_endpoint_returns_paths() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(request_id_header(&response)
+            .chars()
+            .any(|c| c.is_ascii_hexdigit() || c == '-'));
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(spec["openapi"], "3.0.3");
+        let paths = spec["paths"].as_object().expect("应包含 paths");
+        for required in [
+            "/health",
+            "/api/chat",
+            "/api/sessions",
+            "/api/tools",
+            "/api/skills",
+            "/hooks/inbound",
+        ] {
+            assert!(
+                paths.contains_key(required),
+                "OpenAPI paths 缺少 {required}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_openapi_requires_auth_when_token_configured() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/openapi.json")
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(authorized.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(spec["paths"].is_object());
     }
 }

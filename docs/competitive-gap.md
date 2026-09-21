@@ -58,6 +58,8 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **工具列表 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/tools** | P1 | - |
 | **技能列表 API** | ✅ 支持 | ❌ 无 | ✅ **GET /api/skills** | P1 | - |
 | **Webhook 入站** | ✅ 支持 | ⏳ 部分 | ✅ **POST /hooks/inbound** | P1 | - |
+| **Request ID** | ✅ 支持 | ⏳ 部分 | ✅ **X-Request-Id** | P1 | - |
+| **OpenAPI** | ✅ FastAPI 自动 | ⏳ 部分 | ✅ **GET /api/openapi.json** | P1 | - |
 | **SSE 事件流** | ✅ 支持 | ⏳ 部分 | ⏳ 计划中 | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
 | **WebSocket** | ⏳ 社区贡献 | ❌ 无 | ⏳ 计划中（M4） | P2 | - |
 | **Discord/Slack** | ✅ 插件支持 | ❌ 无 | ⏳ 计划中（通过 MCP） | P2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) MCP 集成 |
@@ -69,8 +71,10 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - ✅ REPL 交互模式：`jiaclaw chat`（支持多轮对话）
   - ✅ 技能开关：`--skill <name>` 可重复使用，`--no-auto-skill` 禁用自动激活
   - ✅ 会话管理：`--session <id>` 续聊支持
-- ✅ HTTP 服务已实现（GET /health, POST /api/chat, GET /api/tools, GET /api/skills）
+- ✅ HTTP 服务已实现（GET /health, POST /api/chat, GET /api/tools, GET /api/skills, GET /api/openapi.json）
 - ✅ **可选 HTTP 限流**（`[http] rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`，进程内全局，超限 429 + Retry-After；GET /health 不限流）
+- ✅ **请求追踪**（缺失则生成 UUID，响应回写 `X-Request-Id`；chat/webhook tracing 带 request_id）
+- ✅ **OpenAPI 草图**（`GET /api/openapi.json`，手写 OpenAPI 3；鉴权与 `/api/tools` 一致）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史，自动截断超长历史）
 - ✅ **Session 可选落盘**（`[http] persist = true`，进程重启后可恢复历史，原子写入，自动处理损坏文件）
 - ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
