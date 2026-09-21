@@ -72,7 +72,8 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
   - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
-  - 同步回传 `{ ok: true, reply }` 便于长轮询调试；本切片不主动 `sendMessage` 出站
+  - 同步回传 `{ ok: true, reply }` 便于长轮询调试
+  - 可选 `JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token`：成功回复后调用 Bot `sendMessage` 推回聊天（文本按 4096 截断）；出站失败仍 200 + 原 `reply`（可带 `delivered` / `delivery_error`）
 - ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
 - ✅ **Session 查询 API** - `GET /api/sessions` 列表、`GET /api/sessions/:id` 读取历史（不存在 404）
 - ✅ **工作区 MEMORY.md** - 跨会话长期记忆注入系统提示
@@ -145,6 +146,10 @@ bind = "127.0.0.1:8080"
 # Telegram Bot secret token（可选，环境变量 JIACLAW_TELEGRAM_SECRET 优先）
 # 若设置，/hooks/telegram 校验 X-Telegram-Bot-Api-Secret-Token；未设置则开放（开发友好）
 # telegram_secret = "your-telegram-secret-token"
+
+# Telegram Bot API token（可选，环境变量 JIACLAW_TELEGRAM_BOT_TOKEN 优先）
+# 若设置，成功得到 assistant 回复后会 POST sendMessage 推回聊天；未设置则仅同步 JSON reply
+# telegram_bot_token = "123456:ABC-your-bot-token"
 
 # CORS 允许的来源列表（空或 ["*"] 表示允许所有来源）
 cors_allow_origins = ["*"]
@@ -323,6 +328,15 @@ curl -X POST http://127.0.0.1:8080/hooks/telegram \
   -H "Content-Type: application/json" \
   -H "X-Telegram-Bot-Api-Secret-Token: my_tg_secret" \
   -d '{"update_id": 2, "edited_message": {"message_id": 11, "chat": {"id": 4242}, "text": "编辑后的消息"}}'
+
+# 配置 Bot Token 后，webhook 成功回复会再调用 Telegram sendMessage 推回聊天
+export JIACLAW_TELEGRAM_BOT_TOKEN=123456:ABC-your-bot-token
+
+# 将公网 HTTPS URL 登记为 Bot webhook（secret_token 对应 JIACLAW_TELEGRAM_SECRET）
+curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
+  -d "url=https://your-host.example/hooks/telegram" \
+  -d "secret_token=${JIACLAW_TELEGRAM_SECRET}"
+# 查看 webhook 状态：curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 ```
 
 **注意**：
@@ -335,7 +349,7 @@ curl -X POST http://127.0.0.1:8080/hooks/telegram \
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
 - Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
-- Telegram Bot 入站：`POST /hooks/telegram` 解析 Bot API Update（`message.text` / `edited_message.text`），会话键 `telegram:{chat.id}`；无文本返回 200 + 跳过说明。可选 `JIACLAW_TELEGRAM_SECRET`。本切片不同步调用 Bot `sendMessage` 出站（可后续加）
+- Telegram Bot 入站：`POST /hooks/telegram` 解析 Bot API Update（`message.text` / `edited_message.text`），会话键 `telegram:{chat.id}`；无文本返回 200 + 跳过说明。可选 `JIACLAW_TELEGRAM_SECRET`。配置 `JIACLAW_TELEGRAM_BOT_TOKEN` 后会调用 `sendMessage` 出站（文本超 4096 截断）；出站失败仍返回 200 + 原 `reply`，避免 Telegram 重试。用 `setWebhook` 把公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`
 
 ## 项目结构
 
@@ -432,7 +446,8 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
   - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
   - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
-  - Sync JSON `{ ok: true, reply }` for long-poll debugging; this slice does not call `sendMessage` outbound
+  - Sync JSON `{ ok: true, reply }` for long-poll debugging
+  - Optional `JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token`: after a successful reply, call Bot `sendMessage` (text truncated at 4096). Outbound failure still returns 200 + the original `reply` (may include `delivered` / `delivery_error`)
 - ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
 - ✅ **Session query API** - `GET /api/sessions` list, `GET /api/sessions/:id` history (404 if missing)
 - ✅ **Workspace MEMORY.md** - cross-session facts injected into the system prompt
@@ -505,6 +520,10 @@ bind = "127.0.0.1:8080"
 # Telegram Bot secret token (optional, JIACLAW_TELEGRAM_SECRET env var takes priority)
 # When set, /hooks/telegram checks X-Telegram-Bot-Api-Secret-Token; unset stays open (dev-friendly)
 # telegram_secret = "your-telegram-secret-token"
+
+# Telegram Bot API token (optional, JIACLAW_TELEGRAM_BOT_TOKEN env var takes priority)
+# When set, a successful assistant reply is also POSTed via sendMessage; unset keeps sync JSON only
+# telegram_bot_token = "123456:ABC-your-bot-token"
 
 # CORS allowed origins (empty or ["*"] allows all origins)
 cors_allow_origins = ["*"]
@@ -671,6 +690,15 @@ curl -X POST http://127.0.0.1:8080/hooks/telegram \
   -H "Content-Type: application/json" \
   -H "X-Telegram-Bot-Api-Secret-Token: my_tg_secret" \
   -d '{"update_id": 2, "edited_message": {"message_id": 11, "chat": {"id": 4242}, "text": "Edited message"}}'
+
+# With a Bot token, a successful reply is also pushed back with Telegram sendMessage
+export JIACLAW_TELEGRAM_BOT_TOKEN=123456:ABC-your-bot-token
+
+# Register the public HTTPS URL with Telegram setWebhook (secret_token maps to JIACLAW_TELEGRAM_SECRET)
+curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
+  -d "url=https://your-host.example/hooks/telegram" \
+  -d "secret_token=${JIACLAW_TELEGRAM_SECRET}"
+# Inspect webhook status: curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 ```
 
 **Note**:
@@ -683,7 +711,7 @@ curl -X POST http://127.0.0.1:8080/hooks/telegram \
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
 - Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)
-- Telegram Bot inbound: `POST /hooks/telegram` parses Bot API Updates (`message.text` / `edited_message.text`) into session `telegram:{chat.id}`; updates without text return 200 + a skip reason. Optional `JIACLAW_TELEGRAM_SECRET`. This slice does not call Bot `sendMessage` outbound (follow-up)
+- Telegram Bot inbound: `POST /hooks/telegram` parses Bot API Updates (`message.text` / `edited_message.text`) into session `telegram:{chat.id}`; updates without text return 200 + a skip reason. Optional `JIACLAW_TELEGRAM_SECRET`. With `JIACLAW_TELEGRAM_BOT_TOKEN`, replies are also sent via `sendMessage` (text truncated at 4096); outbound failure still returns 200 + the original `reply` so Telegram does not retry. Point `setWebhook` at the public `https://…/hooks/telegram` URL, optionally with `secret_token`
 
 ### Documentation
 

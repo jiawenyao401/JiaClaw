@@ -262,6 +262,13 @@ pub struct HttpConfig {
     #[serde(default)]
     pub telegram_secret: Option<String>,
 
+    /// Telegram Bot API token（可选，环境变量 `JIACLAW_TELEGRAM_BOT_TOKEN` 优先）
+    ///
+    /// 配置后，`POST /hooks/telegram` 在得到 assistant 回复时会调用 Bot `sendMessage` 推回聊天。
+    /// 未配置则仅同步 JSON 回传 `reply`（与仅入站切片行为一致）。
+    #[serde(default)]
+    pub telegram_bot_token: Option<String>,
+
     /// CORS 允许的来源列表（空或 `["*"]` 表示允许所有来源）
     #[serde(default = "default_cors_allow_origins")]
     pub cors_allow_origins: Vec<String>,
@@ -306,6 +313,7 @@ impl Default for HttpConfig {
             api_token: None,
             webhook_secret: None,
             telegram_secret: None,
+            telegram_bot_token: None,
             cors_allow_origins: default_cors_allow_origins(),
             persist: false,
             persist_path: default_persist_path(),
@@ -313,6 +321,23 @@ impl Default for HttpConfig {
             session_ttl_secs: None,
         }
     }
+}
+
+/// 解析可选密钥：环境变量优先；空白视为未设置并回退到配置文件。
+#[must_use]
+pub fn resolve_optional_secret(
+    configured: Option<String>,
+    env_value: Option<&str>,
+) -> Option<String> {
+    env_value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            configured
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
 }
 
 /// 解析正整数限流值；`0` 或无法解析时视为不限流。
@@ -393,6 +418,17 @@ impl HttpConfig {
         resolve_session_ttl_secs(
             self.session_ttl_secs,
             std::env::var("JIACLAW_SESSION_TTL_SECS").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的 Telegram Bot API token。
+    ///
+    /// 环境变量 `JIACLAW_TELEGRAM_BOT_TOKEN` 优先于配置文件；空白视为未配置。
+    #[must_use]
+    pub fn effective_telegram_bot_token(&self) -> Option<String> {
+        resolve_optional_secret(
+            self.telegram_bot_token.clone(),
+            std::env::var("JIACLAW_TELEGRAM_BOT_TOKEN").ok().as_deref(),
         )
     }
 }
@@ -593,8 +629,9 @@ impl AgentConfig {
 mod tests {
     use super::{
         parse_positive_rate_limit, parse_positive_session_ttl, parse_positive_tool_timeout,
-        resolve_rate_limit_per_minute, resolve_session_ttl_secs, resolve_tool_timeout_secs,
-        AgentConfig, HttpConfig, DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
+        resolve_optional_secret, resolve_rate_limit_per_minute, resolve_session_ttl_secs,
+        resolve_tool_timeout_secs, AgentConfig, HttpConfig, DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH,
+        DEFAULT_USER_PATH,
     };
 
     #[test]
@@ -702,12 +739,14 @@ session_ttl_secs = 3600
         assert_eq!(config.http.api_token, None);
         assert_eq!(config.http.webhook_secret, None);
         assert_eq!(config.http.telegram_secret, None);
+        assert_eq!(config.http.telegram_bot_token, None);
         assert_eq!(config.tool_timeout_secs, None);
     }
 
     #[test]
     fn http_config_telegram_secret_defaults_to_none() {
         assert_eq!(HttpConfig::default().telegram_secret, None);
+        assert_eq!(HttpConfig::default().telegram_bot_token, None);
     }
 
     #[test]
@@ -729,6 +768,54 @@ telegram_secret = "tg-secret-token"
             Some("tg-secret-token")
         );
         assert_eq!(config.http.webhook_secret, None);
+        assert_eq!(config.http.telegram_bot_token, None);
+    }
+
+    #[test]
+    fn http_config_parses_telegram_bot_token_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:8080"
+telegram_secret = "tg-secret-token"
+telegram_bot_token = "123456:ABC-bot-token"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(
+            config.http.telegram_secret.as_deref(),
+            Some("tg-secret-token")
+        );
+        assert_eq!(
+            config.http.telegram_bot_token.as_deref(),
+            Some("123456:ABC-bot-token")
+        );
+    }
+
+    #[test]
+    fn resolve_optional_secret_env_overrides_config() {
+        assert_eq!(
+            resolve_optional_secret(Some("from-file".into()), Some("from-env")),
+            Some("from-env".into())
+        );
+        assert_eq!(
+            resolve_optional_secret(Some("from-file".into()), Some("  ")),
+            Some("from-file".into())
+        );
+        assert_eq!(
+            resolve_optional_secret(Some("  file-token  ".into()), None),
+            Some("file-token".into())
+        );
+        assert_eq!(resolve_optional_secret(Some(String::new()), None), None);
+        assert_eq!(resolve_optional_secret(None, None), None);
+        assert_eq!(
+            resolve_optional_secret(None, Some(" env-token ")),
+            Some("env-token".into())
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
   "info": {
     "title": "JiaClaw HTTP API",
     "version": "0.1.0",
-    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n- Telegram secret：当配置了 `JIACLAW_TELEGRAM_SECRET` 或 `[http].telegram_secret` 时，`POST /hooks/telegram` 需要 `X-Telegram-Bot-Api-Secret-Token`（Telegram 官方 secret token）。未配置则与本地 webhook 一样开放。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。"
+    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n- Telegram secret：当配置了 `JIACLAW_TELEGRAM_SECRET` 或 `[http].telegram_secret` 时，`POST /hooks/telegram` 需要 `X-Telegram-Bot-Api-Secret-Token`（Telegram 官方 secret token）。未配置则与本地 webhook 一样开放。\n\nTelegram 出站：当配置了 `JIACLAW_TELEGRAM_BOT_TOKEN` 或 `[http].telegram_bot_token` 时，成功得到 assistant 回复后会调用 Bot `sendMessage` 推回聊天（文本按 4096 截断）。出站失败仍返回 200 + 原 `reply`，避免 Telegram webhook 重试；响应可带 `delivered` / `delivery_error`。未配置 token 时仅同步 JSON。用 `setWebhook` 将公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。"
   },
   "servers": [
     {
@@ -15,7 +15,7 @@
     { "name": "health", "description": "健康检查" },
     { "name": "chat", "description": "聊天与会话" },
     { "name": "catalog", "description": "工具与技能目录" },
-    { "name": "hooks", "description": "Webhook / Telegram 入站" },
+    { "name": "hooks", "description": "Webhook / Telegram 入站（可选 sendMessage 出站）" },
     { "name": "discovery", "description": "API 发现" }
   ],
   "paths": {
@@ -294,7 +294,7 @@
         "tags": ["hooks"],
         "summary": "Telegram Bot 入站",
         "operationId": "inboundTelegram",
-        "description": "接收 Telegram Bot API Update JSON，将 `message.text` / `edited_message.text` 映射到 session `telegram:{chat.id}` 并走现有 agent chat 路径。无文本的 update 返回 200 并带跳过说明。本切片同步回传 assistant 文本，不主动调用 sendMessage 出站。",
+        "description": "接收 Telegram Bot API Update JSON，将 `message.text` / `edited_message.text` 映射到 session `telegram:{chat.id}` 并走现有 agent chat 路径。无文本的 update 返回 200 并带跳过说明。配置了 `JIACLAW_TELEGRAM_BOT_TOKEN` / `[http].telegram_bot_token` 时，成功回复后会 POST `https://api.telegram.org/bot{token}/sendMessage`（`chat_id` + `text`，文本按 4096 截断）。出站失败仍 200 + 原 JSON `reply`，避免 Telegram 重试；可回传 `delivered` / `delivery_error`。未配置 token 时仅同步 JSON。用 Bot API `setWebhook` 将公网 HTTPS URL 指向本端点，并可设置 `secret_token`。",
         "security": [{ "telegramSecret": [] }],
         "requestBody": {
           "required": true,
@@ -612,6 +612,14 @@
           "reason": {
             "type": "string",
             "example": "no text in update"
+          },
+          "delivered": {
+            "type": "boolean",
+            "description": "是否已成功调用 Bot sendMessage。未配置 bot token 时省略该字段。"
+          },
+          "delivery_error": {
+            "type": "string",
+            "description": "sendMessage 失败时的错误摘要（不含 token 明文）。出站失败不改变 HTTP 200。"
           }
         }
       },
