@@ -14,8 +14,9 @@ pub use jiaclaw_core::{
     IdentityConfig, JiaClawError, MemoryConfig, MessageRole, ProviderConfig, RunStatus,
     SessionConfig, ToolCall, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
     DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-    DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
-    MAX_SESSION_MESSAGES, MEMORY_PROMPT_MAX_BYTES,
+    DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
+    DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
+    MEMORY_PROMPT_MAX_BYTES, MIN_MAX_TOOL_ITERATIONS,
 };
 
 mod heartbeat;
@@ -69,6 +70,9 @@ pub struct JiaClawAgent {
     workspace: Workspace,
     skills: Vec<Skill>,
     tools: ToolRegistry,
+    /// 测试专用：stub 每次都请求该工具，用于验证 tool loop 上限。
+    #[cfg(test)]
+    test_repeat_tool: Option<String>,
     // TODO: 当 StateKnot 发布稳定 API 后，添加 TypedAgent 字段
     // typed_agent: TypedAgent<ChatRequest, ChatResponse>,
 }
@@ -157,6 +161,8 @@ impl JiaClawAgent {
             workspace,
             skills,
             tools,
+            #[cfg(test)]
+            test_repeat_tool: None,
         })
     }
 
@@ -189,6 +195,11 @@ impl JiaClawAgent {
         self.tools.register(tool);
     }
 
+    #[cfg(test)]
+    fn force_repeat_tool_for_test(&mut self, tool_name: &str) {
+        self.test_repeat_tool = Some(tool_name.to_string());
+    }
+
     /// 处理聊天请求
     ///
     /// # Errors
@@ -205,7 +216,7 @@ impl JiaClawAgent {
     /// 2. `openai_compatible` - 已废弃的直连模式（仅作开发逃生舱）
     /// 3. 如果未配置 API key，回退到存根实现
     ///
-    /// 本方法会自动处理工具调用循环（最多 5 次迭代）。
+    /// 本方法会自动处理工具调用循环（上限见 [`AgentConfig::effective_max_tool_iterations`]）。
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, JiaClawError> {
         // 检查是否有技能应该被自动触发（仅在 auto_skills 为 true 时）
         let mut enabled_skills = request.enabled_skills.clone();
@@ -565,6 +576,11 @@ impl JiaClawAgent {
         tool_calls
     }
 
+    /// 达到工具循环上限时写入 assistant / 未执行 tool 的提示。
+    fn max_tool_iterations_stop_hint(limit: usize) -> String {
+        format!("已达到最大工具迭代次数（{limit}）。本轮停止，未执行剩余工具调用。")
+    }
+
     /// 执行工具调用循环
     async fn execute_tool_loop(
         &self,
@@ -573,7 +589,7 @@ impl JiaClawAgent {
         provider_type: &str,
         api_key: Option<&str>,
     ) -> Result<ChatResponse, JiaClawError> {
-        const MAX_ITERATIONS: usize = 5;
+        let max_iterations = self.config.effective_max_tool_iterations();
         let mut iteration = 0;
         let mut all_tool_calls = Vec::new();
 
@@ -630,10 +646,26 @@ impl JiaClawAgent {
             // 解析工具调用
             let tool_calls = Self::parse_tool_calls(&response.message.content);
 
-            if tool_calls.is_empty() || iteration >= MAX_ITERATIONS {
-                // 没有工具调用或达到最大迭代次数，返回结果（包含所有已执行的工具调用）
+            if tool_calls.is_empty() {
                 return Ok(ChatResponse {
                     message: response.message,
+                    tool_calls: all_tool_calls,
+                    status: response.status,
+                    session_id: None,
+                });
+            }
+
+            if iteration >= max_iterations {
+                let hint = Self::max_tool_iterations_stop_hint(max_iterations);
+                tracing::warn!("{hint}");
+                for mut tool_call in tool_calls {
+                    tool_call.result = Some(serde_json::json!({ "error": hint.clone() }));
+                    all_tool_calls.push(tool_call);
+                }
+                let mut message = response.message;
+                message.content = format!("{}\n\n{hint}", message.content.trim_end());
+                return Ok(ChatResponse {
+                    message,
                     tool_calls: all_tool_calls,
                     status: response.status,
                     session_id: None,
@@ -649,7 +681,7 @@ impl JiaClawAgent {
                     "执行工具: {} (迭代 {}/{})",
                     tool_call.tool_name,
                     iteration,
-                    MAX_ITERATIONS
+                    max_iterations
                 );
 
                 let (recorded, message) = self.execute_and_record(tool_call).await;
@@ -667,7 +699,7 @@ impl JiaClawAgent {
                 content: format!(
                     "工具执行结果 (迭代 {}/{}):\n\n{}",
                     iteration,
-                    MAX_ITERATIONS,
+                    max_iterations,
                     tool_results.join("\n\n")
                 ),
             });
@@ -708,6 +740,19 @@ impl JiaClawAgent {
         _system_prompt: &str,
     ) -> String {
         let user_lower = user_message.to_lowercase();
+
+        #[cfg(test)]
+        if let Some(tool_name) = &self.test_repeat_tool {
+            return format!(
+                "继续调用工具。\n\n\
+                 ```tool\n\
+                 {{\n\
+                   \"tool_name\": \"{tool_name}\",\n\
+                   \"arguments\": {{}}\n\
+                 }}\n\
+                 ```"
+            );
+        }
 
         // 检查是否是工具执行结果反馈
         if user_lower.contains("工具执行结果") || user_lower.contains("执行成功") {
@@ -1321,6 +1366,116 @@ mod tests {
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0].tool_name, "datetime_now");
         assert_eq!(tool_calls[1].tool_name, "workspace_list");
+    }
+
+    #[tokio::test]
+    async fn tool_loop_stops_at_configured_max_tool_iterations() {
+        let dir = unique_workspace("jiaclaw_max_tool_iter");
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            max_tool_iterations: 2,
+            ..AgentConfig::default()
+        };
+        assert_eq!(config.effective_max_tool_iterations(), 2);
+
+        let mut agent = JiaClawAgent::new(config).unwrap();
+        agent.force_repeat_tool_for_test("datetime_now");
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "反复调用工具".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        };
+
+        let response = agent.chat(&request).await.unwrap();
+        // max=2：第 1 轮执行，第 2 轮达上限停止（不执行，写入 tool/assistant 提示）
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].tool_name, "datetime_now");
+        let first = response.tool_calls[0]
+            .result
+            .as_ref()
+            .expect("executed tool result")
+            .to_string();
+        assert!(
+            !first.contains("最大工具迭代次数"),
+            "first call should execute, got: {first}"
+        );
+
+        assert_eq!(response.tool_calls[1].tool_name, "datetime_now");
+        let skipped = response.tool_calls[1]
+            .result
+            .as_ref()
+            .expect("skipped tool result")
+            .to_string();
+        assert!(
+            skipped.contains("最大工具迭代次数（2）"),
+            "limit hint should be in skipped tool result, got: {skipped}"
+        );
+        assert!(
+            response.message.content.contains("最大工具迭代次数（2）"),
+            "limit hint should be in assistant message: {}",
+            response.message.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_default_limit_matches_legacy_constant() {
+        let dir = unique_workspace("jiaclaw_max_tool_iter_default");
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            config.effective_max_tool_iterations(),
+            DEFAULT_MAX_TOOL_ITERATIONS
+        );
+
+        let mut agent = JiaClawAgent::new(config).unwrap();
+        agent.force_repeat_tool_for_test("datetime_now");
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "反复调用工具".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        };
+
+        let response = agent.chat(&request).await.unwrap();
+        // 默认 5：前 4 轮执行，第 5 轮达上限停止
+        assert_eq!(response.tool_calls.len(), DEFAULT_MAX_TOOL_ITERATIONS);
+        for call in response
+            .tool_calls
+            .iter()
+            .take(DEFAULT_MAX_TOOL_ITERATIONS - 1)
+        {
+            let result = call.result.as_ref().expect("tool result").to_string();
+            assert!(
+                !result.contains("最大工具迭代次数"),
+                "executed calls should not carry the stop hint: {result}"
+            );
+        }
+        let last = response.tool_calls[DEFAULT_MAX_TOOL_ITERATIONS - 1]
+            .result
+            .as_ref()
+            .expect("limit tool result")
+            .to_string();
+        assert!(
+            last.contains(&format!(
+                "最大工具迭代次数（{DEFAULT_MAX_TOOL_ITERATIONS}）"
+            )),
+            "{last}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

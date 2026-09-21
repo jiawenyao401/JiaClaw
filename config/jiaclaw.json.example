@@ -11,7 +11,8 @@
       "temperature": 0.7,
       "max_tokens": 4096
     },
-    "tool_timeout_secs": null
+    "tool_timeout_secs": null,
+    "max_tool_iterations": 5
   },
   "server": {
     "bind": "127.0.0.1:8080",

@@ -73,6 +73,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **可选工具超时** - 单次 `shell_exec` / `http_get` 等不会无限卡住 tool loop
   - 配置 `[agent] tool_timeout_secs` 或环境变量 `JIACLAW_TOOL_TIMEOUT_SECS`（正整数才启用；`0`/非法=关闭）
   - 超时把 `Tool timed out after Ns` 写入 tool result，不 panic，继续循环
+- ✅ **可配置工具循环上限** - 防止失控的工具风暴，同时允许复杂任务提高上限
+  - 配置 `[agent] max_tool_iterations`（默认 **5**，与历史硬编码一致）或环境变量 `JIACLAW_MAX_TOOL_ITERATIONS`（正整数优先；`0`/非法忽略）
+  - 生效值钳制到 1–32；达上限时写入清晰 tool/assistant 提示并结束本轮
+  - `jiaclaw doctor` / `serve` 摘要显示生效值
 - ✅ **可选 web_search** - 默认注册的联网检索工具（`query` 必填，`max_results` 默认 5、钳制 1..=10）
   - 配置 `[tools.web_search] enabled`（默认 `true`）与 `brave_api_key`；环境变量 `JIACLAW_BRAVE_API_KEY` 优先
   - 有 key 时调用 Brave Search API（HTTP 超时 10s，并遵守 `tool_timeout_secs`）；无 key 时工具返回友好错误（不访问网络）
@@ -233,6 +237,8 @@ persist_path = ".jiaclaw/sessions.json"
 # 正整数启用；未设置或 0 不限制（默认）。超时写入 tool result 并继续 loop。
 # [agent]
 # tool_timeout_secs = 30
+# 工具循环上限（默认 5，与历史硬编码一致；JIACLAW_MAX_TOOL_ITERATIONS 优先；钳制 1–32）
+# max_tool_iterations = 5
 
 [memory]
 # 工作区长期记忆（相对于 workspace，默认 MEMORY.md；缺省本段即可）
@@ -276,6 +282,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1
 # 可选：单次工具调用超时（秒，优先于配置文件）
 # export JIACLAW_TOOL_TIMEOUT_SECS=30
+# 可选：工具循环上限（优先于 [agent] max_tool_iterations；正整数，0/非法忽略；钳制 1–32）
+# export JIACLAW_MAX_TOOL_ITERATIONS=8
 # 可选：Heartbeat 间隔（秒，优先于 [heartbeat] interval_secs；需 enabled = true）
 # export JIACLAW_HEARTBEAT_INTERVAL_SECS=3600
 # 可选：Brave Search API key（优先于 [tools.web_search] brave_api_key；不要把 key 提交到仓库）
@@ -476,6 +484,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET 为 404
 - 可选 Session 摘要压缩：设置 `[session] summarize_on_overflow = true` 或 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` 后，接近上限时把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`（默认 10）条；未开启则仍硬截断。摘要失败会 warn 并回退截断，chat 不失败
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
+- 可配置工具循环上限：设置 `JIACLAW_MAX_TOOL_ITERATIONS` 或 `[agent] max_tool_iterations`（默认 5）；正整数生效，`0`/非法忽略，钳制 1–32。达上限时写入 tool/assistant 提示并结束本轮
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
 - 可选 SSE：`POST /api/chat` 在 `Accept: text/event-stream` 或 `"stream": true` 时返回 `text/event-stream`（`meta` / `token` / `tool` / `done` / `error`）。未请求流式时 JSON 不变。**当前为分块推送；Brokerrouter 真流式后续**
@@ -583,6 +592,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Optional tool timeout** - a long `shell_exec` / `http_get` cannot stall the whole tool loop
   - Configure `[agent] tool_timeout_secs` or `JIACLAW_TOOL_TIMEOUT_SECS` (positive integer enables; `0`/invalid disables)
   - Timeout writes `Tool timed out after Ns` into the tool result, does not panic, and continues the loop
+- ✅ **Configurable tool-loop cap** - stop runaway tool storms while allowing complex tasks a higher limit
+  - Configure `[agent] max_tool_iterations` (default **5**, same as the former hardcoded cap) or `JIACLAW_MAX_TOOL_ITERATIONS` (positive integer wins; `0`/invalid ignored)
+  - Effective value is clamped to 1–32; hitting the cap writes a clear tool/assistant hint and ends the turn
+  - `jiaclaw doctor` / `serve` summaries show the effective value
 - ✅ **Optional web_search** - registered by default (`query` required; `max_results` defaults to 5, clamped to 1..=10)
   - Configure `[tools.web_search] enabled` (default `true`) and `brave_api_key`; `JIACLAW_BRAVE_API_KEY` overrides the file
   - With a key, calls Brave Search (10s HTTP timeout, still honors `tool_timeout_secs`); without a key, the tool returns a friendly error and does not hit the network
@@ -742,6 +755,8 @@ persist_path = ".jiaclaw/sessions.json"
 # Positive integer enables; unset or 0 is unlimited (default). Timeout writes into the tool result and the loop continues.
 # [agent]
 # tool_timeout_secs = 30
+# Tool-loop cap (default 5, same as the former hardcoded limit; JIACLAW_MAX_TOOL_ITERATIONS wins; clamped 1–32)
+# max_tool_iterations = 5
 
 [memory]
 # Workspace long-term memory (relative to workspace, default MEMORY.md)
@@ -785,6 +800,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1
 # Optional: per-tool timeout in seconds (overrides config file)
 # export JIACLAW_TOOL_TIMEOUT_SECS=30
+# Optional: tool-loop cap (overrides [agent] max_tool_iterations; positive integer, 0/invalid ignored; clamped 1–32)
+# export JIACLAW_MAX_TOOL_ITERATIONS=8
 # Optional: heartbeat interval in seconds (overrides [heartbeat] interval_secs; requires enabled = true)
 # export JIACLAW_HEARTBEAT_INTERVAL_SECS=3600
 # Optional: Brave Search API key (overrides [tools.web_search] brave_api_key; do not commit secrets)
@@ -973,6 +990,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET of an expired id returns 404
 - Optional session summary compression: set `[session] summarize_on_overflow = true` or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` to fold older messages into one `[session-summary]` system message while keeping the latest `keep_recent` (default 10); unset keeps hard truncation. Summary failure warns and falls back; chat still succeeds
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
+- Configurable tool-loop cap: set `JIACLAW_MAX_TOOL_ITERATIONS` or `[agent] max_tool_iterations` (default 5); positive integers apply, `0`/invalid is ignored, clamped to 1–32. Hitting the cap writes a tool/assistant hint and ends the turn
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
 - Optional SSE: `POST /api/chat` returns `text/event-stream` when `Accept: text/event-stream` or `"stream": true` (`meta` / `token` / `tool` / `done` / `error`). JSON is unchanged when streaming is not requested. **Currently chunked after the full loop; Brokerrouter true streaming comes later**
