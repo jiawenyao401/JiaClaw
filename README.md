@@ -147,6 +147,11 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 配置 `[tools.str_replace] enabled`（默认 `true`）；读入或写出超过 **256KiB**（与 read/write 对齐）明确报错且不落盘
   - tmp + rename 原子写；拒绝二进制；路径安全与 MEMORY / read_file 对齐：禁止 `..` / 绝对路径 / symlink 逃逸
   - `enabled = false` 时不注册；无 shell、不调用 LLM；**不做 exec**
+- ✅ **可选 grep** - 默认注册的工作区字面量文本搜索工具（`pattern` 必填）
+  - 可选 `path`（相对目录或文件，默认 `.`）、`glob`（如 `*.rs`）、`case_insensitive`、`max_matches`（默认 50，钳制 1..=200）
+  - **字面量子串**搜索（非正则，避免 ReDoS）；返回 `{path, line, snippet}`，过长行截断
+  - 配置 `[tools.grep] enabled`（默认 `true`）；路径安全与其它 file 工具对齐：禁止 `..` / 绝对路径 / symlink 逃逸；不跟随逃逸 symlink；跳过二进制
+  - 纯 Rust，无 shell / ripgrep 外部进程、不调用 LLM；`enabled = false` 时不注册；**不做 exec**
 - ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
   - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
@@ -394,6 +399,12 @@ enabled = true
 # 可选工作区精确字符串替换（默认启用并注册）。path / old_str / new_str 必填；replace_all 默认 false（必须恰好 1 次）。
 # 读入或写出超过 256KiB（与 read/write 对齐）报错且不落盘。原子写。拒绝二进制。禁止穿越 / symlink 逃逸。
 # enabled = false 不注册。
+enabled = true
+
+[tools.grep]
+# 可选工作区字面量文本搜索（默认启用并注册）。pattern 必填（字面量子串，非正则，避免 ReDoS）。
+# 可选 path（相对目录或文件，默认 .）、glob（如 *.rs）、case_insensitive、max_matches（默认 50，钳制 1..=200）。
+# 返回 {path, line, snippet}；跳过二进制；禁止穿越 / symlink 逃逸。无 shell / ripgrep。enabled = false 不注册。
 enabled = true
 ```
 
@@ -676,6 +687,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 write_file：默认注册。写入工作区相对路径常规文件；`mode=overwrite|append`（默认 overwrite）；超过 256KiB 报错且不落盘；原子写；禁穿越。`enabled = false` 不注册。无 shell / exec
 - 可选 delete_file：默认注册。删除工作区相对路径常规文件；拒绝目录；缺文件明确报错；禁穿越 / symlink 逃逸。`enabled = false` 不注册。无递归 / shell / exec
 - 可选 str_replace：默认注册。单文件精确字符串替换；`replace_all` 默认 false（必须恰好 1 次）；超过 256KiB 报错且不落盘；原子写；禁穿越。`enabled = false` 不注册。无 shell / exec
+- 可选 grep：默认注册。工作区字面量文本搜索（非正则）；`path` 默认 `.`；可选 `glob` / `case_insensitive` / `max_matches`（默认 50）；禁穿越。`enabled = false` 不注册。无 shell / ripgrep / exec
 
 ## 项目结构
 
@@ -847,6 +859,11 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Configure `[tools.str_replace] enabled` (default `true`); read or write over **256KiB** (aligned with read/write) is rejected and not written
   - tmp + rename atomic write; binary files are refused; same path policy as MEMORY / read_file: no `..` / absolute / symlink escape
   - `enabled = false` skips registration; no shell, no LLM; **no exec**
+- ✅ **Optional grep** - registered by default (`pattern` required)
+  - Optional `path` (relative directory or file, default `.`), `glob` (e.g. `*.rs`), `case_insensitive`, `max_matches` (default 50, clamped to 1..=200)
+  - **Literal substring** search (not regex, avoids ReDoS); returns `{path, line, snippet}` with long lines truncated
+  - Configure `[tools.grep] enabled` (default `true`); same path policy as other file tools: no `..` / absolute / symlink escape; does not follow escaping symlinks; skips binary files
+  - Pure Rust; no shell / ripgrep subprocess, no LLM; `enabled = false` skips registration; **no exec**
 - ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
   - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
   - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
@@ -1093,6 +1110,12 @@ enabled = true
 # Optional workspace exact string replace (registered by default). path / old_str / new_str required; replace_all default false (exactly one match).
 # Read or write over 256KiB (aligned with read/write) is rejected and not written. Atomic write. Binary refused. No traversal / symlink escape.
 # enabled = false skips registration.
+enabled = true
+
+[tools.grep]
+# Optional workspace literal text search (registered by default). pattern required (literal substring, not regex, avoids ReDoS).
+# Optional path (relative directory or file, default .), glob (e.g. *.rs), case_insensitive, max_matches (default 50, clamped 1..=200).
+# Returns {path, line, snippet}; skips binary; no traversal / symlink escape. No shell / ripgrep. enabled = false skips registration.
 enabled = true
 ```
 
@@ -1368,6 +1391,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional write_file: registered by default. Writes a workspace-relative regular file; `mode=overwrite|append` (default overwrite); over 256KiB is rejected and not written; atomic write; no traversal. `enabled = false` skips registration. No shell / exec
 - Optional delete_file: registered by default. Deletes a workspace-relative regular file; directories are rejected; missing files return an explicit error; no traversal / symlink escape. `enabled = false` skips registration. No recursion / shell / exec
 - Optional str_replace: registered by default. Exact in-file string replace; `replace_all` defaults to false (must match exactly once); over 256KiB is rejected and not written; atomic write; no traversal. `enabled = false` skips registration. No shell / exec
+- Optional grep: registered by default. Workspace literal text search (not regex); `path` defaults to `.`; optional `glob` / `case_insensitive` / `max_matches` (default 50); no traversal. `enabled = false` skips registration. No shell / ripgrep / exec
 
 ### Documentation
 

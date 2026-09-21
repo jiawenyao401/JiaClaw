@@ -248,7 +248,7 @@ triggers:
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
 | **Shell 命令** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
-| **文件读写** | ✅ 完整 | ✅ 完整 | ✅ **已实现 + 沙箱 read_file/list_dir/write_file/delete_file/str_replace** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
+| **文件读写** | ✅ 完整 | ✅ 完整 | ✅ **已实现 + 沙箱 read_file/list_dir/write_file/delete_file/str_replace/grep** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
 | **浏览器控制** | ✅ Selenium/Playwright | ⏳ 部分 | ⏳ 计划中（M3） | P2 | MCP Browser Tool |
 | **网页抓取** | ✅ BeautifulSoup | ✅ 完整 | ✅ **可选 web_fetch（去标签文本）** | P1 | 轻量 HTML 剥离，无头浏览器不做 |
 | **API 调用** | ✅ requests | ✅ httpx | ✅ **已实现（HTTP）** | P1 | Rust reqwest + MCP |
@@ -301,6 +301,11 @@ triggers:
   - 可选 `replace_all`（默认 `false`：必须恰好匹配 1 次，否则报错；`true` 替换全部非重叠匹配）
   - 读入或写出超过 256KiB（与 read/write 对齐）明确报错且不落盘；tmp + rename 原子写；拒绝二进制
   - 路径安全复用 resolve（禁穿越 / 绝对路径 / symlink 逃逸）；只操作工作区内常规文本文件
+  - `enabled = false` 不注册；`GET /api/tools` / system prompt / doctor 与其它可选工具并列；无 shell、不调用 LLM；**不做 exec**
+- ✅ **可选 grep**（默认注册；`pattern` 必填，字面量子串）
+  - 可选 `path`（相对目录或文件，默认 `.`）、`glob`（如 `*.rs`）、`case_insensitive`、`max_matches`（默认 50，钳制 1..=200）
+  - **字面量**搜索（非正则，避免 ReDoS）；返回 `{path, line, snippet}`；过长行截断；跳过二进制
+  - 路径安全复用 resolve（禁穿越 / 绝对路径 / symlink 逃逸）；不跟随逃逸 symlink；纯 Rust，无 ripgrep 外部进程
   - `enabled = false` 不注册；`GET /api/tools` / system prompt / doctor 与其它可选工具并列；无 shell、不调用 LLM；**不做 exec**
 - ✅ **可选每工具调用超时**（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`，正整数启用；`0`/非法=关闭）
   - 对每次 `Tool::execute` 用 `tokio::time::timeout` 包裹；超时写入 `Tool timed out after Ns` 到 tool result，不 panic，继续 loop
@@ -426,7 +431,7 @@ triggers:
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
 | **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
 | **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
-| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/请求体上限/TTL/摘要压缩/工具超时/工具循环上限/Heartbeat/web_search/web_fetch/memory_search/memory_write/read_file/list_dir/write_file/delete_file/str_replace/metrics/JSON 日志/优雅退出** | P1 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/请求体上限/TTL/摘要压缩/工具超时/工具循环上限/Heartbeat/web_search/web_fetch/memory_search/memory_write/read_file/list_dir/write_file/delete_file/str_replace/grep/metrics/JSON 日志/优雅退出** | P1 | - |
 | **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
 | **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
@@ -447,7 +452,8 @@ triggers:
 - ✅ 可选 `write_file`（`[tools.write_file] enabled` 默认 true；工作区相对路径写入；overwrite/append；256KiB 上限；原子写；doctor 报告是否启用）
 - ✅ 可选 `delete_file`（`[tools.delete_file] enabled` 默认 true；工作区相对路径删除常规文件；拒绝目录；缺文件报错；doctor 报告是否启用）
 - ✅ 可选 `str_replace`（`[tools.str_replace] enabled` 默认 true；工作区相对路径精确替换；默认恰好 1 次；256KiB 上限；原子写；doctor 报告是否启用）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、请求体上限、Metrics 是否公开、日志 format、Session TTL、优雅退出宽限期、Session 摘要压缩、工具超时、工具循环上限、web_search key 是否配置、web_fetch 是否启用、memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
+- ✅ 可选 `grep`（`[tools.grep] enabled` 默认 true；工作区字面量文本搜索，非正则；默认最多 50 条；doctor 报告是否启用）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、请求体上限、Metrics 是否公开、日志 format、Session TTL、优雅退出宽限期、Session 摘要压缩、工具超时、工具循环上限、web_search key 是否配置、web_fetch 是否启用、memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace / grep 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
@@ -474,10 +480,11 @@ triggers:
   - 可选 write_file（`[tools.write_file]`，工作区相对路径写入；overwrite/append；上限 256KiB；原子写；禁穿越）
   - 可选 delete_file（`[tools.delete_file]`，工作区相对路径删除常规文件；拒绝目录；缺文件报错；禁穿越）
   - 可选 str_replace（`[tools.str_replace]`，工作区相对路径精确替换；默认恰好 1 次；上限 256KiB；原子写；禁穿越）
+  - 可选 grep（`[tools.grep]`，工作区字面量文本搜索，非正则；默认最多 50 条；禁穿越；无 shell / ripgrep）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小
-  - HTTP 配置摘要（bind、日志 format、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 是否启用及允许来源、限流是否开启及数值、请求体上限字节数、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
+  - HTTP 配置摘要（bind、日志 format、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 是否启用及允许来源、限流是否开启及数值、请求体上限字节数、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write / read_file / list_dir / write_file / delete_file / str_replace / grep 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
@@ -597,6 +604,7 @@ triggers:
 | 工作区 write_file | ✅ 本切片 | 路径沙箱，原子写，无 exec |
 | 工作区 delete_file | ✅ 本切片 | 路径沙箱，只删常规文件，无 exec |
 | 工作区 str_replace | ✅ 本切片 | 路径沙箱，精确替换，原子写，无 exec |
+| 工作区 grep | ✅ 本切片 | 路径沙箱，字面量搜索，无 regex / exec |
 | 工作区 SOUL.md / USER.md 注入 | ✅ 本切片 | - |
 | 工作区 HEARTBEAT.md 定时心跳 | ✅ 本切片 | - |
 
