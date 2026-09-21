@@ -63,6 +63,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*`、`/hooks/inbound`、`/hooks/telegram`、`/hooks/slack` 与 `/hooks/discord`
   - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - 超限返回 429 + `Retry-After`；`GET /health` 与 `GET /metrics` 始终不限流
+- ✅ **可选 CORS** - 默认关闭（无 CORS 头）。本地浏览器前端可开 `[http.cors]`
+  - `enabled` 默认 `false`；`JIACLAW_CORS_ENABLED` 覆盖。`allowed_origins` 精确匹配；`*` 仅在显式配置或 `JIACLAW_CORS_ORIGINS=*` 时
+  - 默认方法 GET/POST/DELETE/OPTIONS；允许头 Authorization / Content-Type / X-Request-Id / Accept；暴露 `X-Request-Id`
+  - OPTIONS preflight 不要求 API Bearer，仍回写 `X-Request-Id`；未匹配 Origin 不回声
 - ✅ **可选 GET /metrics** - 进程内 Prometheus 文本（不引入 telemetry SDK）
   - 默认无需 API Bearer（便于 scrape）；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权
   - 计数：`jiaclaw_http_requests_total{path,method,status}`（路由族）、`jiaclaw_sessions_active`、`jiaclaw_tool_calls_total{tool,result}`、`jiaclaw_build_info{version}`
@@ -230,10 +234,16 @@ bind = "127.0.0.1:8080"
 # 若设置，deferred ACK 后会 PATCH 编辑原始 Interaction；未设置则仅记 session
 # discord_bot_token = "your-discord-bot-token"
 
-# CORS 允许的来源列表（空或 ["*"] 表示允许所有来源）
-cors_allow_origins = ["*"]
-# 或限制特定来源：
-# cors_allow_origins = ["https://example.com"]
+# 可选浏览器 CORS（默认关闭，不发送 CORS 头）
+# 本地 Web UI：enabled = true，并填写精确 Origin。`*` 仅在显式配置时允许所有来源。
+# 环境变量 JIACLAW_CORS_ENABLED、JIACLAW_CORS_ORIGINS（逗号分隔）优先。
+# [http.cors]
+# enabled = true
+# allowed_origins = ["http://localhost:5173"]
+# allowed_methods = ["GET", "POST", "DELETE", "OPTIONS"]
+# allowed_headers = ["Authorization", "Content-Type", "X-Request-Id", "Accept"]
+# expose_headers = ["X-Request-Id"]
+# max_age_secs = 600
 
 # Session 持久化配置（可选）
 persist = true  # 启用 session 持久化
@@ -316,6 +326,9 @@ enabled = true
 
 ```bash
 export JIACLAW_API_KEY=brk_live_your_key_here
+# 可选：浏览器 CORS（默认关闭；1/true 开启，优先于 [http.cors] enabled）
+# export JIACLAW_CORS_ENABLED=1
+# export JIACLAW_CORS_ORIGINS=http://localhost:5173,https://app.example
 # 可选：HTTP 限流（次/分钟，优先于配置文件）
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 # 可选：GET /metrics 要求与 /api/* 相同鉴权（优先于 [http] metrics_public）
@@ -557,6 +570,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 超限返回 `429` + `Retry-After`；`GET /health` 与 `GET /metrics` 不限流
+- 可选 CORS：默认关闭、不发送 CORS 头。`[http.cors] enabled = true` 或 `JIACLAW_CORS_ENABLED=1` 后，匹配的 `Origin` 获得 `Access-Control-Allow-Origin`；`JIACLAW_CORS_ORIGINS` 逗号分隔覆盖 `allowed_origins`。`*` 仅在显式配置时允许所有来源。OPTIONS preflight 不要求 API Bearer，仍回写 `X-Request-Id`。未匹配 Origin 不回声
 - 可选 Prometheus 指标：`GET /metrics` 默认公开；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。进程内计数（HTTP 路由族、session 数、工具调用、build_info），不引入 telemetry SDK
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET/export 为 404
 - serve 优雅退出：`jiaclaw serve` 支持 SIGINT/SIGTERM；停止 accept 并等待进行中请求。`[http] shutdown_timeout_secs` 默认 15 秒，`JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先（正整数；非法回退默认）。落盘开启时关闭路径刷盘；Heartbeat 任务 abort
@@ -663,6 +677,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord`
   - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - Over-limit returns 429 + `Retry-After`; `GET /health` and `GET /metrics` are never limited
+- ✅ **Optional CORS** - off by default (no CORS headers). Enable `[http.cors]` for a local browser UI
+  - `enabled` defaults to `false`; override with `JIACLAW_CORS_ENABLED`. `allowed_origins` is exact-match; `*` only when configured explicitly or `JIACLAW_CORS_ORIGINS=*`
+  - Default methods GET/POST/DELETE/OPTIONS; allowed headers Authorization / Content-Type / X-Request-Id / Accept; expose `X-Request-Id`
+  - OPTIONS preflight does not require an API Bearer and still writes `X-Request-Id`; unmatched origins are never echoed
 - ✅ **Optional GET /metrics** - in-process Prometheus text (no telemetry SDK)
   - Public by default for scraping; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`
   - Series: `jiaclaw_http_requests_total{path,method,status}` (route family), `jiaclaw_sessions_active`, `jiaclaw_tool_calls_total{tool,result}`, `jiaclaw_build_info{version}`
@@ -830,10 +848,16 @@ bind = "127.0.0.1:8080"
 # When set, deferred ACK is followed by PATCH of the original Interaction; unset only records the session
 # discord_bot_token = "your-discord-bot-token"
 
-# CORS allowed origins (empty or ["*"] allows all origins)
-cors_allow_origins = ["*"]
-# Or restrict to specific origins:
-# cors_allow_origins = ["https://example.com"]
+# Optional browser CORS (disabled by default; no CORS headers)
+# For a local Web UI set enabled = true and list exact origins. `*` allows all only when written explicitly.
+# JIACLAW_CORS_ENABLED and JIACLAW_CORS_ORIGINS (comma-separated) take priority.
+# [http.cors]
+# enabled = true
+# allowed_origins = ["http://localhost:5173"]
+# allowed_methods = ["GET", "POST", "DELETE", "OPTIONS"]
+# allowed_headers = ["Authorization", "Content-Type", "X-Request-Id", "Accept"]
+# expose_headers = ["X-Request-Id"]
+# max_age_secs = 600
 
 # Session persistence config (optional)
 persist = true  # Enable session persistence
@@ -915,6 +939,9 @@ Or use environment variable:
 
 ```bash
 export JIACLAW_API_KEY=brk_live_your_key_here
+# Optional: browser CORS (off by default; 1/true enables, overrides [http.cors] enabled)
+# export JIACLAW_CORS_ENABLED=1
+# export JIACLAW_CORS_ORIGINS=http://localhost:5173,https://app.example
 # Optional: HTTP rate limit (requests/minute, overrides config file)
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 # Optional: require /api/* auth for GET /metrics (overrides [http] metrics_public)
@@ -1149,6 +1176,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` return `429` + `Retry-After` when exceeded; `GET /health` and `GET /metrics` are never limited
+- Optional CORS: off by default (no CORS headers). `[http.cors] enabled = true` or `JIACLAW_CORS_ENABLED=1` echoes `Access-Control-Allow-Origin` for matching origins; `JIACLAW_CORS_ORIGINS` (comma-separated) overrides `allowed_origins`. `*` allows all only when configured explicitly. OPTIONS preflight does not require an API Bearer and still writes `X-Request-Id`. Unmatched origins are never echoed
 - Optional Prometheus metrics: `GET /metrics` is public by default; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`. In-process counters (HTTP route family, session gauge, tool calls, build_info); no telemetry SDK
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET/export of an expired id returns 404
 - Graceful serve shutdown: `jiaclaw serve` handles SIGINT/SIGTERM; stops accepting and drains in-flight requests. `[http] shutdown_timeout_secs` defaults to 15s; `JIACLAW_SHUTDOWN_TIMEOUT_SECS` wins (positive integer; invalid falls back to default). Persist flush on shutdown; heartbeat tasks are aborted

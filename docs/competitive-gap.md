@@ -408,7 +408,7 @@ triggers:
 **JiaClaw 现状**:
 - ✅ Cargo 工作空间已配置
 - ✅ `jiaclaw init` 命令创建工作空间
-- ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、slack_signing_secret、slack_bot_token、discord_public_key、discord_bot_token、cors_allow_origins、可选限流、可选 Session TTL、可选 metrics 公开开关）
+- ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、slack_signing_secret、slack_bot_token、discord_public_key、discord_bot_token、可选 `[http.cors]`、可选限流、可选 Session TTL、可选 metrics 公开开关）
 - ✅ 可选工具超时（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`）
 - ✅ 可配置工具循环上限（`[agent] max_tool_iterations` / `JIACLAW_MAX_TOOL_ITERATIONS`，默认 5，钳制 1–32）
 - ✅ 可选 `web_search`（`[tools.web_search] enabled` / `brave_api_key`，`JIACLAW_BRAVE_API_KEY` 优先；doctor 不打印 key）
@@ -421,8 +421,8 @@ triggers:
 **目标方案**:
 - **P1 运维配置**: ✅ **已实现**
   - TOML 配置支持 `[http]` 段落
-  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_SLACK_SIGNING_SECRET`、`JIACLAW_SLACK_BOT_TOKEN`、`JIACLAW_DISCORD_PUBLIC_KEY`、`JIACLAW_DISCORD_BOT_TOKEN`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_METRICS_REQUIRE_AUTH`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_SHUTDOWN_TIMEOUT_SECS`、`JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW`、`JIACLAW_TOOL_TIMEOUT_SECS`、`JIACLAW_MAX_TOOL_ITERATIONS`、`JIACLAW_HEARTBEAT_INTERVAL_SECS`、`JIACLAW_BRAVE_API_KEY` 优先）
-  - CORS 来源控制（空或 `["*"]` 保持 permissive，否则限制）
+  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_SLACK_SIGNING_SECRET`、`JIACLAW_SLACK_BOT_TOKEN`、`JIACLAW_DISCORD_PUBLIC_KEY`、`JIACLAW_DISCORD_BOT_TOKEN`、`JIACLAW_CORS_ENABLED`、`JIACLAW_CORS_ORIGINS`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_METRICS_REQUIRE_AUTH`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_SHUTDOWN_TIMEOUT_SECS`、`JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW`、`JIACLAW_TOOL_TIMEOUT_SECS`、`JIACLAW_MAX_TOOL_ITERATIONS`、`JIACLAW_HEARTBEAT_INTERVAL_SECS`、`JIACLAW_BRAVE_API_KEY` 优先）
+  - 可选 CORS（`[http.cors] enabled` 默认 `false` 不发送 CORS 头；`allowed_origins` 精确匹配，`*` 仅显式配置时；`JIACLAW_CORS_ENABLED` / `JIACLAW_CORS_ORIGINS` 可覆盖；OPTIONS preflight 不破坏鉴权/限流/`X-Request-Id`）
   - 可选进程内全局限流（`rate_limit_per_minute`，超限 429 + Retry-After）
   - 可选 Prometheus 文本指标（`GET /metrics`，默认公开；`metrics_public = false` / `JIACLAW_METRICS_REQUIRE_AUTH` 可要求 API 鉴权；不计入限流）
   - 可选会话闲置 TTL（`session_ttl_secs`，过期清理内存 store；落盘开启时同步 save）
@@ -438,7 +438,7 @@ triggers:
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小
-  - HTTP 配置摘要（bind、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
+  - HTTP 配置摘要（bind、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 是否启用及允许来源、限流是否开启及数值、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 

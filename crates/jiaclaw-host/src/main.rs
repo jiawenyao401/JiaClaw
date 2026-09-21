@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, Sse},
@@ -29,7 +29,7 @@ use jiaclaw::{
     inspect_memory_file, load_heartbeat_message, resolve_heartbeat_path, JiaClawAgent, Workspace,
 };
 use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole, ToolCall,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpCorsConfig, MessageRole, ToolCall,
     MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
 };
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::Instant;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod metrics;
 use metrics::{classify_http_path, Metrics, PROMETHEUS_CONTENT_TYPE};
@@ -1560,10 +1560,15 @@ async fn request_id_middleware(mut request: Request, next: Next) -> Response {
     response
 }
 
+#[cfg(test)]
 fn build_router(state: AppState) -> Router {
+    build_router_with_cors(state, None)
+}
+
+fn build_router_with_cors(state: AppState, cors: Option<CorsLayer>) -> Router {
     let limiter = state.rate_limiter.clone();
     let metrics = state.metrics.clone();
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/api/chat", post(chat_handler))
@@ -1589,10 +1594,102 @@ fn build_router(state: AppState) -> Router {
             limiter,
             rate_limit_middleware,
         ))
-        .layer(middleware::from_fn_with_state(metrics, metrics_middleware))
-        // 外层：即使限流 429 也回写 X-Request-Id
+        .layer(middleware::from_fn_with_state(metrics, metrics_middleware));
+    if let Some(layer) = cors {
+        router = router.layer(layer);
+    }
+    router
+        // 外层：即使限流 429 / CORS preflight 也回写 X-Request-Id
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
+}
+
+/// 由已 `resolved()` 的 CORS 配置构建中间件。`enabled = false` 时不挂层、不发送 CORS 头。
+fn build_cors_layer(cors: &HttpCorsConfig) -> Option<CorsLayer> {
+    if !cors.enabled {
+        return None;
+    }
+
+    let methods = parse_cors_methods(&cors.allowed_methods);
+    let allow_headers = parse_cors_header_names(&cors.allowed_headers);
+    let expose_headers = parse_cors_header_names(&cors.expose_headers);
+    let origins = cors.allowed_origins.clone();
+    let allow_any = origins.iter().any(|origin| origin == "*");
+    let allow_origin = if allow_any {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::predicate(move |origin, _parts| {
+            origin
+                .to_str()
+                .ok()
+                .is_some_and(|candidate| origins.iter().any(|item| item == candidate))
+        })
+    };
+
+    let mut layer = CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods(methods)
+        .allow_headers(allow_headers)
+        .expose_headers(expose_headers);
+    if let Some(secs) = cors.max_age_secs.filter(|&value| value > 0) {
+        layer = layer.max_age(Duration::from_secs(secs));
+    }
+    Some(layer)
+}
+
+fn parse_cors_methods(values: &[String]) -> Vec<Method> {
+    let parsed: Vec<Method> = values.iter().filter_map(|item| item.parse().ok()).collect();
+    if parsed.is_empty() {
+        vec![Method::GET, Method::POST, Method::DELETE, Method::OPTIONS]
+    } else {
+        parsed
+    }
+}
+
+fn parse_cors_header_names(values: &[String]) -> Vec<HeaderName> {
+    let parsed: Vec<HeaderName> = values.iter().filter_map(|item| item.parse().ok()).collect();
+    if parsed.is_empty() {
+        vec![
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-request-id"),
+            header::ACCEPT,
+        ]
+    } else {
+        parsed
+    }
+}
+
+fn cors_status_line(cors: &HttpCorsConfig) -> String {
+    let resolved = cors.resolved();
+    if !resolved.enabled {
+        "未启用（默认无 CORS 头）".to_string()
+    } else if resolved.allows_any_origin() {
+        "已启用（允许所有来源 *）".to_string()
+    } else if resolved.allowed_origins.is_empty() {
+        "已启用（未配置 allowed_origins，不回声任何 Origin）".to_string()
+    } else {
+        format!(
+            "已启用（允许来源: {}）",
+            resolved.allowed_origins.join(", ")
+        )
+    }
+}
+
+fn cors_enabled_config_source() -> &'static str {
+    if std::env::var("JIACLAW_CORS_ENABLED").is_ok() {
+        "环境变量 JIACLAW_CORS_ENABLED"
+    } else {
+        "配置文件"
+    }
+}
+
+fn cors_origins_config_source() -> &'static str {
+    if std::env::var("JIACLAW_CORS_ORIGINS").is_ok() {
+        "环境变量 JIACLAW_CORS_ORIGINS"
+    } else {
+        "配置文件"
+    }
 }
 
 fn rate_limit_config_source() -> &'static str {
@@ -2200,32 +2297,13 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         tracing::info!("Heartbeat 未启用");
     }
 
-    // 配置 CORS
-    let cors = if config.http.cors_allow_origins.is_empty()
-        || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
-    {
-        // 允许所有来源
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([Method::GET, Method::POST, Method::DELETE])
-            .allow_headers(Any)
-    } else {
-        // 限制特定来源
-        let origins: Vec<_> = config
-            .http
-            .cors_allow_origins
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        CorsLayer::new()
-            .allow_origin(origins)
-            .allow_methods([Method::GET, Method::POST, Method::DELETE])
-            .allow_headers(Any)
-    };
+    // 配置 CORS（默认关闭；request_id 仍在外层，preflight 也会回写 X-Request-Id）
+    let cors = config.http.cors.resolved();
+    let cors_layer = build_cors_layer(&cors);
 
     // 构建路由（限流中间件不依赖 ConnectInfo，oneshot 测试不会 500）
     let shutdown_state = state.clone();
-    let app = build_router(state).layer(cors);
+    let app = build_router_with_cors(state, cors_layer);
 
     // 绑定地址
     let listener = tokio::net::TcpListener::bind(&config.http.bind)
@@ -2269,6 +2347,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         tracing::info!("   • Discord 出站: 未配置 Bot Token（deferred ACK 后仅记 session）");
     }
     tracing::info!("   • X-Request-Id                - 请求无该头则生成 UUID 并回写");
+    tracing::info!(
+        "   • CORS                        - {}",
+        cors_status_line(&config.http.cors)
+    );
     if let Some(limit) = rate_limit_per_minute {
         tracing::info!(
             "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack、/hooks/discord；GET /health 与 GET /metrics 不限流）"
@@ -2553,14 +2635,18 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         println!("   • Heartbeat: ⚠️  未启用（仅 serve 进程可挂后台任务；CLI chat 不跑心跳）");
     }
 
-    if config.http.cors_allow_origins.is_empty()
-        || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
-    {
-        println!("   • CORS 模式: 允许所有来源（Permissive）");
+    if config.http.cors.resolved().enabled {
+        println!(
+            "   • CORS: ✅ {}（开关来自 {}，来源来自 {}）",
+            cors_status_line(&config.http.cors),
+            cors_enabled_config_source(),
+            cors_origins_config_source()
+        );
     } else {
         println!(
-            "   • CORS 模式: 限制来源（仅允许: {}）",
-            config.http.cors_allow_origins.join(", ")
+            "   • CORS: ⚠️  {}（开关来自 {}）",
+            cors_status_line(&config.http.cors),
+            cors_enabled_config_source()
         );
     }
 
@@ -4909,14 +4995,24 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     }
 
     // CORS 配置
-    if config.http.cors_allow_origins.is_empty()
-        || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
-    {
-        println!("   CORS 模式: 允许所有来源（Permissive）");
+    if config.http.cors.resolved().enabled {
+        println!(
+            "   CORS: ✅ {}（开关来自 {}，来源来自 {}）",
+            cors_status_line(&config.http.cors),
+            cors_enabled_config_source(),
+            cors_origins_config_source()
+        );
     } else {
         println!(
-            "   CORS 模式: 限制来源（{}）",
-            config.http.cors_allow_origins.join(", ")
+            "   CORS: ⚠️  {}（默认收紧，无 CORS 头；开关来自 {}）",
+            cors_status_line(&config.http.cors),
+            cors_enabled_config_source()
+        );
+        println!(
+            "   💡 浏览器前端可设 [http.cors] enabled = true，或 export JIACLAW_CORS_ENABLED=1"
+        );
+        println!(
+            "   💡 允许来源：allowed_origins 或 JIACLAW_CORS_ORIGINS（逗号分隔；* 仅在显式配置时）"
         );
     }
 
@@ -5005,6 +5101,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
             "未启用".to_string()
         }
     );
+    println!("   • CORS: {}", cors_status_line(&config.http.cors));
     println!(
         "   • Metrics: {}",
         if metrics_public {
@@ -5524,6 +5621,68 @@ mod tests {
         };
 
         build_router(state)
+    }
+
+    fn create_test_app_with_cors(cors: &HttpCorsConfig) -> Router {
+        create_test_app_with_cors_and_token(cors, None)
+    }
+
+    fn create_test_app_with_cors_and_token(
+        cors: &HttpCorsConfig,
+        api_token: Option<String>,
+    ) -> Router {
+        let config = AgentConfig::default();
+        let metrics = Arc::new(Metrics::default());
+        let agent = attach_tool_metrics(
+            JiaClawAgent::new(config).expect("创建测试 agent 失败"),
+            &metrics,
+        );
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            discord_public_key: None,
+            discord_bot_token: None,
+            discord_api_base: DISCORD_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+            metrics,
+            metrics_require_auth: false,
+        };
+        build_router_with_cors(state, build_cors_layer(cors))
+    }
+
+    fn matching_browser_cors() -> HttpCorsConfig {
+        HttpCorsConfig {
+            enabled: true,
+            allowed_origins: vec!["http://localhost:5173".to_string()],
+            max_age_secs: Some(600),
+            ..HttpCorsConfig::default()
+        }
+    }
+
+    fn cors_header<'a>(response: &'a axum::http::Response<Body>, name: &str) -> Option<&'a str> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    fn header_list_contains(value: &str, needle: &str) -> bool {
+        value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case(needle))
     }
 
     fn create_test_state_from_config(config: AgentConfig) -> AppState {
@@ -10534,6 +10693,209 @@ mod tests {
             .unwrap();
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(request_id_header(&second), client_id);
+    }
+
+    #[tokio::test]
+    async fn test_cors_disabled_has_no_allow_origin() {
+        let app = create_test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "http://localhost:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            cors_header(&response, "access-control-allow-origin").is_none(),
+            "enabled=false 时不应发送 Access-Control-Allow-Origin"
+        );
+        assert!(!request_id_header(&response).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cors_enabled_echoes_matching_origin() {
+        let app = create_test_app_with_cors(&matching_browser_cors());
+        let origin = "http://localhost:5173";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", origin)
+                    .header("X-Request-Id", "cors-match-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            cors_header(&response, "access-control-allow-origin"),
+            Some(origin)
+        );
+        let expose = cors_header(&response, "access-control-expose-headers").unwrap_or("");
+        assert!(
+            header_list_contains(expose, "x-request-id"),
+            "应暴露 X-Request-Id，实际: {expose}"
+        );
+        assert_eq!(request_id_header(&response), "cors-match-1");
+    }
+
+    #[tokio::test]
+    async fn test_cors_enabled_does_not_echo_unmatched_origin() {
+        let app = create_test_app_with_cors(&matching_browser_cors());
+        let evil = "https://evil.example";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", evil)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let acao = cors_header(&response, "access-control-allow-origin");
+        assert_ne!(acao, Some(evil), "不得回声未允许的 Origin");
+        assert!(acao.is_none(), "不匹配来源时不应发送 ACAO，实际: {acao:?}");
+    }
+
+    #[tokio::test]
+    async fn test_cors_wildcard_uses_star_not_request_origin() {
+        let cors = HttpCorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            ..HttpCorsConfig::default()
+        };
+        let app = create_test_app_with_cors(&cors);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "https://unlisted.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            cors_header(&response, "access-control-allow-origin"),
+            Some("*")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cors_preflight_options_for_api_chat() {
+        let app = create_test_app_with_cors(&matching_browser_cors());
+        let origin = "http://localhost:5173";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/chat")
+                    .header("Origin", origin)
+                    .header("Access-Control-Request-Method", "POST")
+                    .header(
+                        "Access-Control-Request-Headers",
+                        "authorization,content-type,x-request-id,accept",
+                    )
+                    .header("X-Request-Id", "cors-preflight-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            cors_header(&response, "access-control-allow-origin"),
+            Some(origin)
+        );
+        let methods = cors_header(&response, "access-control-allow-methods").unwrap_or("");
+        for required in ["GET", "POST", "DELETE", "OPTIONS"] {
+            assert!(
+                header_list_contains(methods, required),
+                "Allow-Methods 应含 {required}，实际: {methods}"
+            );
+        }
+        let headers = cors_header(&response, "access-control-allow-headers").unwrap_or("");
+        for required in ["authorization", "content-type", "x-request-id", "accept"] {
+            assert!(
+                header_list_contains(headers, required),
+                "Allow-Headers 应含 {required}，实际: {headers}"
+            );
+        }
+        assert_eq!(
+            cors_header(&response, "access-control-max-age"),
+            Some("600")
+        );
+        assert_eq!(request_id_header(&response), "cors-preflight-1");
+    }
+
+    #[tokio::test]
+    async fn test_cors_preflight_does_not_require_api_token() {
+        let app = create_test_app_with_cors_and_token(
+            &matching_browser_cors(),
+            Some("secret-token".to_string()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/chat")
+                    .header("Origin", "http://localhost:5173")
+                    .header("Access-Control-Request-Method", "POST")
+                    .header(
+                        "Access-Control-Request-Headers",
+                        "authorization,content-type",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            cors_header(&response, "access-control-allow-origin"),
+            Some("http://localhost:5173")
+        );
+        assert!(!request_id_header(&response).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cors_preflight_unmatched_origin_does_not_echo() {
+        let app = create_test_app_with_cors(&matching_browser_cors());
+        let evil = "https://evil.example";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/chat")
+                    .header("Origin", evil)
+                    .header("Access-Control-Request-Method", "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let acao = cors_header(&response, "access-control-allow-origin");
+        assert_ne!(acao, Some(evil), "preflight 不得回声未允许 Origin");
+        assert!(
+            acao.is_none(),
+            "不匹配 preflight 不应发送 ACAO，实际: {acao:?}"
+        );
     }
 
     #[tokio::test]

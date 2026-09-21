@@ -145,7 +145,7 @@
 - **CLI 接口**
   - `jiaclaw serve` - 启动 HTTP 服务
   - `jiaclaw chat <message>` - 单次聊天
-  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔；工具循环上限生效值；web_search / web_fetch / memory_search / memory_write 是否启用；serve 优雅退出宽限期）
+  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔；工具循环上限生效值；web_search / web_fetch / memory_search / memory_write 是否启用；可选 CORS 是否启用；serve 优雅退出宽限期）
   - `jiaclaw memory show` - 显示工作区长期记忆
   - `jiaclaw session export <id> [-o file]` - 从落盘 store 只读导出 JSONL
   - `jiaclaw session import <file> [--id ID] [--overwrite]` - 导入 JSONL/JSON 到落盘 store（不调用 LLM）
