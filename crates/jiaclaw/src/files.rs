@@ -869,53 +869,56 @@ pub fn glob_matches(pattern: &str, rel_path: &str) -> bool {
         let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
         return glob_match_segment(pattern, name);
     }
-    let pat_parts: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-    let path_parts: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
-    glob_match_parts(&pat_parts, &path_parts)
+    let glob_segs: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let file_segs: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+    glob_match_parts(&glob_segs, &file_segs)
 }
 
-fn glob_match_parts(pat: &[&str], path: &[&str]) -> bool {
-    match (pat.split_first(), path.split_first()) {
+fn glob_match_parts(glob_segs: &[&str], file_segs: &[&str]) -> bool {
+    match (glob_segs.split_first(), file_segs.split_first()) {
         (None, None) => true,
         (None, Some(_)) => false,
-        (Some((&"**", rest)), None) => glob_match_parts(rest, path),
+        (Some((&"**", rest)), None) => glob_match_parts(rest, file_segs),
         (Some((&"**", rest)), Some((_, remaining))) => {
-            glob_match_parts(rest, path) || glob_match_parts(pat, remaining)
+            glob_match_parts(rest, file_segs) || glob_match_parts(glob_segs, remaining)
         }
         (Some((segment, rest)), Some((name, remaining))) => {
             glob_match_segment(segment, name) && glob_match_parts(rest, remaining)
         }
-        (Some((segment, rest)), None) => *segment == "**" && glob_match_parts(rest, path),
+        (Some((segment, rest)), None) => *segment == "**" && glob_match_parts(rest, file_segs),
     }
 }
 
-fn glob_match_segment(pat: &str, text: &str) -> bool {
-    let pat: Vec<char> = pat.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-    let mut pi = 0;
-    let mut ti = 0;
-    let mut star_pi: Option<usize> = None;
-    let mut star_ti = 0;
-    while ti < text.len() {
-        if pi < pat.len() && pat[pi] != '*' && (pat[pi] == '?' || pat[pi] == text[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < pat.len() && pat[pi] == '*' {
-            star_pi = Some(pi);
-            star_ti = ti;
-            pi += 1;
-        } else if let Some(sp) = star_pi {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
+fn glob_match_segment(glob: &str, text: &str) -> bool {
+    let glob_chars: Vec<char> = glob.chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    let mut glob_idx = 0;
+    let mut text_idx = 0;
+    let mut star_glob: Option<usize> = None;
+    let mut star_text = 0;
+    while text_idx < text_chars.len() {
+        if glob_idx < glob_chars.len()
+            && glob_chars[glob_idx] != '*'
+            && (glob_chars[glob_idx] == '?' || glob_chars[glob_idx] == text_chars[text_idx])
+        {
+            glob_idx += 1;
+            text_idx += 1;
+        } else if glob_idx < glob_chars.len() && glob_chars[glob_idx] == '*' {
+            star_glob = Some(glob_idx);
+            star_text = text_idx;
+            glob_idx += 1;
+        } else if let Some(star_at) = star_glob {
+            glob_idx = star_at + 1;
+            star_text += 1;
+            text_idx = star_text;
         } else {
             return false;
         }
     }
-    while pi < pat.len() && pat[pi] == '*' {
-        pi += 1;
+    while glob_idx < glob_chars.len() && glob_chars[glob_idx] == '*' {
+        glob_idx += 1;
     }
-    pi == pat.len()
+    glob_idx == glob_chars.len()
 }
 
 fn workspace_rel_display(workspace: &Path, abs: &Path) -> String {
@@ -1133,7 +1136,7 @@ fn walk_grep_dir(
     Ok(truncated || out.len() >= args.max_matches || *files_scanned >= GREP_MAX_FILES_SCANNED)
 }
 
-/// 在工作区内按**字面量**子串搜索文本（非正则，避免 ReDoS）。
+/// 在工作区内按**字面量**子串搜索文本（非正则，避免 `ReDoS`）。
 ///
 /// `path` 可为相对目录或文件（默认 `.`）。目录默认递归；不跟随 symlink。
 /// 二进制与超过 `file_max_bytes` 的文件在目录扫描时跳过；若 `path` 指向单个此类文件则报错。
