@@ -179,6 +179,10 @@ pub struct AgentConfig {
     /// `None` 或非正整数表示不限制，保持现有行为。
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
+
+    /// 本地工具配置（缺省本段不影响现有配置；`web_search` 默认启用）
+    #[serde(default)]
+    pub tools: ToolsConfig,
 }
 
 fn default_workspace_path() -> std::path::PathBuf {
@@ -439,6 +443,57 @@ pub fn resolve_session_keep_recent(configured: usize) -> usize {
         configured
     };
     raw.clamp(1, MAX_SESSION_MESSAGES.saturating_sub(1))
+}
+
+fn default_web_search_enabled() -> bool {
+    true
+}
+
+/// 本地工具总配置（缺省本段不影响现有 `[http]` / `[memory]` 等段）
+///
+/// 历史示例里的 `[tools] enabled = [...]` 列表仍可出现在文件中（未知字段忽略），
+/// 当前真正生效的是嵌套表 `[tools.web_search]`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolsConfig {
+    /// `web_search` 工具配置
+    #[serde(default)]
+    pub web_search: WebSearchToolConfig,
+}
+
+/// 可选 `web_search` 联网检索配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchToolConfig {
+    /// 是否注册 `web_search` 工具（默认 `true`）
+    #[serde(default = "default_web_search_enabled")]
+    pub enabled: bool,
+
+    /// Brave Search API key（可选，环境变量 `JIACLAW_BRAVE_API_KEY` 优先）
+    ///
+    /// 日志与 `jiaclaw doctor` 只报告是否已配置，不打印明文。
+    #[serde(default)]
+    pub brave_api_key: Option<String>,
+}
+
+impl Default for WebSearchToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_web_search_enabled(),
+            brave_api_key: None,
+        }
+    }
+}
+
+impl WebSearchToolConfig {
+    /// 解析生效的 Brave API key。
+    ///
+    /// 环境变量 `JIACLAW_BRAVE_API_KEY` 优先于配置文件；空白视为未配置。
+    #[must_use]
+    pub fn effective_brave_api_key(&self) -> Option<String> {
+        resolve_optional_secret(
+            self.brave_api_key.clone(),
+            std::env::var("JIACLAW_BRAVE_API_KEY").ok().as_deref(),
+        )
+    }
 }
 
 /// HTTP 服务配置
@@ -749,6 +804,7 @@ impl Default for AgentConfig {
             heartbeat: HeartbeatConfig::default(),
             session: SessionConfig::default(),
             tool_timeout_secs: None,
+            tools: ToolsConfig::default(),
         }
     }
 }
@@ -798,12 +854,14 @@ impl AgentConfig {
             heartbeat: Option<HeartbeatConfig>,
             #[serde(default)]
             session: Option<SessionConfig>,
+            #[serde(default)]
+            tools: Option<ToolsConfig>,
         }
 
         let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory / identity / heartbeat / session 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity / heartbeat / session / tools 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -821,6 +879,9 @@ impl AgentConfig {
         }
         if let Some(session) = config_file.session {
             config_file.agent.session = session;
+        }
+        if let Some(tools) = config_file.tools {
+            config_file.agent.tools = tools;
         }
 
         Ok(config_file.agent)
@@ -858,12 +919,14 @@ impl AgentConfig {
             heartbeat: Option<HeartbeatConfig>,
             #[serde(default)]
             session: Option<SessionConfig>,
+            #[serde(default)]
+            tools: Option<ToolsConfig>,
         }
 
         let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory / identity / heartbeat / session 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity / heartbeat / session / tools 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -882,6 +945,9 @@ impl AgentConfig {
         if let Some(session) = config_file.session {
             config_file.agent.session = session;
         }
+        if let Some(tools) = config_file.tools {
+            config_file.agent.tools = tools;
+        }
 
         Ok(config_file.agent)
     }
@@ -895,9 +961,10 @@ mod tests {
         resolve_heartbeat_interval_secs, resolve_optional_secret, resolve_rate_limit_per_minute,
         resolve_session_keep_recent, resolve_session_summarize_on_overflow,
         resolve_session_ttl_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
-        HttpConfig, SessionConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
-        DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
-        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_SESSION_MESSAGES,
+        HttpConfig, SessionConfig, ToolsConfig, WebSearchToolConfig,
+        DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
+        DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
+        MAX_SESSION_MESSAGES,
     };
 
     #[test]
@@ -1477,5 +1544,126 @@ max_turns = 10
         let config = AgentConfig::from_toml_str(toml).expect("parse toml");
         assert!(!config.session.summarize_on_overflow);
         assert_eq!(config.session.keep_recent, DEFAULT_SESSION_KEEP_RECENT);
+    }
+
+    #[test]
+    fn web_search_config_defaults_to_enabled_without_key() {
+        let config = WebSearchToolConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.brave_api_key, None);
+        assert!(ToolsConfig::default().web_search.enabled);
+        assert!(AgentConfig::default().tools.web_search.enabled);
+    }
+
+    #[test]
+    fn omitted_tools_section_keeps_web_search_defaults() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:8080"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(config.tools.web_search.enabled);
+        assert_eq!(config.tools.web_search.brave_api_key, None);
+        assert_eq!(config.http.bind, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn existing_tools_enabled_list_does_not_break_parsing() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools]
+enabled = ["search", "calculator"]
+
+[tools.web_search]
+enabled = false
+brave_api_key = "listed-key"
+
+[http]
+bind = "127.0.0.1:9090"
+
+[memory]
+path = "MEMORY.md"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.web_search.enabled);
+        assert_eq!(
+            config.tools.web_search.brave_api_key.as_deref(),
+            Some("listed-key")
+        );
+        assert_eq!(config.http.bind, "127.0.0.1:9090");
+        assert_eq!(config.memory.path, "MEMORY.md");
+    }
+
+    #[test]
+    fn tools_web_search_parses_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools.web_search]
+enabled = false
+brave_api_key = "BSA-test-key"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.web_search.enabled);
+        assert_eq!(
+            config.tools.web_search.brave_api_key.as_deref(),
+            Some("BSA-test-key")
+        );
+    }
+
+    #[test]
+    fn tools_web_search_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "tools": {
+                "web_search": {
+                    "enabled": true,
+                    "brave_api_key": "json-key"
+                }
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(config.tools.web_search.enabled);
+        assert_eq!(
+            config.tools.web_search.brave_api_key.as_deref(),
+            Some("json-key")
+        );
+    }
+
+    #[test]
+    fn resolve_optional_secret_prefers_env_for_brave_key() {
+        assert_eq!(
+            resolve_optional_secret(Some("cfg-key".to_string()), Some("env-key")),
+            Some("env-key".to_string())
+        );
+        assert_eq!(
+            resolve_optional_secret(Some("cfg-key".to_string()), Some("")),
+            Some("cfg-key".to_string())
+        );
+        assert_eq!(resolve_optional_secret(None, Some("  ")), None);
+        assert_eq!(
+            resolve_optional_secret(Some("cfg-key".to_string()), None),
+            Some("cfg-key".to_string())
+        );
     }
 }

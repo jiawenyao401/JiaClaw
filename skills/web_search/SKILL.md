@@ -27,9 +27,10 @@ triggers:
 
 ## 相关工具
 
+- `web_search` - 联网检索（Brave Search；需配置 API key）
 - `http_get` - 获取网页内容
 - `json_query` - 解析 JSON 响应
 
 ## 注意事项
 
-此技能为演示用途，实际搜索功能需要集成真实的搜索 API。
+此技能引导模型使用本地 `web_search` 工具。未配置 Brave API key 时，工具会返回友好错误（设置 `JIACLAW_BRAVE_API_KEY` 或 `[tools.web_search] brave_api_key`）。可用 `[tools.web_search] enabled = false` 关闭注册。

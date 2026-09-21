@@ -47,5 +47,11 @@
     "session": {
       "summarize_on_overflow": false,
       "keep_recent": 10
+    },
+    "tools": {
+      "web_search": {
+        "enabled": true,
+        "brave_api_key": null
+      }
     }
 }

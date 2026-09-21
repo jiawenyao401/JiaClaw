@@ -115,7 +115,7 @@ output = "stdout"
 # file_path = "/var/log/jiaclaw/jiaclaw.log"
 
 [tools]
-# 启用的工具列表（示例）
+# 启用的工具列表（示例，当前不驱动注册）
 enabled = [
     # "search",
     # "calculator",
@@ -127,6 +127,13 @@ enabled = [
 # name = "example-server"
 # url = "http://localhost:3000"
 # auth_token = "your-token-here"
+
+[tools.web_search]
+# 可选联网检索（默认启用并注册）。无 Brave key 时调用返回友好错误，不访问网络。
+# 环境变量 JIACLAW_BRAVE_API_KEY 优先于 brave_api_key；doctor / 日志不打印明文。
+# 申请: https://brave.com/search/api/
+enabled = true
+# brave_api_key = "BSA..."
 
 [skills]
 # 启用的技能列表（示例）
