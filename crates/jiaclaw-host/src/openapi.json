@@ -3,7 +3,7 @@
   "info": {
     "title": "JiaClaw HTTP API",
     "version": "0.1.0",
-    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n- Telegram secret：当配置了 `JIACLAW_TELEGRAM_SECRET` 或 `[http].telegram_secret` 时，`POST /hooks/telegram` 需要 `X-Telegram-Bot-Api-Secret-Token`（Telegram 官方 secret token）。未配置则与本地 webhook 一样开放。\n- Slack signing secret：当配置了 `JIACLAW_SLACK_SIGNING_SECRET` 或 `[http].slack_signing_secret` 时，`POST /hooks/slack` 校验 `X-Slack-Signature` + `X-Slack-Request-Timestamp`（官方 v0 HMAC-SHA256，时间窗 ±5 分钟）。签名使用原始 body 字节。未配置则开放（开发友好）。\n\nTelegram 出站：当配置了 `JIACLAW_TELEGRAM_BOT_TOKEN` 或 `[http].telegram_bot_token` 时，成功得到 assistant 回复后会调用 Bot `sendMessage` 推回聊天（文本按 4096 截断）。出站失败仍返回 200 + 原 `reply`，避免 Telegram webhook 重试；响应可带 `delivered` / `delivery_error`。未配置 token 时仅同步 JSON。用 `setWebhook` 将公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`。\n\nSlack 出站：当配置了 `JIACLAW_SLACK_BOT_TOKEN` 或 `[http].slack_bot_token` 时，成功得到 assistant 回复后会调用 `chat.postMessage` 推回 channel（文本按 40000 截断）。出站失败仍 200 + 原 `reply`，避免 Slack Events 重试。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。\n\n可选 SSE：`POST /api/chat` 在 `Accept: text/event-stream` 或 body `stream: true` 时返回 `text/event-stream`（事件：meta / token / tool / done / error）。未请求流式时 JSON 响应不变。当前为整轮 tool loop 完成后的分块推送；Brokerrouter 真流式后续。"
+    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n- Telegram secret：当配置了 `JIACLAW_TELEGRAM_SECRET` 或 `[http].telegram_secret` 时，`POST /hooks/telegram` 需要 `X-Telegram-Bot-Api-Secret-Token`（Telegram 官方 secret token）。未配置则与本地 webhook 一样开放。\n- Slack signing secret：当配置了 `JIACLAW_SLACK_SIGNING_SECRET` 或 `[http].slack_signing_secret` 时，`POST /hooks/slack` 校验 `X-Slack-Signature` + `X-Slack-Request-Timestamp`（官方 v0 HMAC-SHA256，时间窗 ±5 分钟）。签名使用原始 body 字节。未配置则开放（开发友好）。\n- Discord 公钥：当配置了 `JIACLAW_DISCORD_PUBLIC_KEY` 或 `[http].discord_public_key` 时，`POST /hooks/discord` 校验 `X-Signature-Ed25519` + `X-Signature-Timestamp`（官方 Ed25519，消息为 `timestamp + raw body`）。未配置则开放（开发友好）。\n\nTelegram 出站：当配置了 `JIACLAW_TELEGRAM_BOT_TOKEN` 或 `[http].telegram_bot_token` 时，成功得到 assistant 回复后会调用 Bot `sendMessage` 推回聊天（文本按 4096 截断）。出站失败仍返回 200 + 原 `reply`，避免 Telegram webhook 重试；响应可带 `delivered` / `delivery_error`。未配置 token 时仅同步 JSON。用 `setWebhook` 将公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`。\n\nSlack 出站：当配置了 `JIACLAW_SLACK_BOT_TOKEN` 或 `[http].slack_bot_token` 时，成功得到 assistant 回复后会调用 `chat.postMessage` 推回 channel（文本按 40000 截断）。出站失败仍 200 + 原 `reply`，避免 Slack Events 重试。\n\nDiscord 出站：当配置了 `JIACLAW_DISCORD_BOT_TOKEN` 或 `[http].discord_bot_token` 时，`POST /hooks/discord` 立即返回 `type=5` deferred ACK，后台 chat 完成后 `PATCH /webhooks/{application_id}/{interaction_token}/messages/@original` 编辑原始回复（文本按 2000 截断）。未配置 token 时仍 ACK 并记录 session，但无法 follow-up。长任务必须走 deferred（Discord 要求 3s 内 ACK）。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。\n\n可选 SSE：`POST /api/chat` 在 `Accept: text/event-stream` 或 body `stream: true` 时返回 `text/event-stream`（事件：meta / token / tool / done / error）。未请求流式时 JSON 响应不变。当前为整轮 tool loop 完成后的分块推送；Brokerrouter 真流式后续。"
   },
   "servers": [
     {
@@ -15,7 +15,7 @@
     { "name": "health", "description": "健康检查" },
     { "name": "chat", "description": "聊天与会话" },
     { "name": "catalog", "description": "工具与技能目录" },
-    { "name": "hooks", "description": "Webhook / Telegram / Slack 入站（可选出站）" },
+    { "name": "hooks", "description": "Webhook / Telegram / Slack / Discord 入站（可选出站）" },
     { "name": "discovery", "description": "API 发现" }
   ],
   "paths": {
@@ -376,6 +376,48 @@
           "429": { "$ref": "#/components/responses/RateLimited" }
         }
       }
+    },
+    "/hooks/discord": {
+      "post": {
+        "tags": ["hooks"],
+        "summary": "Discord Interactions 入站",
+        "operationId": "inboundDiscord",
+        "description": "接收 Discord Interactions HTTP JSON。先读取原始 body 字节再反序列化，以便配置公钥时做官方 Ed25519 校验（`X-Signature-Ed25519` + `X-Signature-Timestamp`，消息为 timestamp 与 raw body 拼接）。`type=1` PING 返回 `{ type: 1 }` PONG。`type=2` APPLICATION_COMMAND 仅处理 Chat Input（`data.type=1` 或省略）：文本取第一个 string option，否则用 `data.name` 加选项拼接；会话键 `discord:{guild_id}:{channel_id}`（无 guild 则为 `discord:dm:{channel_id}`）。立即返回 `{ type: 5 }` deferred ACK（满足 3s），后台跑 chat；配置了 `JIACLAW_DISCORD_BOT_TOKEN` / `[http].discord_bot_token` 时再 PATCH 编辑原始消息。未配置公钥时开放（开发友好）；未配置 bot token 时仍 ACK 并写 session，但无法 follow-up。不支持 Incoming Webhook 简化体。",
+        "security": [{ "discordSignature": [], "discordTimestamp": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/DiscordInteraction" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PING 为 `{ type: 1 }`；Chat Input Command 为 `{ type: 5 }` deferred；忽略的 interaction 为 type 4 短暂消息",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DiscordInteractionResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Discord Ed25519 签名无效",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WebhookUnauthorized" }
+              }
+            }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
     }
   },
   "components": {
@@ -414,6 +456,18 @@
         "in": "header",
         "name": "X-Slack-Request-Timestamp",
         "description": "Slack 请求 Unix 时间戳（秒）。与签名一起校验，时间窗 ±5 分钟。未配置 signing secret 时不需要。"
+      },
+      "discordSignature": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Signature-Ed25519",
+        "description": "Discord Interactions Ed25519 签名（hex）。未配置 `JIACLAW_DISCORD_PUBLIC_KEY` / `[http].discord_public_key` 时不需要。"
+      },
+      "discordTimestamp": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Signature-Timestamp",
+        "description": "Discord 请求时间戳。与 Ed25519 签名一起校验（消息为 timestamp + raw body）。未配置公钥时不需要。"
       }
     },
     "headers": {
@@ -745,6 +799,62 @@
           "delivery_error": {
             "type": "string",
             "description": "chat.postMessage 失败时的错误摘要（不含 token 明文）。出站失败不改变 HTTP 200。"
+          }
+        }
+      },
+      "DiscordCommandOption": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "integer", "description": "3 = STRING" },
+          "value": {},
+          "options": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DiscordCommandOption" }
+          }
+        }
+      },
+      "DiscordInteractionData": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "example": "ask" },
+          "type": { "type": "integer", "description": "1 = CHAT_INPUT" },
+          "options": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DiscordCommandOption" }
+          }
+        }
+      },
+      "DiscordInteraction": {
+        "type": "object",
+        "description": "Discord Interactions 最小子集；其余字段忽略。不接受 Incoming Webhook 简化体。",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "integer",
+            "description": "1 = PING，2 = APPLICATION_COMMAND"
+          },
+          "application_id": { "type": "string" },
+          "guild_id": { "type": "string" },
+          "channel_id": { "type": "string" },
+          "token": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/DiscordInteractionData" }
+        }
+      },
+      "DiscordInteractionResponse": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "integer",
+            "description": "1 = PONG；4 = CHANNEL_MESSAGE_WITH_SOURCE（跳过时短暂消息）；5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "content": { "type": "string" },
+              "flags": { "type": "integer", "description": "64 = EPHEMERAL" }
+            }
           }
         }
       },

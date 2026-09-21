@@ -29,7 +29,11 @@
       "session_ttl_secs": null,
       "webhook_secret": null,
       "telegram_secret": null,
-      "telegram_bot_token": null
+      "telegram_bot_token": null,
+      "slack_signing_secret": null,
+      "slack_bot_token": null,
+      "discord_public_key": null,
+      "discord_bot_token": null
     },
     "memory": {
       "path": "MEMORY.md"
