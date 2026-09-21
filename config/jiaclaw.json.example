@@ -24,7 +24,8 @@
       "cors_allow_origins": ["*"],
       "persist": false,
       "persist_path": ".jiaclaw/sessions.json",
-      "rate_limit_per_minute": null
+      "rate_limit_per_minute": null,
+      "session_ttl_secs": null
     },
     "memory": {
       "path": "MEMORY.md"

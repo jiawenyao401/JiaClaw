@@ -228,6 +228,12 @@ pub struct HttpConfig {
     /// `None` 或非正整数表示不限流。
     #[serde(default)]
     pub rate_limit_per_minute: Option<u32>,
+
+    /// 会话闲置 TTL（秒，可选，环境变量 `JIACLAW_SESSION_TTL_SECS` 优先）
+    ///
+    /// `None` 或非正整数表示不启用过期清理。
+    #[serde(default)]
+    pub session_ttl_secs: Option<u64>,
 }
 
 fn default_http_bind() -> String {
@@ -252,6 +258,7 @@ impl Default for HttpConfig {
             persist: false,
             persist_path: default_persist_path(),
             rate_limit_per_minute: None,
+            session_ttl_secs: None,
         }
     }
 }
@@ -276,6 +283,23 @@ pub fn resolve_rate_limit_per_minute(
     }
 }
 
+/// 解析正整数会话 TTL（秒）；`0` 或无法解析时视为不启用。
+#[must_use]
+pub fn parse_positive_session_ttl(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+/// 根据配置文件值与可选环境变量解析会话闲置 TTL（秒）。
+///
+/// 环境变量优先；仅正整数生效。
+#[must_use]
+pub fn resolve_session_ttl_secs(configured: Option<u64>, env_value: Option<&str>) -> Option<u64> {
+    match env_value {
+        Some(raw) => parse_positive_session_ttl(raw),
+        None => configured.filter(|&n| n > 0),
+    }
+}
+
 impl HttpConfig {
     /// 解析生效的每分钟请求上限。
     ///
@@ -288,6 +312,18 @@ impl HttpConfig {
             std::env::var("JIACLAW_RATE_LIMIT_PER_MINUTE")
                 .ok()
                 .as_deref(),
+        )
+    }
+
+    /// 解析生效的会话闲置 TTL（秒）。
+    ///
+    /// 环境变量 `JIACLAW_SESSION_TTL_SECS` 优先于配置文件。
+    /// 仅正整数生效；未设置、`0` 或无法解析表示不启用。
+    #[must_use]
+    pub fn effective_session_ttl_secs(&self) -> Option<u64> {
+        resolve_session_ttl_secs(
+            self.session_ttl_secs,
+            std::env::var("JIACLAW_SESSION_TTL_SECS").ok().as_deref(),
         )
     }
 }
@@ -463,8 +499,8 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_positive_rate_limit, resolve_rate_limit_per_minute, AgentConfig, HttpConfig,
-        DEFAULT_MEMORY_PATH,
+        parse_positive_rate_limit, parse_positive_session_ttl, resolve_rate_limit_per_minute,
+        resolve_session_ttl_secs, AgentConfig, HttpConfig, DEFAULT_MEMORY_PATH,
     };
 
     #[test]
@@ -477,6 +513,12 @@ mod tests {
     }
 
     #[test]
+    fn http_config_session_ttl_defaults_to_none() {
+        assert_eq!(HttpConfig::default().session_ttl_secs, None);
+        assert_eq!(HttpConfig::default().effective_session_ttl_secs(), None);
+    }
+
+    #[test]
     fn parse_positive_rate_limit_accepts_only_positive_integers() {
         assert_eq!(parse_positive_rate_limit("60"), Some(60));
         assert_eq!(parse_positive_rate_limit(" 1 "), Some(1));
@@ -484,6 +526,16 @@ mod tests {
         assert_eq!(parse_positive_rate_limit(""), None);
         assert_eq!(parse_positive_rate_limit("abc"), None);
         assert_eq!(parse_positive_rate_limit("-1"), None);
+    }
+
+    #[test]
+    fn parse_positive_session_ttl_accepts_only_positive_integers() {
+        assert_eq!(parse_positive_session_ttl("3600"), Some(3600));
+        assert_eq!(parse_positive_session_ttl(" 1 "), Some(1));
+        assert_eq!(parse_positive_session_ttl("0"), None);
+        assert_eq!(parse_positive_session_ttl(""), None);
+        assert_eq!(parse_positive_session_ttl("abc"), None);
+        assert_eq!(parse_positive_session_ttl("-1"), None);
     }
 
     #[test]
@@ -500,6 +552,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_session_ttl_env_overrides_config() {
+        assert_eq!(resolve_session_ttl_secs(Some(30), Some("120")), Some(120));
+        assert_eq!(resolve_session_ttl_secs(Some(30), Some("0")), None);
+        assert_eq!(resolve_session_ttl_secs(Some(30), Some("nope")), None);
+        assert_eq!(resolve_session_ttl_secs(Some(30), None), Some(30));
+        assert_eq!(resolve_session_ttl_secs(Some(0), None), None);
+        assert_eq!(resolve_session_ttl_secs(None, None), None);
+    }
+
+    #[test]
     fn http_config_parses_rate_limit_from_toml() {
         let toml = r#"
 [agent]
@@ -511,10 +573,12 @@ max_turns = 10
 [http]
 bind = "127.0.0.1:9090"
 rate_limit_per_minute = 60
+session_ttl_secs = 3600
 "#;
         let config = AgentConfig::from_toml_str(toml).expect("parse toml");
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.http.rate_limit_per_minute, Some(60));
+        assert_eq!(config.http.session_ttl_secs, Some(3600));
         assert_eq!(config.http.api_token, None);
         assert_eq!(config.http.webhook_secret, None);
     }
@@ -535,6 +599,7 @@ rate_limit_per_minute = 60
         let config = AgentConfig::from_json_str(json).expect("parse json");
         assert_eq!(config.http.bind, "0.0.0.0:8080");
         assert_eq!(config.http.rate_limit_per_minute, None);
+        assert_eq!(config.http.session_ttl_secs, None);
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
     }
 

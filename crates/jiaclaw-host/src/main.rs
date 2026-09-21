@@ -27,7 +27,9 @@ use std::{
     num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
+use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 
 /// 进程内全局（非按 IP）速率限制器，oneshot 测试无需 `ConnectInfo`。
@@ -229,16 +231,43 @@ fn init_command(path: Option<PathBuf>, force: bool) -> Result<()> {
 /// 每个 session 保留的最大消息数（防止内存涨爆）
 const MAX_SESSION_MESSAGES: usize = 50;
 
+/// 会话闲置 TTL 后台扫描间隔。
+const SESSION_TTL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 内存中的一条会话：消息 + 最近触达时间。
+struct SessionRecord {
+    messages: Vec<ChatMessage>,
+    last_accessed: Instant,
+}
+
+impl SessionRecord {
+    fn new(messages: Vec<ChatMessage>) -> Self {
+        Self {
+            messages,
+            last_accessed: Instant::now(),
+        }
+    }
+
+    fn touch(&mut self) {
+        self.last_accessed = Instant::now();
+    }
+
+    fn is_expired(&self, ttl: Duration, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_accessed) >= ttl
+    }
+}
+
 /// HTTP 服务的共享状态
 #[derive(Clone)]
 struct AppState {
     agent: Arc<JiaClawAgent>,
-    sessions: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
     api_token: Option<String>,
     webhook_secret: Option<String>,
     persist_enabled: bool,
     persist_path: Arc<PathBuf>,
     rate_limiter: Option<Arc<GlobalRateLimiter>>,
+    session_ttl: Option<Duration>,
 }
 
 /// 健康检查响应
@@ -382,6 +411,75 @@ fn rate_limit_config_source() -> &'static str {
     }
 }
 
+fn session_ttl_config_source() -> &'static str {
+    if std::env::var("JIACLAW_SESSION_TTL_SECS").is_ok() {
+        "环境变量 JIACLAW_SESSION_TTL_SECS"
+    } else {
+        "配置文件"
+    }
+}
+
+fn sessions_from_messages(raw: HashMap<String, Vec<ChatMessage>>) -> HashMap<String, SessionRecord> {
+    raw.into_iter()
+        .map(|(id, messages)| (id, SessionRecord::new(messages)))
+        .collect()
+}
+
+fn messages_from_sessions(
+    sessions: &HashMap<String, SessionRecord>,
+) -> HashMap<String, Vec<ChatMessage>> {
+    sessions
+        .iter()
+        .map(|(id, rec)| (id.clone(), rec.messages.clone()))
+        .collect()
+}
+
+fn persist_session_map(state: &AppState, sessions: &HashMap<String, SessionRecord>) {
+    if !state.persist_enabled {
+        return;
+    }
+    let raw = messages_from_sessions(sessions);
+    if let Err(e) = save_sessions(&state.persist_path, &raw) {
+        tracing::error!("保存 sessions 失败: {}", e);
+    }
+}
+
+fn purge_expired_sessions(state: &AppState) -> usize {
+    let Some(ttl) = state.session_ttl else {
+        return 0;
+    };
+    let now = Instant::now();
+    let mut sessions = state.sessions.lock().unwrap();
+    let before = sessions.len();
+    sessions.retain(|id, rec| {
+        let keep = !rec.is_expired(ttl, now);
+        if !keep {
+            tracing::info!("Session {id} 已闲置过期，移出 store");
+        }
+        keep
+    });
+    let removed = before.saturating_sub(sessions.len());
+    if removed > 0 {
+        persist_session_map(state, &sessions);
+    }
+    removed
+}
+
+fn spawn_session_ttl_sweeper(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SESSION_TTL_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let removed = purge_expired_sessions(&state);
+            if removed > 0 {
+                tracing::info!("Session TTL 扫描移除 {removed} 个过期会话");
+            }
+        }
+    });
+}
+
 /// Webhook 入站响应
 #[derive(Debug, Serialize, Deserialize)]
 struct InboundWebhookResponse {
@@ -436,6 +534,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
     let rate_limiter = rate_limit_per_minute.and_then(build_rate_limiter);
 
+    // 读取会话闲置 TTL（环境变量优先于配置文件）
+    let session_ttl_secs = config.http.effective_session_ttl_secs();
+    let session_ttl = session_ttl_secs.map(Duration::from_secs);
+
     // 解析持久化路径
     let persist_path = if config.http.persist_path.starts_with('/') {
         PathBuf::from(&config.http.persist_path)
@@ -446,7 +548,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     // 加载持久化的 sessions（如果启用）
     let sessions = if config.http.persist {
         tracing::info!("Session 持久化已启用，路径: {}", persist_path.display());
-        load_sessions(&persist_path)
+        sessions_from_messages(load_sessions(&persist_path))
     } else {
         tracing::info!("Session 持久化未启用");
         HashMap::new()
@@ -460,7 +562,12 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         persist_enabled: config.http.persist,
         persist_path: Arc::new(persist_path),
         rate_limiter,
+        session_ttl,
     };
+
+    if state.session_ttl.is_some() {
+        spawn_session_ttl_sweeper(state.clone());
+    }
 
     // 配置 CORS
     let cors = if config.http.cors_allow_origins.is_empty()
@@ -513,6 +620,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • HTTP 限流: 未启用");
     }
+    if let Some(ttl) = session_ttl_secs {
+        tracing::info!("   • Session TTL: 已启用（闲置 {ttl} 秒后过期）");
+    } else {
+        tracing::info!("   • Session TTL: 未启用");
+    }
 
     // 打印配置摘要（不打印 secret 明文）
     println!("\n📋 HTTP 配置摘要:");
@@ -551,6 +663,15 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         );
     } else {
         println!("   • HTTP 限流: ⚠️  未启用（/api/* 与 /hooks/inbound 不限流）");
+    }
+
+    if let Some(ttl) = session_ttl_secs {
+        println!(
+            "   • Session TTL: ✅ 已启用（闲置 {ttl} 秒，通过 {}）",
+            session_ttl_config_source()
+        );
+    } else {
+        println!("   • Session TTL: ⚠️  未启用（会话不会因闲置过期）");
     }
 
     if config.http.cors_allow_origins.is_empty()
@@ -658,12 +779,14 @@ async fn chat_handler(
 
     let session_id = request.session_id.clone();
 
+    purge_expired_sessions(&state);
+
     // 如果提供了 session_id，从 session 中获取历史消息
     if let Some(ref sid) = session_id {
         let sessions = state.sessions.lock().unwrap();
         if let Some(history) = sessions.get(sid) {
             // 将历史消息和新消息合并
-            let mut all_messages = history.clone();
+            let mut all_messages = history.messages.clone();
             all_messages.extend(request.messages.clone());
 
             // 检查消息数上限，防止内存涨爆
@@ -727,24 +850,19 @@ async fn chat_handler(
     // 如果提供了 session_id，更新 session 历史
     if let Some(ref sid) = session_id {
         let mut sessions = state.sessions.lock().unwrap();
-        sessions.insert(sid.clone(), request.messages.clone());
-        sessions
-            .entry(sid.clone())
-            .or_default()
-            .push(response.message.clone());
+        let mut messages = request.messages.clone();
+        messages.push(response.message.clone());
+        let message_count = messages.len();
+        sessions.insert(sid.clone(), SessionRecord::new(messages));
         tracing::info!(
             request_id = %request_id,
             "更新 session {}, 当前消息数: {}",
             sid,
-            sessions.get(sid).unwrap().len()
+            message_count
         );
 
         // 持久化到磁盘（如果启用）
-        if state.persist_enabled {
-            if let Err(e) = save_sessions(&state.persist_path, &sessions) {
-                tracing::error!(request_id = %request_id, "保存 sessions 失败: {}", e);
-            }
-        }
+        persist_session_map(&state, &sessions);
     }
 
     tracing::info!(
@@ -800,12 +918,18 @@ async fn list_sessions_handler(
         return Err(AppError::Unauthorized);
     }
 
+    purge_expired_sessions(&state);
+
     let mut sessions: Vec<SessionSummary> = {
-        let map = state.sessions.lock().unwrap();
+        let mut map = state.sessions.lock().unwrap();
+        let now = Instant::now();
+        for rec in map.values_mut() {
+            rec.last_accessed = now;
+        }
         map.iter()
-            .map(|(id, messages)| SessionSummary {
+            .map(|(id, rec)| SessionSummary {
                 id: id.clone(),
-                message_count: messages.len(),
+                message_count: rec.messages.len(),
             })
             .collect()
     };
@@ -833,9 +957,14 @@ async fn get_session_handler(
         return Err(AppError::Unauthorized);
     }
 
+    purge_expired_sessions(&state);
+
     let messages = {
-        let map = state.sessions.lock().unwrap();
-        map.get(&session_id).cloned()
+        let mut map = state.sessions.lock().unwrap();
+        map.get_mut(&session_id).map(|rec| {
+            rec.touch();
+            rec.messages.clone()
+        })
     };
 
     if let Some(messages) = messages {
@@ -871,9 +1000,11 @@ async fn create_session_handler(
     }
     let session_id = uuid::Uuid::new_v4().to_string();
 
+    purge_expired_sessions(&state);
+
     // 立即在 sessions map 中创建空的 Vec，这样后续 DELETE 能正确返回 success=true
     let mut sessions = state.sessions.lock().unwrap();
-    sessions.insert(session_id.clone(), Vec::new());
+    sessions.insert(session_id.clone(), SessionRecord::new(Vec::new()));
 
     tracing::info!("创建新 session: {}", session_id);
     Ok(Json(CreateSessionResponse { session_id }))
@@ -924,18 +1055,15 @@ async fn delete_session_handler(
         tracing::warn!("API 鉴权失败: token 不匹配或缺失");
         return Err(AppError::Unauthorized);
     }
+    purge_expired_sessions(&state);
+
     let mut sessions = state.sessions.lock().unwrap();
     let existed = sessions.remove(&session_id).is_some();
 
     if existed {
         tracing::info!("删除 session: {}", session_id);
 
-        // 持久化到磁盘（如果启用）
-        if state.persist_enabled {
-            if let Err(e) = save_sessions(&state.persist_path, &sessions) {
-                tracing::error!("保存 sessions 失败: {}", e);
-            }
-        }
+        persist_session_map(&state, &sessions);
 
         Ok(Json(DeleteSessionResponse {
             success: true,
@@ -1045,6 +1173,8 @@ async fn hooks_inbound_handler(
     let session_id = format!("webhook:{}", body.chat_id);
     tracing::info!(request_id = %request_id, "使用 session_id: {}", session_id);
 
+    purge_expired_sessions(&state);
+
     // 构建聊天请求
     let mut request = ChatRequest {
         messages: vec![ChatMessage {
@@ -1061,7 +1191,7 @@ async fn hooks_inbound_handler(
     {
         let sessions = state.sessions.lock().unwrap();
         if let Some(history) = sessions.get(&session_id) {
-            let mut all_messages = history.clone();
+            let mut all_messages = history.messages.clone();
             all_messages.extend(request.messages.clone());
 
             // 检查消息数上限
@@ -1123,24 +1253,18 @@ async fn hooks_inbound_handler(
     // 更新 session 历史
     {
         let mut sessions = state.sessions.lock().unwrap();
-        sessions.insert(session_id.clone(), request.messages.clone());
-        sessions
-            .entry(session_id.clone())
-            .or_default()
-            .push(response.message.clone());
+        let mut messages = request.messages.clone();
+        messages.push(response.message.clone());
+        let message_count = messages.len();
+        sessions.insert(session_id.clone(), SessionRecord::new(messages));
         tracing::info!(
             request_id = %request_id,
             "更新 webhook session {}, 当前消息数: {}",
             session_id,
-            sessions.get(&session_id).unwrap().len()
+            message_count
         );
 
-        // 持久化到磁盘（如果启用）
-        if state.persist_enabled {
-            if let Err(e) = save_sessions(&state.persist_path, &sessions) {
-                tracing::error!(request_id = %request_id, "保存 sessions 失败: {}", e);
-            }
-        }
+        persist_session_map(&state, &sessions);
     }
 
     tracing::info!(
@@ -1821,6 +1945,17 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_RATE_LIMIT_PER_MINUTE=60");
     }
 
+    let session_ttl_secs = config.http.effective_session_ttl_secs();
+    if let Some(ttl) = session_ttl_secs {
+        println!(
+            "   Session TTL: ✅ 已启用（闲置 {ttl} 秒，通过 {}）",
+            session_ttl_config_source()
+        );
+    } else {
+        println!("   Session TTL: ⚠️  未启用");
+        println!("   💡 设置环境变量: export JIACLAW_SESSION_TTL_SECS=3600");
+    }
+
     // CORS 配置
     if config.http.cors_allow_origins.is_empty()
         || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
@@ -1866,6 +2001,14 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         "   • HTTP 限流: {}",
         if let Some(limit) = rate_limit_per_minute {
             format!("已启用（{limit} 次/分钟）")
+        } else {
+            "未启用".to_string()
+        }
+    );
+    println!(
+        "   • Session TTL: {}",
+        if let Some(ttl) = session_ttl_secs {
+            format!("已启用（闲置 {ttl} 秒）")
         } else {
             "未启用".to_string()
         }
@@ -1922,6 +2065,19 @@ mod tests {
         webhook_secret: Option<String>,
         rate_limit_per_minute: Option<u32>,
     ) -> Router {
+        create_test_app_with_full(api_token, webhook_secret, rate_limit_per_minute, None)
+    }
+
+    fn create_test_app_with_session_ttl(session_ttl_secs: Option<u64>) -> Router {
+        create_test_app_with_full(None, None, None, session_ttl_secs)
+    }
+
+    fn create_test_app_with_full(
+        api_token: Option<String>,
+        webhook_secret: Option<String>,
+        rate_limit_per_minute: Option<u32>,
+        session_ttl_secs: Option<u64>,
+    ) -> Router {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
         let persist_path =
@@ -1934,9 +2090,107 @@ mod tests {
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: rate_limit_per_minute.and_then(build_rate_limiter),
+            session_ttl: session_ttl_secs.map(Duration::from_secs),
         };
 
         build_router(state)
+    }
+
+    async fn http_create_session(app: &Router) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+        created.session_id
+    }
+
+    async fn http_get_session_status(app: &Router, session_id: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn http_list_session_ids(app: &Router) -> Vec<String> {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: ListSessionsResponse = serde_json::from_slice(&body).unwrap();
+        list.sessions.into_iter().map(|s| s.id).collect()
+    }
+
+    async fn http_delete_session(app: &Router, session_id: &str) -> DeleteSessionResponse {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn http_chat_with_session(app: &Router, session_id: &str) {
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "ttl-touch".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: Some(session_id.to_string()),
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2471,6 +2725,117 @@ mod tests {
         assert!(!list.sessions.iter().any(|s| s.id == session_id));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_session_ttl_expires_after_idle() {
+        let app = create_test_app_with_session_ttl(Some(1));
+        let session_id = http_create_session(&app).await;
+
+        assert_eq!(
+            http_get_session_status(&app, &session_id).await,
+            StatusCode::OK
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert_eq!(
+            http_get_session_status(&app, &session_id).await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(!http_list_session_ids(&app).await.contains(&session_id));
+
+        let deleted = http_delete_session(&app, &session_id).await;
+        assert!(!deleted.success, "过期 session 的 DELETE 应与不存在一致");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_session_ttl_disabled_does_not_expire() {
+        let app = create_test_app_with_session_ttl(None);
+        let session_id = http_create_session(&app).await;
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        assert_eq!(
+            http_get_session_status(&app, &session_id).await,
+            StatusCode::OK
+        );
+        assert!(http_list_session_ids(&app).await.contains(&session_id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_session_ttl_get_touch_refreshes() {
+        let app = create_test_app_with_session_ttl(Some(1));
+        let session_id = http_create_session(&app).await;
+
+        tokio::time::advance(Duration::from_millis(700)).await;
+        assert_eq!(
+            http_get_session_status(&app, &session_id).await,
+            StatusCode::OK
+        );
+
+        tokio::time::advance(Duration::from_millis(700)).await;
+        assert_eq!(
+            http_get_session_status(&app, &session_id).await,
+            StatusCode::OK,
+            "GET 触达应刷新 last_accessed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_session_ttl_chat_touch_refreshes() {
+        let app = create_test_app_with_session_ttl(Some(1));
+        let session_id = http_create_session(&app).await;
+
+        tokio::time::advance(Duration::from_millis(700)).await;
+        http_chat_with_session(&app, &session_id).await;
+
+        tokio::time::advance(Duration::from_millis(700)).await;
+        assert_eq!(
+            http_get_session_status(&app, &session_id).await,
+            StatusCode::OK,
+            "chat 触达应刷新 last_accessed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_session_ttl_purge_saves_when_persist_enabled() {
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let session_id = "ttl-persist".to_string();
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: "将过期".to_string(),
+        }];
+
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            persist_enabled: true,
+            persist_path: Arc::new(persist_path.clone()),
+            rate_limiter: None,
+            session_ttl: Some(Duration::from_secs(1)),
+        };
+
+        {
+            let mut map = state.sessions.lock().unwrap();
+            map.insert(session_id.clone(), SessionRecord::new(messages));
+            persist_session_map(&state, &map);
+        }
+        assert_eq!(load_sessions(&persist_path).len(), 1);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(purge_expired_sessions(&state), 1);
+        assert!(
+            load_sessions(&persist_path).is_empty(),
+            "过期清理后落盘应同步删除"
+        );
+
+        std::fs::remove_file(&persist_path).ok();
+    }
+
     #[tokio::test]
     async fn test_get_session_reads_memory_not_disk() {
         let persist_path =
@@ -2492,7 +2857,7 @@ mod tests {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
         let mut mem_map = HashMap::new();
-        mem_map.insert(session_id.clone(), mem_messages);
+        mem_map.insert(session_id.clone(), SessionRecord::new(mem_messages));
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(mem_map)),
@@ -2501,6 +2866,7 @@ mod tests {
             persist_enabled: true,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
+            session_ttl: None,
         };
         let app = build_router(state);
 
@@ -2538,6 +2904,7 @@ mod tests {
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
+            session_ttl: None,
         };
 
         let session_id = "test-limit-session".to_string();
@@ -2559,7 +2926,7 @@ mod tests {
         // 手动设置 session 历史
         {
             let mut sessions = state.sessions.lock().unwrap();
-            sessions.insert(session_id.clone(), messages.clone());
+            sessions.insert(session_id.clone(), SessionRecord::new(messages.clone()));
         }
 
         // 创建请求并通过 chat_handler 处理
@@ -2903,6 +3270,7 @@ mod tests {
             persist_enabled: false,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
+            session_ttl: None,
         };
 
         let session_id = "test-session".to_string();
@@ -2913,7 +3281,7 @@ mod tests {
 
         {
             let mut sessions = state.sessions.lock().unwrap();
-            sessions.insert(session_id.clone(), messages.clone());
+            sessions.insert(session_id.clone(), SessionRecord::new(messages.clone()));
         }
 
         assert!(!persist_path.exists(), "persist=false 时不应该创建文件");

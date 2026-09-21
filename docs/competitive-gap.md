@@ -56,6 +56,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **Session（内存）** | ✅ 支持 | ⏳ 部分 | ✅ **已实现** | P1 | - |
 | **Session（落盘）** | ✅ 支持 | ⏳ 部分 | ✅ **可选落盘** | P1 | - |
 | **Session 查询 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/sessions** | P1 | - |
+| **Session TTL** | ✅ 支持 | ⏳ 部分 | ✅ **可选闲置过期** | P1 | - |
 | **工具列表 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/tools** | P1 | - |
 | **技能列表 API** | ✅ 支持 | ❌ 无 | ✅ **GET /api/skills** | P1 | - |
 | **Webhook 入站** | ✅ 支持 | ⏳ 部分 | ✅ **POST /hooks/inbound** | P1 | - |
@@ -78,6 +79,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ **OpenAPI 草图**（`GET /api/openapi.json`，手写 OpenAPI 3；鉴权与 `/api/tools` 一致）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史，自动截断超长历史）
 - ✅ **Session 查询 API**（`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息，不存在 404；读内存当前状态，落盘开启时与 store 一致）
+- ✅ **可选 Session TTL**（`[http] session_ttl_secs` / `JIACLAW_SESSION_TTL_SECS`，正整数启用闲置过期；create/chat/get/list 刷新；过期后 list 省略，GET/DELETE 与不存在一致）
 - ✅ **Session 可选落盘**（`[http] persist = true`，进程重启后可恢复历史，原子写入，自动处理损坏文件）
 - ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
 - ✅ 技能列表 API（GET /api/skills 列出已发现技能）
@@ -315,7 +317,7 @@ triggers:
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
 | **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
 | **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
-| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流** | P1 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/TTL** | P1 | - |
 | **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
 | **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
@@ -323,20 +325,21 @@ triggers:
 **JiaClaw 现状**:
 - ✅ Cargo 工作空间已配置
 - ✅ `jiaclaw init` 命令创建工作空间
-- ✅ HTTP 配置支持（bind、webhook_secret、cors_allow_origins、可选限流）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、MEMORY 文件）
+- ✅ HTTP 配置支持（bind、webhook_secret、cors_allow_origins、可选限流、可选 Session TTL）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Session TTL、MEMORY 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
 - **P1 运维配置**: ✅ **已实现**
   - TOML 配置支持 `[http]` 段落
-  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_RATE_LIMIT_PER_MINUTE` 优先）
+  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_SESSION_TTL_SECS` 优先）
   - CORS 来源控制（空或 `["*"]` 保持 permissive，否则限制）
   - 可选进程内全局限流（`rate_limit_per_minute`，超限 429 + Retry-After）
+  - 可选会话闲置 TTL（`session_ttl_secs`，过期清理内存 store；落盘开启时同步 save）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY 是否存在及大小
-  - HTTP 配置摘要（bind、webhook 鉴权状态、CORS 模式、限流是否开启及数值）
+  - HTTP 配置摘要（bind、webhook 鉴权状态、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
