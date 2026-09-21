@@ -180,7 +180,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
 
-    /// 本地工具配置（缺省本段不影响现有配置；`web_search` 默认启用）
+    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` 默认启用）
     #[serde(default)]
     pub tools: ToolsConfig,
 }
@@ -449,15 +449,23 @@ fn default_web_search_enabled() -> bool {
     true
 }
 
+fn default_web_fetch_enabled() -> bool {
+    true
+}
+
 /// 本地工具总配置（缺省本段不影响现有 `[http]` / `[memory]` 等段）
 ///
 /// 历史示例里的 `[tools] enabled = [...]` 列表仍可出现在文件中（未知字段忽略），
-/// 当前真正生效的是嵌套表 `[tools.web_search]`。
+/// 当前真正生效的是嵌套表 `[tools.web_search]` 与 `[tools.web_fetch]`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
     /// `web_search` 工具配置
     #[serde(default)]
     pub web_search: WebSearchToolConfig,
+
+    /// `web_fetch` 工具配置
+    #[serde(default)]
+    pub web_fetch: WebFetchToolConfig,
 }
 
 /// 可选 `web_search` 联网检索配置
@@ -493,6 +501,30 @@ impl WebSearchToolConfig {
             self.brave_api_key.clone(),
             std::env::var("JIACLAW_BRAVE_API_KEY").ok().as_deref(),
         )
+    }
+}
+
+/// 可选 `web_fetch` 网页抓取配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFetchToolConfig {
+    /// 是否注册 `web_fetch` 工具（默认 `true`）
+    #[serde(default = "default_web_fetch_enabled")]
+    pub enabled: bool,
+
+    /// 是否允许抓取 localhost / 私网地址（默认 `false`）
+    ///
+    /// 默认拒绝 `127.0.0.0/8`、`::1`、`10/8`、`172.16/12`、`192.168/16` 以及
+    /// 链路本地地址。测试或内网场景可设为 `true`。
+    #[serde(default)]
+    pub allow_private: bool,
+}
+
+impl Default for WebFetchToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_web_fetch_enabled(),
+            allow_private: false,
+        }
     }
 }
 
@@ -961,7 +993,7 @@ mod tests {
         resolve_heartbeat_interval_secs, resolve_optional_secret, resolve_rate_limit_per_minute,
         resolve_session_keep_recent, resolve_session_summarize_on_overflow,
         resolve_session_ttl_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
-        HttpConfig, SessionConfig, ToolsConfig, WebSearchToolConfig,
+        HttpConfig, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
         DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
         DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
         MAX_SESSION_MESSAGES,
@@ -1556,6 +1588,17 @@ max_turns = 10
     }
 
     #[test]
+    fn web_fetch_config_defaults_to_enabled_without_private() {
+        let config = WebFetchToolConfig::default();
+        assert!(config.enabled);
+        assert!(!config.allow_private);
+        assert!(ToolsConfig::default().web_fetch.enabled);
+        assert!(!ToolsConfig::default().web_fetch.allow_private);
+        assert!(AgentConfig::default().tools.web_fetch.enabled);
+        assert!(!AgentConfig::default().tools.web_fetch.allow_private);
+    }
+
+    #[test]
     fn omitted_tools_section_keeps_web_search_defaults() {
         let toml = r#"
 [agent]
@@ -1570,6 +1613,8 @@ bind = "127.0.0.1:8080"
         let config = AgentConfig::from_toml_str(toml).expect("parse toml");
         assert!(config.tools.web_search.enabled);
         assert_eq!(config.tools.web_search.brave_api_key, None);
+        assert!(config.tools.web_fetch.enabled);
+        assert!(!config.tools.web_fetch.allow_private);
         assert_eq!(config.http.bind, "127.0.0.1:8080");
     }
 
@@ -1601,6 +1646,11 @@ path = "MEMORY.md"
             config.tools.web_search.brave_api_key.as_deref(),
             Some("listed-key")
         );
+        assert!(
+            config.tools.web_fetch.enabled,
+            "omitted [tools.web_fetch] should keep default enabled"
+        );
+        assert!(!config.tools.web_fetch.allow_private);
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.memory.path, "MEMORY.md");
     }
@@ -1648,6 +1698,52 @@ brave_api_key = "BSA-test-key"
             config.tools.web_search.brave_api_key.as_deref(),
             Some("json-key")
         );
+        assert!(config.tools.web_fetch.enabled);
+        assert!(!config.tools.web_fetch.allow_private);
+    }
+
+    #[test]
+    fn tools_web_fetch_parses_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools.web_fetch]
+enabled = false
+allow_private = true
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.web_fetch.enabled);
+        assert!(config.tools.web_fetch.allow_private);
+        assert!(
+            config.tools.web_search.enabled,
+            "omitted [tools.web_search] should keep default enabled"
+        );
+    }
+
+    #[test]
+    fn tools_web_fetch_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "tools": {
+                "web_fetch": {
+                    "enabled": false,
+                    "allow_private": true
+                }
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(!config.tools.web_fetch.enabled);
+        assert!(config.tools.web_fetch.allow_private);
+        assert!(config.tools.web_search.enabled);
     }
 
     #[test]

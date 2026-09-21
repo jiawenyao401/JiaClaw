@@ -28,7 +28,8 @@ triggers:
 ## 相关工具
 
 - `web_search` - 联网检索（Brave Search；需配置 API key）
-- `http_get` - 获取网页内容
+- `web_fetch` - 抓取网页为可读纯文本（默认拒绝 localhost/私网）
+- `http_get` - 获取网页原始响应
 - `json_query` - 解析 JSON 响应
 
 ## 注意事项

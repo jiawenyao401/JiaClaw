@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use jiaclaw_core::{JiaClawError, ToolCall};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// 工具 trait
 #[async_trait]
@@ -789,6 +791,679 @@ fn perform_brave_search(
 
     serde_json::to_string_pretty(&items)
         .map_err(|e| JiaClawError::ToolExecution(format!("序列化搜索结果失败: {e}")))
+}
+
+/// `web_fetch` HTTP 总体超时（秒）；仍遵守注册表级 `tool_timeout_secs`
+pub const WEB_FETCH_HTTP_TIMEOUT_SECS: u64 = 15;
+
+/// 最多跟随的重定向次数
+pub const WEB_FETCH_MAX_REDIRECTS: usize = 5;
+
+/// `max_chars` 缺省值
+pub const WEB_FETCH_DEFAULT_MAX_CHARS: usize = 8000;
+
+/// `max_chars` 下限（含）
+pub const WEB_FETCH_MIN_CHARS: usize = 500;
+
+/// `max_chars` 上限（含）
+pub const WEB_FETCH_MAX_CHARS: usize = 50_000;
+
+/// 原始响应用的读取上限，避免超大页面占满内存
+const WEB_FETCH_MAX_BODY_BYTES: usize = 1_048_576;
+
+const WEB_FETCH_USER_AGENT: &str = "JiaClaw/0.1 (web_fetch)";
+
+/// 将 `max_chars` 钳制到 `500..=50000`。
+#[must_use]
+pub fn clamp_web_fetch_max_chars(raw: u64) -> usize {
+    usize::try_from(raw)
+        .unwrap_or(WEB_FETCH_MAX_CHARS)
+        .clamp(WEB_FETCH_MIN_CHARS, WEB_FETCH_MAX_CHARS)
+}
+
+/// 解析 `web_fetch` 参数：必填 `url`，可选 `max_chars`（默认 8000，钳制 500..=50000）。
+///
+/// # Errors
+///
+/// `url` 缺失/空白，或 `max_chars` 不是数字时返回错误。
+pub fn parse_web_fetch_args(args: &Value) -> Result<(String, usize), JiaClawError> {
+    let url = args
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            JiaClawError::ToolExecution("缺少参数 'url'（非空 http/https URL）".to_string())
+        })?;
+
+    let max_chars = match args.get("max_chars") {
+        None => WEB_FETCH_DEFAULT_MAX_CHARS,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()));
+            match raw {
+                Some(n) => clamp_web_fetch_max_chars(n),
+                None => {
+                    return Err(JiaClawError::ToolExecution(
+                        "参数 'max_chars' 必须是整数（将钳制到 500..=50000）".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+
+    Ok((url.to_string(), max_chars))
+}
+
+/// 校验 `web_fetch` URL：仅 http(s)，默认拒绝 localhost / 私网 / 链路本地。
+///
+/// # Errors
+///
+/// 非 http(s)、无法解析、或目标落在被拒绝网段时返回错误。
+pub fn validate_web_fetch_url(url: &str, allow_private: bool) -> Result<(), JiaClawError> {
+    let parsed = parse_http_url(url)?;
+    if allow_private {
+        return Ok(());
+    }
+    if host_is_obviously_private_or_local(&parsed.host) {
+        return Err(private_url_error(url));
+    }
+    if resolved_host_has_private_ip(&parsed.host)? {
+        return Err(private_url_error(url));
+    }
+    Ok(())
+}
+
+fn private_url_error(url: &str) -> JiaClawError {
+    JiaClawError::ToolExecution(format!(
+        "拒绝抓取私网或本地地址: {url}。默认阻止 localhost、127.0.0.0/8、::1、10/8、172.16/12、192.168/16 与链路本地。如需内网访问，设置 [tools.web_fetch] allow_private = true。"
+    ))
+}
+
+struct ParsedHttpUrl {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+    path_and_query: String,
+}
+
+fn parse_http_url(raw: &str) -> Result<ParsedHttpUrl, JiaClawError> {
+    let raw = raw.trim();
+    let (scheme, rest) = if let Some(rest) = raw.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(scheme_end) = raw.find("://") {
+        let scheme = &raw[..scheme_end];
+        return Err(JiaClawError::ToolExecution(format!(
+            "仅允许 http/https URL，收到协议: {scheme}"
+        )));
+    } else {
+        return Err(JiaClawError::ToolExecution(
+            "URL 必须以 http:// 或 https:// 开头".to_string(),
+        ));
+    };
+
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (authority, path_and_query) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], rest[idx..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+
+    if authority.is_empty() {
+        return Err(JiaClawError::ToolExecution("URL 缺少主机名".to_string()));
+    }
+
+    let authority = match authority.rfind('@') {
+        Some(idx) => &authority[idx + 1..],
+        None => authority,
+    };
+
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let end = inner
+            .find(']')
+            .ok_or_else(|| JiaClawError::ToolExecution("IPv6 URL 缺少闭合括号".to_string()))?;
+        let host = inner[..end].to_string();
+        let after = &inner[end + 1..];
+        let port = if after.is_empty() {
+            None
+        } else if let Some(port_str) = after.strip_prefix(':') {
+            Some(parse_port(port_str)?)
+        } else {
+            return Err(JiaClawError::ToolExecution(
+                "IPv6 URL 端口格式无效".to_string(),
+            ));
+        };
+        (host, port)
+    } else if let Some((host, port_str)) = split_host_port(authority) {
+        (host.to_string(), Some(parse_port(port_str)?))
+    } else {
+        (authority.to_string(), None)
+    };
+
+    if host.is_empty() {
+        return Err(JiaClawError::ToolExecution("URL 缺少主机名".to_string()));
+    }
+
+    Ok(ParsedHttpUrl {
+        scheme: scheme.to_string(),
+        host,
+        port,
+        path_and_query,
+    })
+}
+
+fn split_host_port(authority: &str) -> Option<(&str, &str)> {
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((host, port))
+}
+
+fn parse_port(raw: &str) -> Result<u16, JiaClawError> {
+    raw.parse::<u16>()
+        .map_err(|_| JiaClawError::ToolExecution(format!("无效端口: {raw}")))
+}
+
+fn format_origin(parsed: &ParsedHttpUrl) -> String {
+    match parsed.port {
+        Some(port) if parsed.host.contains(':') => {
+            format!("{}://[{}]:{port}", parsed.scheme, parsed.host)
+        }
+        Some(port) => format!("{}://{}:{port}", parsed.scheme, parsed.host),
+        None if parsed.host.contains(':') => {
+            format!("{}://[{}]", parsed.scheme, parsed.host)
+        }
+        None => format!("{}://{}", parsed.scheme, parsed.host),
+    }
+}
+
+fn resolve_redirect_location(current: &str, location: &str) -> Result<String, JiaClawError> {
+    let location = location.trim();
+    if location.is_empty() {
+        return Err(JiaClawError::ToolExecution(
+            "重定向响应缺少 Location".to_string(),
+        ));
+    }
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(location.to_string());
+    }
+    if let Some(rest) = location.strip_prefix("//") {
+        let parsed = parse_http_url(current)?;
+        return Ok(format!("{}://{rest}", parsed.scheme));
+    }
+
+    let parsed = parse_http_url(current)?;
+    let origin = format_origin(&parsed);
+    if location.starts_with('/') {
+        return Ok(format!("{origin}{location}"));
+    }
+
+    let path = parsed
+        .path_and_query
+        .split('?')
+        .next()
+        .unwrap_or(&parsed.path_and_query);
+    let dir = match path.rfind('/') {
+        Some(idx) => &path[..=idx],
+        None => "/",
+    };
+    Ok(format!("{origin}{dir}{location}"))
+}
+
+fn host_is_obviously_private_or_local(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip_is_private_or_local(ip);
+    }
+    false
+}
+
+fn resolved_host_has_private_ip(host: &str) -> Result<bool, JiaClawError> {
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(host_is_obviously_private_or_local(host));
+    }
+    let addrs = (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析主机 {host}: {e}")))?;
+    let ips: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
+    if ips.is_empty() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "无法解析主机 {host}: 没有地址"
+        )));
+    }
+    Ok(ips.into_iter().any(ip_is_private_or_local))
+}
+
+fn ip_is_private_or_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_private_or_local(v4),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ipv4_is_private_or_local(v4);
+            }
+            if let Some(v4) = v6.to_ipv4() {
+                return ipv4_is_private_or_local(v4);
+            }
+            let segs = v6.segments();
+            // fe80::/10 链路本地
+            if segs[0] & 0xffc0 == 0xfe80 {
+                return true;
+            }
+            // fc00::/7 unique local
+            if segs[0] & 0xfe00 == 0xfc00 {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+fn ipv4_is_private_or_local(ip: Ipv4Addr) -> bool {
+    ip.is_unspecified() || ip.is_loopback() || ip.is_private() || ip.is_link_local()
+}
+
+fn is_redirect_status(status: i32) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn content_type_is_html(content_type: &str, body: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.contains("text/html") || ct.contains("application/xhtml") {
+        return true;
+    }
+    if !ct.is_empty() {
+        return false;
+    }
+    let trimmed = body.trim_start();
+    let lower = trimmed.get(..32).unwrap_or(trimmed).to_ascii_lowercase();
+    lower.starts_with("<!doctype html") || lower.starts_with("<html")
+}
+
+fn remaining_timeout_secs(deadline: Instant) -> Result<u64, JiaClawError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "web_fetch 超过 {WEB_FETCH_HTTP_TIMEOUT_SECS}s 超时"
+        )));
+    }
+    Ok(remaining.as_secs().clamp(1, WEB_FETCH_HTTP_TIMEOUT_SECS))
+}
+
+/// 轻量 HTML → 可读文本：去掉 script/style，剥离标签，保留标题。
+#[must_use]
+pub fn html_to_readable_text(html: &str) -> (Option<String>, String) {
+    let title = extract_html_title(html);
+    let mut text = strip_elements_with_content(html, "script");
+    text = strip_elements_with_content(&text, "style");
+    text = strip_elements_with_content(&text, "noscript");
+    text = strip_html_comments(&text);
+    text = tags_to_text(&text);
+    text = decode_basic_entities(&text);
+    text = collapse_whitespace(&text);
+    (title, text)
+}
+
+fn extract_html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start_tag = lower.find("<title")?;
+    let start_inner = lower[start_tag..].find('>')? + start_tag + 1;
+    let end_tag = lower[start_inner..].find("</title>")? + start_inner;
+    let title = decode_basic_entities(&html[start_inner..end_tag]);
+    let title = collapse_whitespace(&title);
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn strip_elements_with_content(html: &str, tag: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while let Some(rel) = lower[i..].find(&open) {
+        let start = i + rel;
+        let after = start + open.len();
+        let boundary = lower.as_bytes().get(after).copied().unwrap_or(b'>');
+        if !matches!(boundary, b'>' | b'/' | b' ' | b'\n' | b'\r' | b'\t') {
+            out.push_str(&html[i..after]);
+            i = after;
+            continue;
+        }
+        out.push_str(&html[i..start]);
+        if let Some(end_rel) = lower[after..].find(&close) {
+            i = after + end_rel + close.len();
+        } else {
+            return out;
+        }
+    }
+    out.push_str(&html[i..]);
+    out
+}
+
+fn strip_html_comments(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start + 4..].find("-->") {
+            rest = &rest[start + 4 + end + 3..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn tags_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('>') {
+            let tag = after[..end].trim();
+            let name = tag
+                .trim_start_matches('/')
+                .split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or("");
+            let name = name.to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "p" | "div"
+                    | "br"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "li"
+                    | "tr"
+                    | "section"
+                    | "article"
+                    | "header"
+                    | "footer"
+                    | "blockquote"
+                    | "hr"
+                    | "ul"
+                    | "ol"
+            ) {
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_basic_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find(';') {
+            let entity = &after[..end];
+            if let Some(ch) = decode_entity(entity) {
+                out.push(ch);
+            } else {
+                out.push('&');
+                out.push_str(entity);
+                out.push(';');
+            }
+            rest = &after[end + 1..];
+        } else {
+            out.push('&');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" | "#39" => Some('\''),
+        "nbsp" => Some(' '),
+        other => {
+            if let Some(digits) = other
+                .strip_prefix("#x")
+                .or_else(|| other.strip_prefix("#X"))
+            {
+                u32::from_str_radix(digits, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+            } else if let Some(digits) = other.strip_prefix('#') {
+                digits.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut newline_run = 0;
+    let mut space_pending = false;
+    for ch in input.chars() {
+        if ch == '\n' || ch == '\r' {
+            space_pending = false;
+            newline_run += 1;
+            if newline_run <= 2 {
+                if ch == '\r' {
+                    continue;
+                }
+                out.push('\n');
+            }
+            continue;
+        }
+        newline_run = 0;
+        if ch.is_whitespace() {
+            space_pending = !out.is_empty() && !out.ends_with('\n');
+            continue;
+        }
+        if space_pending {
+            out.push(' ');
+            space_pending = false;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+fn format_web_fetch_output(
+    final_url: &str,
+    title: Option<&str>,
+    body: &str,
+    max_chars: usize,
+) -> String {
+    let mut truncated = false;
+    let body = if body.chars().count() > max_chars {
+        truncated = true;
+        body.chars().take(max_chars).collect::<String>()
+    } else {
+        body.to_string()
+    };
+
+    let mut out = String::new();
+    if let Some(title) = title.filter(|t| !t.is_empty()) {
+        out.push_str("Title: ");
+        out.push_str(title);
+        out.push('\n');
+    }
+    out.push_str("URL: ");
+    out.push_str(final_url);
+    out.push_str("\n\n");
+    out.push_str(&body);
+    if truncated {
+        out.push_str("\n\n[truncated]");
+    }
+    out
+}
+
+/// 网页抓取工具：GET URL，HTML 去标签为可读文本
+pub struct WebFetchTool {
+    allow_private: bool,
+}
+
+impl WebFetchTool {
+    /// 创建工具；`allow_private` 为 `true` 时允许 localhost / 私网。
+    #[must_use]
+    pub fn new(allow_private: bool) -> Self {
+        Self { allow_private }
+    }
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+#[async_trait]
+impl Tool for WebFetchTool {
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+
+    fn description(&self) -> &str {
+        "抓取网页并返回可读纯文本（HTML 会去掉 script/style 与标签）。url 必填且仅限 http/https；可选 max_chars（默认 8000，钳制 500..=50000）。默认拒绝 localhost/私网。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "要抓取的 URL（必填，仅 http/https）"
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "返回正文最大字符数（可选，默认 8000，钳制到 500..=50000）",
+                    "minimum": 500,
+                    "maximum": 50000,
+                    "default": 8000
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let (url, max_chars) = parse_web_fetch_args(&args)?;
+        validate_web_fetch_url(&url, self.allow_private)?;
+        let allow_private = self.allow_private;
+
+        tokio::task::spawn_blocking(move || perform_web_fetch(&url, max_chars, allow_private))
+            .await
+            .map_err(|e| JiaClawError::ToolExecution(format!("任务执行失败: {e}")))?
+    }
+}
+
+fn perform_web_fetch(
+    start_url: &str,
+    max_chars: usize,
+    allow_private: bool,
+) -> Result<String, JiaClawError> {
+    let deadline = Instant::now() + Duration::from_secs(WEB_FETCH_HTTP_TIMEOUT_SECS);
+    let mut current = start_url.to_string();
+
+    for redirect_count in 0..=WEB_FETCH_MAX_REDIRECTS {
+        validate_web_fetch_url(&current, allow_private)?;
+        let timeout_secs = remaining_timeout_secs(deadline)?;
+        tracing::debug!("web_fetch 请求: {current}");
+
+        let response = minreq::get(&current)
+            .with_header(
+                "Accept",
+                "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+            )
+            .with_header("User-Agent", WEB_FETCH_USER_AGENT)
+            .with_max_redirects(0)
+            .with_timeout(timeout_secs)
+            .send()
+            .map_err(|e| JiaClawError::ToolExecution(format!("web_fetch 请求失败: {e}")))?;
+
+        let status = response.status_code;
+        if is_redirect_status(status) {
+            if redirect_count == WEB_FETCH_MAX_REDIRECTS {
+                return Err(JiaClawError::ToolExecution(format!(
+                    "web_fetch 重定向超过 {WEB_FETCH_MAX_REDIRECTS} 次"
+                )));
+            }
+            let location = header_value(&response.headers, "location").ok_or_else(|| {
+                JiaClawError::ToolExecution(format!("web_fetch 收到 HTTP {status} 但缺少 Location"))
+            })?;
+            current = resolve_redirect_location(&current, location)?;
+            continue;
+        }
+
+        if !(200..300).contains(&status) {
+            return Err(JiaClawError::ToolExecution(format!(
+                "web_fetch 返回 HTTP {status}（最终 URL: {current}）"
+            )));
+        }
+
+        let content_type = header_value(&response.headers, "content-type")
+            .unwrap_or("")
+            .to_string();
+        let raw = response.as_bytes();
+        let truncated_download = raw.len() > WEB_FETCH_MAX_BODY_BYTES;
+        let slice = if truncated_download {
+            &raw[..WEB_FETCH_MAX_BODY_BYTES]
+        } else {
+            raw
+        };
+        let body = String::from_utf8_lossy(slice);
+
+        let (title, text) = if content_type_is_html(&content_type, &body) {
+            html_to_readable_text(&body)
+        } else {
+            (None, body.trim().to_string())
+        };
+
+        let mut output = format_web_fetch_output(&current, title.as_deref(), &text, max_chars);
+        if truncated_download && !output.contains("[truncated]") {
+            output.push_str("\n\n[truncated]");
+        }
+        return Ok(output);
+    }
+
+    Err(JiaClawError::ToolExecution(format!(
+        "web_fetch 重定向超过 {WEB_FETCH_MAX_REDIRECTS} 次"
+    )))
 }
 
 /// `DateTime` 工具
@@ -1879,5 +2554,191 @@ mod tests {
             !err.contains("secret-key-value"),
             "must not leak api key: {err}"
         );
+    }
+
+    #[test]
+    fn parse_web_fetch_args_requires_non_empty_url() {
+        let err = parse_web_fetch_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("url"), "{err}");
+
+        let err = parse_web_fetch_args(&serde_json::json!({"url": "   "}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("url"), "{err}");
+    }
+
+    #[test]
+    fn parse_web_fetch_args_defaults_and_clamps_max_chars() {
+        let (url, max_chars) =
+            parse_web_fetch_args(&serde_json::json!({"url": " https://example.com "})).unwrap();
+        assert_eq!(url, "https://example.com");
+        assert_eq!(max_chars, WEB_FETCH_DEFAULT_MAX_CHARS);
+
+        let (_, max_chars) = parse_web_fetch_args(&serde_json::json!({
+            "url": "https://example.com",
+            "max_chars": 500
+        }))
+        .unwrap();
+        assert_eq!(max_chars, WEB_FETCH_MIN_CHARS);
+
+        let (_, max_chars) = parse_web_fetch_args(&serde_json::json!({
+            "url": "https://example.com",
+            "max_chars": 10
+        }))
+        .unwrap();
+        assert_eq!(max_chars, WEB_FETCH_MIN_CHARS);
+
+        let (_, max_chars) = parse_web_fetch_args(&serde_json::json!({
+            "url": "https://example.com",
+            "max_chars": 99_999
+        }))
+        .unwrap();
+        assert_eq!(max_chars, WEB_FETCH_MAX_CHARS);
+
+        let err = parse_web_fetch_args(&serde_json::json!({
+            "url": "https://example.com",
+            "max_chars": "nope"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_chars"), "{err}");
+    }
+
+    #[test]
+    fn clamp_web_fetch_max_chars_bounds() {
+        assert_eq!(clamp_web_fetch_max_chars(0), WEB_FETCH_MIN_CHARS);
+        assert_eq!(clamp_web_fetch_max_chars(8000), 8000);
+        assert_eq!(clamp_web_fetch_max_chars(50_000), WEB_FETCH_MAX_CHARS);
+        assert_eq!(clamp_web_fetch_max_chars(50_001), WEB_FETCH_MAX_CHARS);
+    }
+
+    #[test]
+    fn validate_web_fetch_url_rejects_non_http_and_private() {
+        for url in [
+            "ftp://example.com/file",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "example.com",
+        ] {
+            let err = validate_web_fetch_url(url, false).unwrap_err().to_string();
+            assert!(
+                err.contains("http") || err.contains("https") || err.contains("协议"),
+                "unexpected error for {url}: {err}"
+            );
+        }
+
+        for url in [
+            "http://127.0.0.1/",
+            "http://127.0.0.1:8080/foo",
+            "http://localhost/secret",
+            "http://LOCALHOST/secret",
+            "http://[::1]/",
+            "http://10.0.0.1/",
+            "http://172.16.0.1/",
+            "http://172.31.255.1/",
+            "http://192.168.1.1/",
+            "http://169.254.1.1/",
+        ] {
+            let err = validate_web_fetch_url(url, false).unwrap_err().to_string();
+            assert!(err.contains("私网") || err.contains("本地"), "{url}: {err}");
+        }
+
+        validate_web_fetch_url("https://1.1.1.1/path", false).unwrap();
+        validate_web_fetch_url("http://172.15.0.1/", false).unwrap();
+        validate_web_fetch_url("http://127.0.0.1/", true).unwrap();
+        validate_web_fetch_url("http://192.168.0.5/internal", true).unwrap();
+    }
+
+    #[test]
+    fn html_to_readable_text_strips_script_and_keeps_body() {
+        let html = r#"
+            <html>
+              <head>
+                <title>Demo Title</title>
+                <script>alert('xss')</script>
+                <style>body { color: red; }</style>
+              </head>
+              <body>
+                <p>Hello visible</p>
+                <script>secret_token</script>
+              </body>
+            </html>
+        "#;
+        let (title, text) = html_to_readable_text(html);
+        assert_eq!(title.as_deref(), Some("Demo Title"));
+        assert!(text.contains("Hello visible"), "{text}");
+        assert!(!text.contains("alert"), "{text}");
+        assert!(!text.contains("xss"), "{text}");
+        assert!(!text.contains("secret_token"), "{text}");
+        assert!(!text.contains("color: red"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_private_url_without_network() {
+        let tool = WebFetchTool::new(false);
+        assert_eq!(tool.name(), "web_fetch");
+        let err = tool
+            .execute(serde_json::json!({"url": "http://127.0.0.1/"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("私网") || err.contains("本地"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_html_becomes_text_without_script() {
+        let path = "/web-fetch-html";
+        let _mock = mockito::mock("GET", path)
+            .match_header("User-Agent", WEB_FETCH_USER_AGENT)
+            .with_status(200)
+            .with_header("content-type", "text/html; charset=utf-8")
+            .with_body(
+                r#"<html><head><title>Demo Title</title>
+                <script>alert('xss')</script></head>
+                <body><p>Hello visible</p></body></html>"#,
+            )
+            .create();
+
+        let tool = WebFetchTool::new(true);
+        let url = format!("{}{path}", mockito::server_url());
+        let result = tool.execute(serde_json::json!({"url": url})).await.unwrap();
+
+        assert!(result.contains("Demo Title"), "{result}");
+        assert!(result.contains("Hello visible"), "{result}");
+        assert!(result.contains("URL: "), "{result}");
+        assert!(!result.contains("alert"), "{result}");
+        assert!(!result.contains("xss"), "{result}");
+        assert!(!result.contains("<p>"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_truncates_long_text() {
+        let path = "/web-fetch-long";
+        let long_body = "A".repeat(20_000);
+        let html = format!("<html><body><p>{long_body}</p></body></html>");
+        let _mock = mockito::mock("GET", path)
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body(html)
+            .create();
+
+        let tool = WebFetchTool::new(true);
+        let url = format!("{}{path}", mockito::server_url());
+        let result = tool
+            .execute(serde_json::json!({"url": url, "max_chars": 500}))
+            .await
+            .unwrap();
+
+        assert!(result.contains("[truncated]"), "{result}");
+        let body = result.split("\n\n").nth(1).unwrap_or(&result);
+        let body = body.replace("[truncated]", "");
+        assert!(
+            body.chars().count() <= WEB_FETCH_MIN_CHARS + 20,
+            "body too long: {}",
+            body.chars().count()
+        );
+        assert!(result.contains('A'), "{result}");
     }
 }

@@ -12,10 +12,10 @@
 pub use jiaclaw_core::{
     AgentConfig, ChatMessage, ChatRequest, ChatResponse, HeartbeatConfig, HttpConfig,
     IdentityConfig, JiaClawError, MemoryConfig, MessageRole, ProviderConfig, RunStatus,
-    SessionConfig, ToolCall, ToolsConfig, WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-    DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MEMORY_PATH,
-    DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_SESSION_MESSAGES,
-    MEMORY_PROMPT_MAX_BYTES,
+    SessionConfig, ToolCall, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+    DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
+    DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
+    MAX_SESSION_MESSAGES, MEMORY_PROMPT_MAX_BYTES,
 };
 
 mod heartbeat;
@@ -46,11 +46,13 @@ pub use session::{
 };
 pub use skills::{Skill, SkillDiscovery};
 pub use tools::{
-    clamp_web_search_max_results, parse_web_search_args, DateTimeTool, FileCopyTool,
-    FileDeleteTool, FileListTool, FileReadTool, FileWriteTool, HttpGetTool, JsonQueryTool,
-    MemoryReadTool, ShellExecTool, Tool, ToolRegistry, WebSearchTool, WorkspaceListTool,
-    DEFAULT_BRAVE_SEARCH_ENDPOINT, WEB_SEARCH_DEFAULT_MAX_RESULTS, WEB_SEARCH_HTTP_TIMEOUT_SECS,
-    WEB_SEARCH_MAX_RESULTS,
+    clamp_web_fetch_max_chars, clamp_web_search_max_results, html_to_readable_text,
+    parse_web_fetch_args, parse_web_search_args, validate_web_fetch_url, DateTimeTool,
+    FileCopyTool, FileDeleteTool, FileListTool, FileReadTool, FileWriteTool, HttpGetTool,
+    JsonQueryTool, MemoryReadTool, ShellExecTool, Tool, ToolRegistry, WebFetchTool, WebSearchTool,
+    WorkspaceListTool, DEFAULT_BRAVE_SEARCH_ENDPOINT, WEB_FETCH_DEFAULT_MAX_CHARS,
+    WEB_FETCH_HTTP_TIMEOUT_SECS, WEB_FETCH_MAX_CHARS, WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_MIN_CHARS,
+    WEB_SEARCH_DEFAULT_MAX_RESULTS, WEB_SEARCH_HTTP_TIMEOUT_SECS, WEB_SEARCH_MAX_RESULTS,
 };
 pub use workspace::Workspace;
 
@@ -136,6 +138,11 @@ impl JiaClawAgent {
         if config.tools.web_search.enabled {
             tools.register(Box::new(WebSearchTool::new(
                 config.tools.web_search.effective_brave_api_key(),
+            )));
+        }
+        if config.tools.web_fetch.enabled {
+            tools.register(Box::new(WebFetchTool::new(
+                config.tools.web_fetch.allow_private,
             )));
         }
 
@@ -991,6 +998,7 @@ mod tests {
                     enabled: false,
                     brave_api_key: None,
                 },
+                ..ToolsConfig::default()
             },
             ..AgentConfig::default()
         };
@@ -1017,6 +1025,7 @@ mod tests {
                     enabled: false,
                     brave_api_key: None,
                 },
+                ..ToolsConfig::default()
             },
             ..AgentConfig::default()
         };
@@ -1026,6 +1035,83 @@ mod tests {
             .execute(&ToolCall {
                 tool_name: "web_search".to_string(),
                 arguments: serde_json::json!({"query": "hello"}),
+                result: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("工具不存在"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn web_fetch_is_registered_by_default() {
+        let agent = JiaClawAgent::new(AgentConfig::default()).unwrap();
+        assert!(
+            agent.tools().get("web_fetch").is_some(),
+            "web_fetch should be in the default tool list"
+        );
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            prompt.contains("web_fetch"),
+            "system prompt should describe web_fetch"
+        );
+        assert!(prompt.contains("max_chars"), "{prompt}");
+    }
+
+    #[test]
+    fn web_fetch_is_not_registered_when_disabled() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                web_fetch: WebFetchToolConfig {
+                    enabled: false,
+                    allow_private: false,
+                },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        assert!(agent.tools().get("web_fetch").is_none());
+        assert!(agent.tools().get("web_search").is_some());
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            !prompt.contains("### web_fetch"),
+            "disabled web_fetch must not appear in tool docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_execute_when_unregistered_returns_missing_tool() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                web_fetch: WebFetchToolConfig {
+                    enabled: false,
+                    allow_private: false,
+                },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let err = agent
+            .tools()
+            .execute(&ToolCall {
+                tool_name: "web_fetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com"}),
                 result: None,
             })
             .await

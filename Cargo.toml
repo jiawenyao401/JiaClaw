@@ -34,7 +34,7 @@ homepage = "https://github.com/jiawenyao401/JiaClaw"
 tokio = { version = "1.40", features = ["full"] }
 
 # HTTP client - using minreq for simplicity and Rust 1.83 compatibility
-minreq = { version = "2.12", features = ["json-using-serde"] }
+minreq = { version = "2.12", features = ["json-using-serde", "https"] }
 
 # Utilities
 dirs = "4.0"

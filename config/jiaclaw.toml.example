@@ -135,6 +135,13 @@ enabled = [
 enabled = true
 # brave_api_key = "BSA..."
 
+[tools.web_fetch]
+# 可选网页抓取（默认启用并注册）。GET 页面，HTML 去标签为可读文本。
+# 默认拒绝 localhost / 私网（127.0.0.0/8、::1、10/8、172.16/12、192.168/16、链路本地）。
+# 内网调试可设 allow_private = true。HTTP 超时约 15s，并遵守 [agent] tool_timeout_secs。
+enabled = true
+# allow_private = false
+
 [skills]
 # 启用的技能列表（示例）
 enabled = [

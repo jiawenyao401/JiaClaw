@@ -262,7 +262,7 @@ This skill provides web search capabilities for finding information, news, and c
 ## Tools
 
 - `web_search` - Search the web using a search engine
-- `fetch_url` - Fetch and extract content from a URL
+- `web_fetch` - Fetch a URL and extract readable text
 
 ## Usage
 
