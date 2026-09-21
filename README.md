@@ -68,7 +68,8 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 计数：`jiaclaw_http_requests_total{path,method,status}`（路由族）、`jiaclaw_sessions_active`、`jiaclaw_tool_calls_total{tool,result}`、`jiaclaw_build_info{version}`
 - ✅ **可选 Session TTL** - 闲置超时自动清理内存会话（长时间 `serve` 防堆积）
   - 配置 `session_ttl_secs` 或环境变量 `JIACLAW_SESSION_TTL_SECS`（正整数才启用；`0`/非法=关闭）
-  - create/chat/get/list 触达刷新；过期后 list 不返回，GET/DELETE 与不存在一致（404）
+  - create/chat/get/list 触达刷新；过期后 list 不返回，GET/DELETE/export 与不存在一致（404）
+  - `GET /api/sessions/:id/export` 只读导出（默认 JSONL），不刷新 TTL、不触发摘要
 - ✅ **可选 Session 摘要压缩** - 接近消息条数上限时把旧消息折叠成一条摘要，避免硬截断丢上下文
   - 配置 `[session] summarize_on_overflow`（默认 `false`，保持现有丢弃最旧消息行为）或环境变量 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` 强制开启
   - `keep_recent` 默认 10；复用当前 LLM provider，固定中英 prompt，无工具且限制 `max_tokens`；失败 warn 并回退硬截断，不让 chat 失败
@@ -117,7 +118,8 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 事件：`meta`（session_id / request_id）、`token`（文本增量）、`tool`（name + ok/error）、`done`（最终 reply）、`error`
   - **当前为整轮 tool loop 完成后的分块推送；Brokerrouter 真流式后续**
   - 未请求流式时 JSON 响应完全不变；鉴权失败仍为 JSON 401
-- ✅ **Session 查询 API** - `GET /api/sessions` 列表、`GET /api/sessions/:id` 读取历史（不存在 404）
+- ✅ **Session 查询 API** - `GET /api/sessions` 列表、`GET /api/sessions/:id` 读取历史、`GET /api/sessions/:id/export` 导出 JSONL/JSON（不存在或过期 404；导出不触发摘要、不改写 store）
+- ✅ **CLI 会话导出** - `jiaclaw session export <id> [-o file]`，默认 stdout JSONL；读落盘 session store
 - ✅ **工作区 MEMORY.md** - 跨会话长期记忆注入系统提示
   - 默认 `{workspace}/MEMORY.md`，可用 `[memory] path` 覆盖
   - 每次 `chat` 重读；过大截断（32KiB）并 warn
@@ -327,6 +329,10 @@ cargo run --bin jiaclaw -- memory show
 cargo run --bin jiaclaw -- soul show
 cargo run --bin jiaclaw -- user show
 
+# 导出会话（JSONL；默认 stdout。读 `[http] persist_path` 落盘 store）
+cargo run --bin jiaclaw -- session export <session-id>
+cargo run --bin jiaclaw -- session export <session-id> -o session.jsonl
+
 # 列出已发现的技能
 cargo run --bin jiaclaw -- skills
 cargo run --bin jiaclaw -- skills --verbose  # 显示详细信息
@@ -424,6 +430,10 @@ curl -N -X POST http://127.0.0.1:8080/api/chat \
 # 读取会话历史（不存在返回 404）
 curl http://127.0.0.1:8080/api/sessions/$SESSION_ID
 
+# 导出会话 JSONL（每行一条消息；可选 ?format=json 返回 {id, messages}）
+curl -D - http://127.0.0.1:8080/api/sessions/$SESSION_ID/export
+curl http://127.0.0.1:8080/api/sessions/$SESSION_ID/export?format=json
+
 # 删除会话
 curl -X DELETE http://127.0.0.1:8080/api/sessions/$SESSION_ID
 
@@ -503,14 +513,14 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - StateKnot 持久化功能尚未集成
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 超限返回 `429` + `Retry-After`；`GET /health` 与 `GET /metrics` 不限流
 - 可选 Prometheus 指标：`GET /metrics` 默认公开；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。进程内计数（HTTP 路由族、session 数、工具调用、build_info），不引入 telemetry SDK
-- 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET 为 404
+- 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET/export 为 404
 - 可选 Session 摘要压缩：设置 `[session] summarize_on_overflow = true` 或 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` 后，接近上限时把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`（默认 10）条；未开启则仍硬截断。摘要失败会 warn 并回退截断，chat 不失败
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
 - 可配置工具循环上限：设置 `JIACLAW_MAX_TOOL_ITERATIONS` 或 `[agent] max_tool_iterations`（默认 5）；正整数生效，`0`/非法忽略，钳制 1–32。达上限时写入 tool/assistant 提示并结束本轮
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
 - 可选 SSE：`POST /api/chat` 在 `Accept: text/event-stream` 或 `"stream": true` 时返回 `text/event-stream`（`meta` / `token` / `tool` / `done` / `error`）。未请求流式时 JSON 不变。**当前为分块推送；Brokerrouter 真流式后续**
-- Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
+- Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；`GET /api/sessions/:id/export` 默认 JSONL（`?format=json` 整包）；不存在或过期 404。导出只读，不触发摘要、不改写 store。CLI：`jiaclaw session export <id> [-o file]`
 - Telegram Bot 入站：`POST /hooks/telegram` 解析 Bot API Update（`message.text` / `edited_message.text`），会话键 `telegram:{chat.id}`；无文本返回 200 + 跳过说明。可选 `JIACLAW_TELEGRAM_SECRET`。配置 `JIACLAW_TELEGRAM_BOT_TOKEN` 后会调用 `sendMessage` 出站（文本超 4096 截断）；出站失败仍返回 200 + 原 `reply`，避免 Telegram 重试。用 `setWebhook` 把公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`
 - Slack Events API 入站：`POST /hooks/slack` 处理 `url_verification`（回传 `{ challenge }`）与 `event_callback`（仅 `message` 且 `subtype` 为空）；会话键 `slack:{team_id}:{channel}`（无 team 则为 `slack:{channel}`）。可选 `JIACLAW_SLACK_SIGNING_SECRET`（官方 v0 HMAC-SHA256，先取 raw body）。配置 `JIACLAW_SLACK_BOT_TOKEN` 后会调用 `chat.postMessage` 出站；出站失败仍 200 + 原 `reply`。在 Slack 应用的 Event Subscriptions 把 Request URL 指到公网 `https://…/hooks/slack`
 - Discord Interactions 入站：`POST /hooks/discord` 处理 PING（`type=1` → `{ type: 1 }`）与 Chat Input Command（`type=2`）；会话键 `discord:{guild_id}:{channel_id}`（无 guild 则为 `discord:dm:{channel_id}`）。立即 `{ type: 5 }` deferred ACK，后台跑 chat。可选 `JIACLAW_DISCORD_PUBLIC_KEY`（官方 Ed25519，先取 raw body）。配置 `JIACLAW_DISCORD_BOT_TOKEN` 后 PATCH 编辑原始消息；无 token 时仍记 session。生产长任务需 deferred（3s ACK）。在 Discord 应用的 Interactions Endpoint URL 指到公网 `https://…/hooks/discord`
@@ -610,7 +620,8 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Series: `jiaclaw_http_requests_total{path,method,status}` (route family), `jiaclaw_sessions_active`, `jiaclaw_tool_calls_total{tool,result}`, `jiaclaw_build_info{version}`
 - ✅ **Optional Session TTL** - idle sessions are expired to avoid unbounded memory growth during long `serve`
   - Configure `session_ttl_secs` or `JIACLAW_SESSION_TTL_SECS` (positive integer enables; `0`/invalid disables)
-  - create/chat/get/list refresh last access; expired ids are omitted from list and GET/DELETE match not-found (404)
+  - create/chat/get/list refresh last access; expired ids are omitted from list and GET/DELETE/export match not-found (404)
+  - `GET /api/sessions/:id/export` is a read-only dump (JSONL by default); it does not refresh TTL or trigger summarization
 - ✅ **Optional session summary compression** - fold older messages into one summary near the session cap instead of dropping them
   - Configure `[session] summarize_on_overflow` (default `false`, keeps hard truncation) or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` to force-enable
   - `keep_recent` defaults to 10; reuses the current LLM provider with a fixed bilingual prompt, no tools, and a small `max_tokens`; on failure, warn and fall back to truncation without failing chat
@@ -659,7 +670,8 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Events: `meta` (session_id / request_id), `token` (text chunks), `tool` (name + ok/error), `done` (final reply), `error`
   - **Currently chunked after the full tool loop; Brokerrouter true streaming comes later**
   - JSON responses stay unchanged when streaming is not requested; auth failures remain JSON 401
-- ✅ **Session query API** - `GET /api/sessions` list, `GET /api/sessions/:id` history (404 if missing)
+- ✅ **Session query API** - `GET /api/sessions` list, `GET /api/sessions/:id` history, `GET /api/sessions/:id/export` JSONL/JSON dump (404 if missing or expired; export does not summarize or rewrite the store)
+- ✅ **CLI session export** - `jiaclaw session export <id> [-o file]`, stdout JSONL by default; reads the on-disk session store
 - ✅ **Workspace MEMORY.md** - cross-session facts injected into the system prompt
   - Default `{workspace}/MEMORY.md`, overridable via `[memory] path`
   - Re-read on every `chat`; truncate at 32KiB with a warning
@@ -868,6 +880,10 @@ cargo run --bin jiaclaw -- memory show
 cargo run --bin jiaclaw -- soul show
 cargo run --bin jiaclaw -- user show
 
+# Export a session (JSONL; stdout by default. Reads `[http] persist_path`)
+cargo run --bin jiaclaw -- session export <session-id>
+cargo run --bin jiaclaw -- session export <session-id> -o session.jsonl
+
 # Run single chat (requires API key)
 export JIACLAW_API_KEY=brk_live_...
 cargo run --bin jiaclaw -- chat "Hello, JiaClaw"
@@ -953,6 +969,10 @@ curl -N -X POST http://127.0.0.1:8080/api/chat \
 # Read session history (404 if missing)
 curl http://127.0.0.1:8080/api/sessions/$SESSION_ID
 
+# Export session JSONL (one message per line; optional ?format=json for {id, messages})
+curl -D - http://127.0.0.1:8080/api/sessions/$SESSION_ID/export
+curl http://127.0.0.1:8080/api/sessions/$SESSION_ID/export?format=json
+
 # Delete session
 curl -X DELETE http://127.0.0.1:8080/api/sessions/$SESSION_ID
 
@@ -1032,14 +1052,14 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - StateKnot persistence features not yet integrated
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` return `429` + `Retry-After` when exceeded; `GET /health` and `GET /metrics` are never limited
 - Optional Prometheus metrics: `GET /metrics` is public by default; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`. In-process counters (HTTP route family, session gauge, tool calls, build_info); no telemetry SDK
-- Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET of an expired id returns 404
+- Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET/export of an expired id returns 404
 - Optional session summary compression: set `[session] summarize_on_overflow = true` or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` to fold older messages into one `[session-summary]` system message while keeping the latest `keep_recent` (default 10); unset keeps hard truncation. Summary failure warns and falls back; chat still succeeds
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
 - Configurable tool-loop cap: set `JIACLAW_MAX_TOOL_ITERATIONS` or `[agent] max_tool_iterations` (default 5); positive integers apply, `0`/invalid is ignored, clamped to 1–32. Hitting the cap writes a tool/assistant hint and ends the turn
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
 - Optional SSE: `POST /api/chat` returns `text/event-stream` when `Accept: text/event-stream` or `"stream": true` (`meta` / `token` / `tool` / `done` / `error`). JSON is unchanged when streaming is not requested. **Currently chunked after the full loop; Brokerrouter true streaming comes later**
-- Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)
+- Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages; `GET /api/sessions/:id/export` defaults to JSONL (`?format=json` for the full object); 404 if missing or expired. Export is read-only (no summary, no store rewrite). CLI: `jiaclaw session export <id> [-o file]`
 - Telegram Bot inbound: `POST /hooks/telegram` parses Bot API Updates (`message.text` / `edited_message.text`) into session `telegram:{chat.id}`; updates without text return 200 + a skip reason. Optional `JIACLAW_TELEGRAM_SECRET`. With `JIACLAW_TELEGRAM_BOT_TOKEN`, replies are also sent via `sendMessage` (text truncated at 4096); outbound failure still returns 200 + the original `reply` so Telegram does not retry. Point `setWebhook` at the public `https://…/hooks/telegram` URL, optionally with `secret_token`
 - Slack Events API inbound: `POST /hooks/slack` handles `url_verification` (echo `{ challenge }`) and `event_callback` (plain `message` with empty `subtype` only); session key `slack:{team_id}:{channel}` (or `slack:{channel}` if team is missing). Optional `JIACLAW_SLACK_SIGNING_SECRET` (official v0 HMAC-SHA256 over the raw body). With `JIACLAW_SLACK_BOT_TOKEN`, replies are also sent via `chat.postMessage`; outbound failure still returns 200 + the original `reply`. Point the Slack app Event Subscriptions Request URL at the public `https://…/hooks/slack`
 - Discord Interactions inbound: `POST /hooks/discord` handles PING (`type=1` → `{ type: 1 }`) and Chat Input Commands (`type=2`); session key `discord:{guild_id}:{channel_id}` (or `discord:dm:{channel_id}` if guild is missing). Immediately `{ type: 5 }` deferred ACK, then background chat. Optional `JIACLAW_DISCORD_PUBLIC_KEY` (official Ed25519 over the raw body). With `JIACLAW_DISCORD_BOT_TOKEN`, the original message is PATCHed; without a token the session is still recorded. Production long-running work must use deferred (3s ACK). Point the Discord app Interactions Endpoint URL at the public `https://…/hooks/discord`

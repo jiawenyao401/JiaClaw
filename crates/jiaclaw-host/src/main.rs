@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{
@@ -54,6 +54,9 @@ type GlobalRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 /// 请求追踪头。大小写不敏感，响应回写同名头。
 const X_REQUEST_ID: &str = "x-request-id";
+
+/// 会话 JSONL 导出的 `Content-Type`（NDJSON）。
+const SESSION_EXPORT_NDJSON: &str = "application/x-ndjson";
 
 /// Telegram Bot API webhook `secret_token` 请求头（官方名称，大小写不敏感）。
 const X_TELEGRAM_BOT_API_SECRET_TOKEN: &str = "X-Telegram-Bot-Api-Secret-Token";
@@ -223,6 +226,30 @@ enum Commands {
         #[command(subcommand)]
         action: IdentityFileCommands,
     },
+
+    /// 会话（只读导出；不触发摘要、不改写 store）
+    Session {
+        #[command(subcommand)]
+        action: SessionCommands,
+    },
+}
+
+/// 会话子命令
+#[derive(Subcommand)]
+enum SessionCommands {
+    /// 导出会话历史为 JSONL（默认 stdout）
+    Export {
+        /// 会话 ID
+        id: String,
+
+        /// 输出文件（省略则写 stdout）
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: Option<PathBuf>,
+
+        /// 配置文件路径
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
 }
 
 /// 长期记忆子命令
@@ -297,6 +324,11 @@ async fn main() -> Result<()> {
         Commands::User { action } => match action {
             IdentityFileCommands::Show { config } => {
                 identity_show_command(config, IdentityShowKind::User)?;
+            }
+        },
+        Commands::Session { action } => match action {
+            SessionCommands::Export { id, output, config } => {
+                session_export_command(config, &id, output.as_deref())?;
             }
         },
     }
@@ -1497,6 +1529,7 @@ fn build_router(state: AppState) -> Router {
             "/api/sessions/:id",
             get(get_session_handler).delete(delete_session_handler),
         )
+        .route("/api/sessions/:id/export", get(export_session_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/skills", get(skills_handler))
         .route("/api/openapi.json", get(openapi_handler))
@@ -1933,11 +1966,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     let metrics_require_auth = !metrics_public;
 
     // 解析持久化路径
-    let persist_path = if config.http.persist_path.starts_with('/') {
-        PathBuf::from(&config.http.persist_path)
-    } else {
-        config.workspace_path.join(&config.http.persist_path)
-    };
+    let persist_path = persist_path_from_config(&config);
 
     // 加载持久化的 sessions（如果启用）
     let sessions = if config.http.persist {
@@ -2028,6 +2057,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • GET    /api/sessions        - 列出会话");
     tracing::info!("   • POST   /api/sessions        - 创建会话");
     tracing::info!("   • GET    /api/sessions/:id    - 读取会话历史");
+    tracing::info!("   • GET    /api/sessions/:id/export - 导出会话（JSONL / JSON）");
     tracing::info!("   • DELETE /api/sessions/:id    - 删除会话");
     tracing::info!("   • GET    /api/tools           - 列出已注册工具");
     tracing::info!("   • GET    /api/skills          - 列出已发现技能");
@@ -2744,6 +2774,88 @@ async fn get_session_handler(
     }
 }
 
+/// 导出会话查询参数。默认 JSONL；`format=json` 返回整包。
+#[derive(Debug, Default, Deserialize)]
+struct ExportSessionQuery {
+    #[serde(default)]
+    format: Option<String>,
+}
+
+fn wants_json_export(format: Option<&str>) -> bool {
+    format.is_some_and(|value| value.eq_ignore_ascii_case("json"))
+}
+
+/// 将消息编码为 NDJSON（每行一条，沿用现有 `ChatMessage` 字段）。
+fn encode_messages_jsonl(messages: &[ChatMessage]) -> Result<String, serde_json::Error> {
+    let mut out = String::new();
+    for message in messages {
+        out.push_str(&serde_json::to_string(message)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// 只读取出会话消息：过期先按 TTL 清理；不 touch、不摘要、不因导出而改写消息。
+fn load_session_messages_for_export(
+    state: &AppState,
+    session_id: &str,
+) -> Option<Vec<ChatMessage>> {
+    purge_expired_sessions(state);
+    let sessions = state.sessions.lock().unwrap();
+    sessions.get(session_id).map(|rec| rec.messages.clone())
+}
+
+/// 导出会话历史；不存在或已过期返回 404。只读，不触发摘要、不刷新 TTL。
+async fn export_session_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<ExportSessionQuery>,
+) -> Result<Response, AppError> {
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!(
+            request_id = request_id_log_value(&headers),
+            "API 鉴权失败: token 不匹配或缺失"
+        );
+        return Err(AppError::Unauthorized);
+    }
+
+    let Some(messages) = load_session_messages_for_export(&state, &session_id) else {
+        tracing::info!(
+            request_id = request_id_log_value(&headers),
+            "导出 session 不存在: {}",
+            session_id
+        );
+        return Err(AppError::NotFound);
+    };
+
+    tracing::info!(
+        request_id = request_id_log_value(&headers),
+        "导出会话 {}，消息数: {}",
+        session_id,
+        messages.len()
+    );
+
+    if wants_json_export(query.format.as_deref()) {
+        return Ok(Json(GetSessionResponse {
+            id: session_id,
+            messages,
+        })
+        .into_response());
+    }
+
+    let body = encode_messages_jsonl(&messages)
+        .map_err(|e| AppError::Internal(format!("序列化会话导出失败: {e}")))?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(SESSION_EXPORT_NDJSON),
+        )],
+        body,
+    )
+        .into_response())
+}
+
 /// 创建会话处理器
 async fn create_session_handler(
     State(state): State<AppState>,
@@ -3271,8 +3383,16 @@ async fn shutdown_signal() {
     tracing::info!("收到关闭信号，正在停止服务器...");
 }
 
+fn persist_path_from_config(config: &AgentConfig) -> PathBuf {
+    if config.http.persist_path.starts_with('/') {
+        PathBuf::from(&config.http.persist_path)
+    } else {
+        config.workspace_path.join(&config.http.persist_path)
+    }
+}
+
 /// 从磁盘加载 sessions
-fn load_sessions(path: &PathBuf) -> HashMap<String, Vec<ChatMessage>> {
+fn load_sessions(path: &std::path::Path) -> HashMap<String, Vec<ChatMessage>> {
     if !path.exists() {
         tracing::info!("Session 文件不存在，从空 map 开始");
         return HashMap::new();
@@ -3639,6 +3759,45 @@ fn load_agent_config(config_path: Option<PathBuf>) -> Result<AgentConfig> {
     } else {
         Ok(AgentConfig::default())
     }
+}
+
+/// 从落盘 session store 只读导出 JSONL。不触发摘要、不改写文件。
+fn session_export_command(
+    config_path: Option<PathBuf>,
+    session_id: &str,
+    output: Option<&std::path::Path>,
+) -> Result<()> {
+    let config = load_agent_config(config_path)?;
+    let persist_path = persist_path_from_config(&config);
+    export_session_from_persist_file(&persist_path, session_id, output)
+}
+
+fn export_session_from_persist_file(
+    persist_path: &std::path::Path,
+    session_id: &str,
+    output: Option<&std::path::Path>,
+) -> Result<()> {
+    let sessions = load_sessions(persist_path);
+    let Some(messages) = sessions.get(session_id) else {
+        anyhow::bail!("session_not_found");
+    };
+    write_session_jsonl(messages, output)
+}
+
+fn write_session_jsonl(messages: &[ChatMessage], output: Option<&std::path::Path>) -> Result<()> {
+    let body = encode_messages_jsonl(messages).context("序列化会话导出失败")?;
+    if let Some(path) = output {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("无法创建目录: {}", parent.display()))?;
+            }
+        }
+        std::fs::write(path, body).with_context(|| format!("无法写入 {}", path.display()))?;
+    } else {
+        print!("{body}");
+    }
+    Ok(())
 }
 
 fn memory_show_command(config_path: Option<PathBuf>) -> Result<()> {
@@ -5392,6 +5551,214 @@ mod tests {
             .find(|s| s.id == session_id)
             .expect("list 应包含刚聊过的 session");
         assert_eq!(summary.message_count, got.messages.len());
+    }
+
+    fn parse_jsonl_messages(body: &str) -> Vec<ChatMessage> {
+        body.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("每行应为 ChatMessage JSON"))
+            .collect()
+    }
+
+    async fn http_export_session(
+        app: &Router,
+        session_id: &str,
+        format: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let uri = match format {
+            Some(fmt) => format!("/api/sessions/{session_id}/export?format={fmt}"),
+            None => format!("/api/sessions/{session_id}/export"),
+        };
+        app.clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_export_session_jsonl_line_count_matches_chat() {
+        let app = create_test_app();
+        let session_id = "export-session-chat".to_string();
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "你好".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: Some(session_id.clone()),
+        };
+
+        let chat_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat_response.status(), StatusCode::OK);
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let got: GetSessionResponse = serde_json::from_slice(&body).unwrap();
+
+        let export_response = http_export_session(&app, &session_id, None).await;
+        assert_eq!(export_response.status(), StatusCode::OK);
+        assert!(!request_id_header(&export_response).is_empty());
+        assert_eq!(
+            response_content_type(&export_response),
+            SESSION_EXPORT_NDJSON
+        );
+        let export_body = body_text(export_response).await;
+        let exported = parse_jsonl_messages(&export_body);
+        assert_eq!(exported.len(), got.messages.len());
+        assert_eq!(exported, got.messages);
+    }
+
+    #[tokio::test]
+    async fn test_export_session_json_format() {
+        let app = create_test_app();
+        let session_id = "export-session-json".to_string();
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "导出 JSON".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: Some(session_id.clone()),
+        };
+        let chat_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat_response.status(), StatusCode::OK);
+
+        let export_response = http_export_session(&app, &session_id, Some("json")).await;
+        assert_eq!(export_response.status(), StatusCode::OK);
+        assert!(response_content_type(&export_response).starts_with("application/json"));
+        let body = axum::body::to_bytes(export_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let exported: GetSessionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(exported.id, session_id);
+        assert!(
+            exported.messages.len() >= 2,
+            "json 导出应包含用户与助手消息，实际: {}",
+            exported.messages.len()
+        );
+        assert_eq!(exported.messages[0].role, MessageRole::User);
+        assert_eq!(exported.messages[0].content, "导出 JSON");
+    }
+
+    #[tokio::test]
+    async fn test_export_session_not_found() {
+        let app = create_test_app();
+        let response = http_export_session(&app, "does-not-exist", None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get(X_REQUEST_ID).is_some());
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"], "session_not_found");
+    }
+
+    #[tokio::test]
+    async fn test_export_session_does_not_compact_or_rewrite() {
+        let state = create_test_state_from_config(AgentConfig::default());
+        let session_id = "export-no-compact".to_string();
+        let history = overflow_history(60);
+        let original_len = history.len();
+        {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.insert(session_id.clone(), SessionRecord::new(history));
+        }
+        let app = build_router(state.clone());
+
+        let export_response = http_export_session(&app, &session_id, None).await;
+        assert_eq!(export_response.status(), StatusCode::OK);
+        let exported = parse_jsonl_messages(&body_text(export_response).await);
+        assert_eq!(exported.len(), original_len);
+
+        let stored_len = {
+            let sessions = state.sessions.lock().unwrap();
+            sessions
+                .get(&session_id)
+                .expect("export 不应删除 session")
+                .messages
+                .len()
+        };
+        assert_eq!(stored_len, original_len, "导出不应触发摘要或改写 store");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_export_session_ttl_expired_is_not_found() {
+        let app = create_test_app_with_session_ttl(Some(1));
+        let session_id = http_create_session(&app).await;
+
+        let ok = http_export_session(&app, &session_id, None).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let expired = http_export_session(&app, &session_id, None).await;
+        assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(expired.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"], "session_not_found");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_export_session_does_not_refresh_ttl() {
+        let app = create_test_app_with_session_ttl(Some(1));
+        let session_id = http_create_session(&app).await;
+
+        tokio::time::advance(Duration::from_millis(700)).await;
+        let export_response = http_export_session(&app, &session_id, None).await;
+        assert_eq!(export_response.status(), StatusCode::OK);
+
+        tokio::time::advance(Duration::from_millis(700)).await;
+        assert_eq!(
+            http_get_session_status(&app, &session_id).await,
+            StatusCode::NOT_FOUND,
+            "export 不应刷新 last_accessed"
+        );
     }
 
     #[tokio::test]
@@ -8168,6 +8535,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_sessions_api_requires_auth() {
         let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
 
@@ -8212,6 +8580,19 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        // GET /api/sessions/:id/export 无 token 应 401（即使不存在也不应先 404）
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/any-id/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
         // 带正确 token 应该成功
         let response = app
             .clone()
@@ -8247,6 +8628,7 @@ mod tests {
         assert_eq!(list_response.status(), StatusCode::OK);
 
         let get_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/sessions/{session_id}"))
@@ -8257,6 +8639,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_response.status(), StatusCode::OK);
+
+        let export_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/export"))
+                    .header("authorization", "Bearer test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(export_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_content_type(&export_response),
+            SESSION_EXPORT_NDJSON
+        );
     }
 
     #[tokio::test]
@@ -8550,6 +8948,7 @@ mod tests {
         assert!(is_rate_limited_path("/api/tools"));
         assert!(is_rate_limited_path("/api/sessions"));
         assert!(is_rate_limited_path("/api/sessions/abc"));
+        assert!(is_rate_limited_path("/api/sessions/abc/export"));
         assert!(is_rate_limited_path("/api/openapi.json"));
         assert!(is_rate_limited_path("/hooks/inbound"));
         assert!(is_rate_limited_path("/hooks/telegram"));
@@ -8909,6 +9308,7 @@ mod tests {
             "/api/chat",
             "/api/sessions",
             "/api/sessions/{id}",
+            "/api/sessions/{id}/export",
             "/api/tools",
             "/api/skills",
             "/hooks/inbound",
@@ -8925,6 +9325,7 @@ mod tests {
         assert!(paths["/api/sessions"].get("post").is_some());
         assert!(paths["/api/sessions/{id}"].get("get").is_some());
         assert!(paths["/api/sessions/{id}"].get("delete").is_some());
+        assert!(paths["/api/sessions/{id}/export"].get("get").is_some());
     }
 
     #[tokio::test]
@@ -9202,5 +9603,74 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["error"], "Unauthorized");
+    }
+
+    #[test]
+    fn test_cli_session_export_parses() {
+        let cli =
+            Cli::try_parse_from(["jiaclaw", "session", "export", "abc-id", "-o", "out.jsonl"])
+                .expect("应解析 session export");
+        match cli.command {
+            Commands::Session {
+                action: SessionCommands::Export { id, output, config },
+            } => {
+                assert_eq!(id, "abc-id");
+                assert_eq!(output.as_deref(), Some(std::path::Path::new("out.jsonl")));
+                assert!(config.is_none());
+            }
+            _ => panic!("应为 session export 子命令"),
+        }
+    }
+
+    #[test]
+    fn test_cli_session_export_writes_jsonl_and_404() {
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-export-{}.json", uuid::Uuid::new_v4()));
+        let out_path =
+            std::env::temp_dir().join(format!("jiaclaw-export-{}.jsonl", uuid::Uuid::new_v4()));
+        let session_id = "cli-export-id";
+        let mut map = HashMap::new();
+        map.insert(
+            session_id.to_string(),
+            vec![
+                ChatMessage {
+                    role: MessageRole::User,
+                    content: "hi".to_string(),
+                },
+                ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: "hello".to_string(),
+                },
+            ],
+        );
+        save_sessions(&persist_path, &map).expect("保存 persist 失败");
+
+        export_session_from_persist_file(&persist_path, session_id, Some(&out_path))
+            .expect("导出应成功");
+        let body = std::fs::read_to_string(&out_path).expect("应写入 jsonl");
+        let exported = parse_jsonl_messages(&body);
+        assert_eq!(exported.len(), 2);
+        assert_eq!(exported[0].content, "hi");
+        assert_eq!(exported[1].content, "hello");
+
+        let err = export_session_from_persist_file(&persist_path, "missing", Some(&out_path))
+            .expect_err("缺失 session 应失败");
+        assert!(
+            err.to_string().contains("session_not_found"),
+            "错误应为 session_not_found，实际: {err}"
+        );
+
+        let before = std::fs::read_to_string(&persist_path).unwrap();
+        export_session_from_persist_file(&persist_path, session_id, Some(&out_path)).unwrap();
+        let after = std::fs::read_to_string(&persist_path).unwrap();
+        assert_eq!(before, after, "CLI 导出不应改写 persist store");
+
+        std::fs::remove_file(&persist_path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    #[test]
+    fn test_encode_messages_jsonl_empty() {
+        assert_eq!(encode_messages_jsonl(&[]).unwrap(), "");
     }
 }

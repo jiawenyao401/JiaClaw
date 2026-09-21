@@ -56,6 +56,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **Session（内存）** | ✅ 支持 | ⏳ 部分 | ✅ **已实现** | P1 | - |
 | **Session（落盘）** | ✅ 支持 | ⏳ 部分 | ✅ **可选落盘** | P1 | - |
 | **Session 查询 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/sessions** | P1 | - |
+| **Session 导出** | ✅ 支持 | ⏳ 部分 | ✅ **GET export + CLI JSONL** | P1 | - |
 | **Session TTL** | ✅ 支持 | ⏳ 部分 | ✅ **可选闲置过期** | P1 | - |
 | **Session 摘要压缩** | ✅ 支持 | ⏳ 部分 | ✅ **可选溢出摘要** | P1 | - |
 | **工具列表 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/tools** | P1 | - |
@@ -75,12 +76,13 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **gRPC** | ❌ 无 | ❌ 无 | ⏳ 可选（通过 StateKnot） | P2 | - |
 
 **JiaClaw 现状**:
-- ✅ CLI 已实现（`jiaclaw chat`, `jiaclaw serve`）
+- ✅ CLI 已实现（`jiaclaw chat`, `jiaclaw serve`, `jiaclaw session export`）
   - ✅ 单次聊天模式：`jiaclaw chat "消息"`
   - ✅ REPL 交互模式：`jiaclaw chat`（支持多轮对话）
   - ✅ 技能开关：`--skill <name>` 可重复使用，`--no-auto-skill` 禁用自动激活
   - ✅ 会话管理：`--session <id>` 续聊支持
-- ✅ HTTP 服务已实现（GET /health, GET /metrics, POST /api/chat，可选 SSE, GET/POST /api/sessions, GET/DELETE /api/sessions/:id, GET /api/tools, GET /api/skills, GET /api/openapi.json）
+  - ✅ 会话导出：`jiaclaw session export <id> [-o file]`，默认 stdout JSONL；读落盘 store，不触发摘要
+- ✅ HTTP 服务已实现（GET /health, GET /metrics, POST /api/chat，可选 SSE, GET/POST /api/sessions, GET/DELETE /api/sessions/:id, GET /api/sessions/:id/export, GET /api/tools, GET /api/skills, GET /api/openapi.json）
 - ✅ **可选 HTTP 限流**（`[http] rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`，进程内全局，超限 429 + Retry-After；GET /health 与 GET /metrics 不限流；覆盖 `/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord`）
 - ✅ **可选 Prometheus 指标**（`GET /metrics`，手写 Prometheus 0.0.4 文本；默认公开；`[http] metrics_public = false` / `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。HTTP 路由族计数、sessions_active、tool_calls、build_info；无 telemetry SDK）
 - ✅ **请求追踪**（缺失则生成 UUID，响应回写 `X-Request-Id`；chat/webhook tracing 带 request_id）
@@ -88,7 +90,8 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ **可选 SSE**（`POST /api/chat`：`Accept: text/event-stream` 或 body `stream: true` → `text/event-stream`；事件 `meta` / `token` / `tool` / `done` / `error`。未请求流式时 JSON 不变；鉴权失败仍 JSON 401。**当前为整轮完成后分块推送；Brokerrouter 真流式后续**）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史；默认硬截断超长历史，可开启摘要压缩）
 - ✅ **Session 查询 API**（`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息，不存在 404；读内存当前状态，落盘开启时与 store 一致）
-- ✅ **可选 Session TTL**（`[http] session_ttl_secs` / `JIACLAW_SESSION_TTL_SECS`，正整数启用闲置过期；create/chat/get/list 刷新；过期后 list 省略，GET/DELETE 与不存在一致）
+- ✅ **Session 导出**（`GET /api/sessions/:id/export` 默认 JSONL，`?format=json` 整包 `{id, messages}`；鉴权/限流/`X-Request-Id` 与其它 `/api/*` 一致；过期 TTL 与不存在同为 404；不触发摘要、不改写 store。CLI：`jiaclaw session export <id> [-o file]`）
+- ✅ **可选 Session TTL**（`[http] session_ttl_secs` / `JIACLAW_SESSION_TTL_SECS`，正整数启用闲置过期；create/chat/get/list 刷新；过期后 list 省略，GET/DELETE/export 与不存在一致）
 - ✅ **可选 Session 摘要压缩**（`[session] summarize_on_overflow` / `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true`，默认关保持硬截断；开启后把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`；失败 warn 回退截断。HTTP/Telegram/Slack/Discord/webhook/heartbeat 共用 store 写入点，摘要无工具循环）
 - ✅ **Session 可选落盘**（`[http] persist = true`，进程重启后可恢复历史，原子写入，自动处理损坏文件）
 - ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
