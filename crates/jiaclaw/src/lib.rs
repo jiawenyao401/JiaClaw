@@ -158,6 +158,11 @@ impl JiaClawAgent {
         &self.tools
     }
 
+    #[cfg(test)]
+    fn register_tool_for_test(&mut self, tool: Box<dyn Tool>) {
+        self.tools.register(tool);
+    }
+
     /// 处理聊天请求
     ///
     /// # Errors
@@ -365,6 +370,28 @@ impl JiaClawAgent {
         }
     }
 
+    /// 执行一次工具调用，并把成功/失败结果写入 `ToolCall.result`。
+    ///
+    /// 超时走现有错误路径：写入错误结果并返回，不 panic。
+    async fn execute_and_record(&self, mut tool_call: ToolCall) -> (ToolCall, String) {
+        match self
+            .tools
+            .execute_with_timeout(&tool_call, self.config.effective_tool_timeout_secs())
+            .await
+        {
+            Ok(result) => {
+                tool_call.result = Some(serde_json::json!(result.clone()));
+                let message = format!("工具 {} 执行成功:\n{}", tool_call.tool_name, result);
+                (tool_call, message)
+            }
+            Err(e) => {
+                let error_msg = format!("工具 {} 执行失败: {}", tool_call.tool_name, e);
+                tool_call.result = Some(serde_json::json!({"error": error_msg.clone()}));
+                (tool_call, error_msg)
+            }
+        }
+    }
+
     /// 解析 assistant 消息中的工具调用
     fn parse_tool_calls(content: &str) -> Vec<ToolCall> {
         let mut tool_calls = Vec::new();
@@ -479,7 +506,7 @@ impl JiaClawAgent {
             let mut executed_tool_calls = Vec::new();
             let mut tool_results = Vec::new();
 
-            for mut tool_call in tool_calls {
+            for tool_call in tool_calls {
                 tracing::info!(
                     "执行工具: {} (迭代 {}/{})",
                     tool_call.tool_name,
@@ -487,22 +514,9 @@ impl JiaClawAgent {
                     MAX_ITERATIONS
                 );
 
-                match self.tools.execute(&tool_call).await {
-                    Ok(result) => {
-                        tool_call.result = Some(serde_json::json!(result.clone()));
-                        executed_tool_calls.push(tool_call.clone());
-                        tool_results.push(format!(
-                            "工具 {} 执行成功:\n{}",
-                            tool_call.tool_name, result
-                        ));
-                    }
-                    Err(e) => {
-                        let error_msg = format!("工具 {} 执行失败: {}", tool_call.tool_name, e);
-                        tool_call.result = Some(serde_json::json!({"error": error_msg.clone()}));
-                        executed_tool_calls.push(tool_call.clone());
-                        tool_results.push(error_msg);
-                    }
-                }
+                let (recorded, message) = self.execute_and_record(tool_call).await;
+                executed_tool_calls.push(recorded);
+                tool_results.push(message);
             }
 
             // 将所有执行的工具调用添加到累积列表
@@ -858,6 +872,106 @@ mod tests {
             response.tool_calls[0].result.is_some(),
             "工具应该有执行结果"
         );
+    }
+
+    struct SlowSleepTool {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SlowSleepTool {
+        fn name(&self) -> &str {
+            "slow_sleep"
+        }
+
+        fn description(&self) -> &str {
+            "test-only slow tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<String, JiaClawError> {
+            tokio::time::sleep(self.delay).await;
+            Ok("slept".to_string())
+        }
+    }
+
+    fn slow_sleep_call() -> ToolCall {
+        ToolCall {
+            tool_name: "slow_sleep".to_string(),
+            arguments: serde_json::json!({}),
+            result: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfigured_tool_timeout_does_not_change_behavior() {
+        let config = AgentConfig::default();
+        assert_eq!(config.tool_timeout_secs, None);
+        assert_eq!(config.effective_tool_timeout_secs(), None);
+
+        let mut agent = JiaClawAgent::new(config).unwrap();
+        agent.register_tool_for_test(Box::new(SlowSleepTool {
+            delay: std::time::Duration::from_millis(50),
+        }));
+
+        let (recorded, message) = agent.execute_and_record(slow_sleep_call()).await;
+        let result = recorded.result.expect("tool result");
+        assert!(!result.to_string().contains("timed out"), "{result}");
+        assert!(message.contains("执行成功"), "{message}");
+        assert_eq!(result, serde_json::json!("slept"));
+    }
+
+    #[tokio::test]
+    async fn short_tool_timeout_records_error_in_tool_result() {
+        let config = AgentConfig {
+            tool_timeout_secs: Some(1),
+            ..AgentConfig::default()
+        };
+        let mut agent = JiaClawAgent::new(config).unwrap();
+        agent.register_tool_for_test(Box::new(SlowSleepTool {
+            delay: std::time::Duration::from_secs(10),
+        }));
+
+        let (recorded, message) = agent.execute_and_record(slow_sleep_call()).await;
+        let result = recorded.result.expect("tool result");
+        let result_text = result.to_string();
+        assert!(
+            result_text.contains("Tool timed out after 1s"),
+            "timeout should be in tool result, got: {result_text}"
+        );
+        assert!(message.contains("Tool timed out after 1s"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_does_not_fail_fast_tools() {
+        let config = AgentConfig {
+            tool_timeout_secs: Some(30),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "列出工作空间".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        };
+
+        let response = agent.chat(&request).await.unwrap();
+        assert_eq!(response.tool_calls[0].tool_name, "workspace_list");
+        let result = response.tool_calls[0]
+            .result
+            .as_ref()
+            .expect("tool result")
+            .to_string();
+        assert!(!result.contains("timed out"), "{result}");
     }
 
     #[tokio::test]

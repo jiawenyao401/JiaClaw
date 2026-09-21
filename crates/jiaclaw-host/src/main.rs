@@ -452,6 +452,14 @@ fn session_ttl_config_source() -> &'static str {
     }
 }
 
+fn tool_timeout_config_source() -> &'static str {
+    if std::env::var("JIACLAW_TOOL_TIMEOUT_SECS").is_ok() {
+        "环境变量 JIACLAW_TOOL_TIMEOUT_SECS"
+    } else {
+        "配置文件"
+    }
+}
+
 fn sessions_from_messages(
     raw: HashMap<String, Vec<ChatMessage>>,
 ) -> HashMap<String, SessionRecord> {
@@ -660,6 +668,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • Session TTL: 未启用");
     }
+    if let Some(secs) = config.effective_tool_timeout_secs() {
+        tracing::info!("   • 工具超时: 已启用（每调用 {secs} 秒）");
+    } else {
+        tracing::info!("   • 工具超时: 未启用（不限制）");
+    }
 
     // 打印配置摘要（不打印 secret 明文）
     println!("\n📋 HTTP 配置摘要:");
@@ -707,6 +720,15 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         );
     } else {
         println!("   • Session TTL: ⚠️  未启用（会话不会因闲置过期）");
+    }
+
+    if let Some(secs) = config.effective_tool_timeout_secs() {
+        println!(
+            "   • 工具超时: ✅ 已启用（每调用 {secs} 秒，通过 {}）",
+            tool_timeout_config_source()
+        );
+    } else {
+        println!("   • 工具超时: ⚠️  未启用（不限制单次工具执行时间）");
     }
 
     if config.http.cors_allow_origins.is_empty()
@@ -1975,6 +1997,17 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         }
     };
 
+    let tool_timeout_secs = config.effective_tool_timeout_secs();
+    if let Some(secs) = tool_timeout_secs {
+        println!(
+            "   工具超时: ✅ 已启用（每调用 {secs} 秒，通过 {}）",
+            tool_timeout_config_source()
+        );
+    } else {
+        println!("   工具超时: ⚠️  未启用（不限制）");
+        println!("   💡 设置环境变量: export JIACLAW_TOOL_TIMEOUT_SECS=30");
+    }
+
     // 3. 检查提供商配置
     println!("\n🔌 提供商配置");
     println!("   类型: {}", config.provider.provider_type);
@@ -2135,6 +2168,14 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         "   • Session TTL: {}",
         if let Some(ttl) = session_ttl_secs {
             format!("已启用（闲置 {ttl} 秒）")
+        } else {
+            "未启用".to_string()
+        }
+    );
+    println!(
+        "   • 工具超时: {}",
+        if let Some(secs) = tool_timeout_secs {
+            format!("已启用（每调用 {secs} 秒）")
         } else {
             "未启用".to_string()
         }

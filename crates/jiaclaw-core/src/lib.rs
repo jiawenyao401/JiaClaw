@@ -165,6 +165,12 @@ pub struct AgentConfig {
     /// 工作区人格 / 用户画像配置（缺省为 `{workspace}/SOUL.md` 与 `USER.md`）
     #[serde(default)]
     pub identity: IdentityConfig,
+
+    /// 单次工具调用超时（秒，可选，环境变量 `JIACLAW_TOOL_TIMEOUT_SECS` 优先）
+    ///
+    /// `None` 或非正整数表示不限制，保持现有行为。
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
 }
 
 fn default_workspace_path() -> std::path::PathBuf {
@@ -339,6 +345,23 @@ pub fn resolve_session_ttl_secs(configured: Option<u64>, env_value: Option<&str>
     }
 }
 
+/// 解析正整数工具超时（秒）；`0` 或无法解析时视为不启用。
+#[must_use]
+pub fn parse_positive_tool_timeout(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+/// 根据配置文件值与可选环境变量解析单次工具调用超时（秒）。
+///
+/// 环境变量优先；仅正整数生效。
+#[must_use]
+pub fn resolve_tool_timeout_secs(configured: Option<u64>, env_value: Option<&str>) -> Option<u64> {
+    match env_value {
+        Some(raw) => parse_positive_tool_timeout(raw),
+        None => configured.filter(|&n| n > 0),
+    }
+}
+
 impl HttpConfig {
     /// 解析生效的每分钟请求上限。
     ///
@@ -440,11 +463,24 @@ impl Default for AgentConfig {
             http: HttpConfig::default(),
             memory: MemoryConfig::default(),
             identity: IdentityConfig::default(),
+            tool_timeout_secs: None,
         }
     }
 }
 
 impl AgentConfig {
+    /// 解析生效的单次工具调用超时（秒）。
+    ///
+    /// 环境变量 `JIACLAW_TOOL_TIMEOUT_SECS` 优先于配置文件。
+    /// 仅正整数生效；未设置、`0` 或无法解析表示不限制。
+    #[must_use]
+    pub fn effective_tool_timeout_secs(&self) -> Option<u64> {
+        resolve_tool_timeout_secs(
+            self.tool_timeout_secs,
+            std::env::var("JIACLAW_TOOL_TIMEOUT_SECS").ok().as_deref(),
+        )
+    }
+
     /// 从 TOML 文件加载配置
     ///
     /// # Errors
@@ -549,9 +585,9 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_positive_rate_limit, parse_positive_session_ttl, resolve_rate_limit_per_minute,
-        resolve_session_ttl_secs, AgentConfig, HttpConfig, DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH,
-        DEFAULT_USER_PATH,
+        parse_positive_rate_limit, parse_positive_session_ttl, parse_positive_tool_timeout,
+        resolve_rate_limit_per_minute, resolve_session_ttl_secs, resolve_tool_timeout_secs,
+        AgentConfig, HttpConfig, DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
     };
 
     #[test]
@@ -567,6 +603,12 @@ mod tests {
     fn http_config_session_ttl_defaults_to_none() {
         assert_eq!(HttpConfig::default().session_ttl_secs, None);
         assert_eq!(HttpConfig::default().effective_session_ttl_secs(), None);
+    }
+
+    #[test]
+    fn agent_config_tool_timeout_defaults_to_none() {
+        assert_eq!(AgentConfig::default().tool_timeout_secs, None);
+        assert_eq!(AgentConfig::default().effective_tool_timeout_secs(), None);
     }
 
     #[test]
@@ -613,6 +655,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_positive_tool_timeout_accepts_only_positive_integers() {
+        assert_eq!(parse_positive_tool_timeout("30"), Some(30));
+        assert_eq!(parse_positive_tool_timeout(" 1 "), Some(1));
+        assert_eq!(parse_positive_tool_timeout("0"), None);
+        assert_eq!(parse_positive_tool_timeout(""), None);
+        assert_eq!(parse_positive_tool_timeout("abc"), None);
+        assert_eq!(parse_positive_tool_timeout("-1"), None);
+    }
+
+    #[test]
+    fn resolve_tool_timeout_env_overrides_config() {
+        assert_eq!(resolve_tool_timeout_secs(Some(30), Some("120")), Some(120));
+        assert_eq!(resolve_tool_timeout_secs(Some(30), Some("0")), None);
+        assert_eq!(resolve_tool_timeout_secs(Some(30), Some("nope")), None);
+        assert_eq!(resolve_tool_timeout_secs(Some(30), None), Some(30));
+        assert_eq!(resolve_tool_timeout_secs(Some(0), None), None);
+        assert_eq!(resolve_tool_timeout_secs(None, None), None);
+    }
+
+    #[test]
     fn http_config_parses_rate_limit_from_toml() {
         let toml = r#"
 [agent]
@@ -632,6 +694,36 @@ session_ttl_secs = 3600
         assert_eq!(config.http.session_ttl_secs, Some(3600));
         assert_eq!(config.http.api_token, None);
         assert_eq!(config.http.webhook_secret, None);
+        assert_eq!(config.tool_timeout_secs, None);
+    }
+
+    #[test]
+    fn agent_config_parses_tool_timeout_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+tool_timeout_secs = 30
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.tool_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn agent_config_parses_tool_timeout_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10,
+                "tool_timeout_secs": 15
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert_eq!(config.tool_timeout_secs, Some(15));
     }
 
     #[test]
@@ -654,6 +746,7 @@ session_ttl_secs = 3600
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
         assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
         assert_eq!(config.identity.user_path, DEFAULT_USER_PATH);
+        assert_eq!(config.tool_timeout_secs, None);
     }
 
     #[test]
