@@ -33,7 +33,7 @@ pub enum JiaClawError {
 }
 
 /// 聊天消息
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ChatMessage {
     /// 消息角色（user/assistant/system）
     pub role: MessageRole,
@@ -170,6 +170,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
 
+    /// 会话历史溢出策略（缺省关闭摘要压缩，保持硬截断）
+    #[serde(default)]
+    pub session: SessionConfig,
+
     /// 单次工具调用超时（秒，可选，环境变量 `JIACLAW_TOOL_TIMEOUT_SECS` 优先）
     ///
     /// `None` 或非正整数表示不限制，保持现有行为。
@@ -201,6 +205,12 @@ pub const DEFAULT_HEARTBEAT_SESSION_ID: &str = "heartbeat";
 
 /// 默认心跳间隔（秒）
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 3600;
+
+/// 每个 session 保留的最大消息数（防止内存涨爆）
+pub const MAX_SESSION_MESSAGES: usize = 50;
+
+/// 摘要压缩时默认保留的最近消息条数
+pub const DEFAULT_SESSION_KEEP_RECENT: usize = 10;
 
 /// 注入系统提示时的最大字节数（32 KiB）；MEMORY / SOUL / USER 各自独立截断
 pub const MEMORY_PROMPT_MAX_BYTES: usize = 32 * 1024;
@@ -348,6 +358,87 @@ fn fallback_heartbeat_interval(configured: u64) -> u64 {
     } else {
         DEFAULT_HEARTBEAT_INTERVAL_SECS
     }
+}
+
+fn default_session_keep_recent() -> usize {
+    DEFAULT_SESSION_KEEP_RECENT
+}
+
+/// 会话历史溢出策略（硬截断 vs 可选摘要压缩）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// 接近消息上限时是否先做摘要压缩（默认 `false`，保持现有硬截断）
+    ///
+    /// 环境变量 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` 可强制开启。
+    #[serde(default)]
+    pub summarize_on_overflow: bool,
+
+    /// 摘要后保留的最近消息条数（默认 10）
+    #[serde(default = "default_session_keep_recent")]
+    pub keep_recent: usize,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            summarize_on_overflow: false,
+            keep_recent: default_session_keep_recent(),
+        }
+    }
+}
+
+impl SessionConfig {
+    /// 解析是否启用摘要压缩。
+    ///
+    /// 环境变量 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW` 优先：`1`/`true`/`yes`/`on` 强制开启，
+    /// `0`/`false`/`no`/`off` 强制关闭；未设置或无法解析时回退到配置文件。
+    #[must_use]
+    pub fn effective_summarize_on_overflow(&self) -> bool {
+        resolve_session_summarize_on_overflow(
+            self.summarize_on_overflow,
+            std::env::var("JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// 摘要后保留的最近消息条数；`0` 回退默认值，并钳制到 `[1, MAX_SESSION_MESSAGES - 1]`。
+    #[must_use]
+    pub fn effective_keep_recent(&self) -> usize {
+        resolve_session_keep_recent(self.keep_recent)
+    }
+}
+
+/// 解析摘要压缩开关；无法识别时返回 `None`。
+#[must_use]
+pub fn parse_session_summarize_on_overflow(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// 根据配置文件值与可选环境变量解析摘要压缩开关。
+///
+/// 可解析的环境变量优先；否则使用配置值。
+#[must_use]
+pub fn resolve_session_summarize_on_overflow(configured: bool, env_value: Option<&str>) -> bool {
+    match env_value {
+        Some(raw) => parse_session_summarize_on_overflow(raw).unwrap_or(configured),
+        None => configured,
+    }
+}
+
+/// 钳制 `keep_recent`：`0` 使用默认 10，且不超过 `MAX_SESSION_MESSAGES - 1`。
+#[must_use]
+pub fn resolve_session_keep_recent(configured: usize) -> usize {
+    let raw = if configured == 0 {
+        DEFAULT_SESSION_KEEP_RECENT
+    } else {
+        configured
+    };
+    raw.clamp(1, MAX_SESSION_MESSAGES.saturating_sub(1))
 }
 
 /// HTTP 服务配置
@@ -656,6 +747,7 @@ impl Default for AgentConfig {
             memory: MemoryConfig::default(),
             identity: IdentityConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            session: SessionConfig::default(),
             tool_timeout_secs: None,
         }
     }
@@ -704,12 +796,14 @@ impl AgentConfig {
             identity: Option<IdentityConfig>,
             #[serde(default)]
             heartbeat: Option<HeartbeatConfig>,
+            #[serde(default)]
+            session: Option<SessionConfig>,
         }
 
         let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory / identity / heartbeat 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity / heartbeat / session 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -724,6 +818,9 @@ impl AgentConfig {
         }
         if let Some(heartbeat) = config_file.heartbeat {
             config_file.agent.heartbeat = heartbeat;
+        }
+        if let Some(session) = config_file.session {
+            config_file.agent.session = session;
         }
 
         Ok(config_file.agent)
@@ -759,12 +856,14 @@ impl AgentConfig {
             identity: Option<IdentityConfig>,
             #[serde(default)]
             heartbeat: Option<HeartbeatConfig>,
+            #[serde(default)]
+            session: Option<SessionConfig>,
         }
 
         let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory / identity / heartbeat 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity / heartbeat / session 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -780,6 +879,9 @@ impl AgentConfig {
         if let Some(heartbeat) = config_file.heartbeat {
             config_file.agent.heartbeat = heartbeat;
         }
+        if let Some(session) = config_file.session {
+            config_file.agent.session = session;
+        }
 
         Ok(config_file.agent)
     }
@@ -789,11 +891,13 @@ impl AgentConfig {
 mod tests {
     use super::{
         parse_positive_heartbeat_interval, parse_positive_rate_limit, parse_positive_session_ttl,
-        parse_positive_tool_timeout, resolve_heartbeat_interval_secs, resolve_optional_secret,
-        resolve_rate_limit_per_minute, resolve_session_ttl_secs, resolve_tool_timeout_secs,
-        AgentConfig, HeartbeatConfig, HttpConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-        DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MEMORY_PATH,
-        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
+        parse_positive_tool_timeout, parse_session_summarize_on_overflow,
+        resolve_heartbeat_interval_secs, resolve_optional_secret, resolve_rate_limit_per_minute,
+        resolve_session_keep_recent, resolve_session_summarize_on_overflow,
+        resolve_session_ttl_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
+        HttpConfig, SessionConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
+        DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
+        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_SESSION_MESSAGES,
     };
 
     #[test]
@@ -1272,5 +1376,106 @@ session_id = "nightly"
             ..HeartbeatConfig::default()
         };
         assert_eq!(cfg.effective_session_id(), DEFAULT_HEARTBEAT_SESSION_ID);
+    }
+
+    #[test]
+    fn session_config_defaults_disable_summarize() {
+        let cfg = SessionConfig::default();
+        assert!(!cfg.summarize_on_overflow);
+        assert_eq!(cfg.keep_recent, DEFAULT_SESSION_KEEP_RECENT);
+        assert_eq!(cfg.effective_keep_recent(), DEFAULT_SESSION_KEEP_RECENT);
+        assert!(!AgentConfig::default().session.summarize_on_overflow);
+        assert_eq!(
+            AgentConfig::default().session.keep_recent,
+            DEFAULT_SESSION_KEEP_RECENT
+        );
+    }
+
+    #[test]
+    fn parse_session_summarize_on_overflow_accepts_boolish_values() {
+        assert_eq!(parse_session_summarize_on_overflow("1"), Some(true));
+        assert_eq!(parse_session_summarize_on_overflow("true"), Some(true));
+        assert_eq!(parse_session_summarize_on_overflow(" TRUE "), Some(true));
+        assert_eq!(parse_session_summarize_on_overflow("yes"), Some(true));
+        assert_eq!(parse_session_summarize_on_overflow("on"), Some(true));
+        assert_eq!(parse_session_summarize_on_overflow("0"), Some(false));
+        assert_eq!(parse_session_summarize_on_overflow("false"), Some(false));
+        assert_eq!(parse_session_summarize_on_overflow("off"), Some(false));
+        assert_eq!(parse_session_summarize_on_overflow(""), None);
+        assert_eq!(parse_session_summarize_on_overflow("maybe"), None);
+    }
+
+    #[test]
+    fn resolve_session_summarize_env_can_force_enable() {
+        assert!(resolve_session_summarize_on_overflow(false, Some("1")));
+        assert!(resolve_session_summarize_on_overflow(false, Some("true")));
+        assert!(!resolve_session_summarize_on_overflow(true, Some("0")));
+        assert!(!resolve_session_summarize_on_overflow(false, Some("nope")));
+        assert!(!resolve_session_summarize_on_overflow(false, None));
+        assert!(resolve_session_summarize_on_overflow(true, None));
+        assert!(resolve_session_summarize_on_overflow(true, Some("bogus")));
+    }
+
+    #[test]
+    fn resolve_session_keep_recent_clamps_and_defaults() {
+        assert_eq!(resolve_session_keep_recent(0), DEFAULT_SESSION_KEEP_RECENT);
+        assert_eq!(resolve_session_keep_recent(10), 10);
+        assert_eq!(resolve_session_keep_recent(1), 1);
+        assert_eq!(
+            resolve_session_keep_recent(10_000),
+            MAX_SESSION_MESSAGES - 1
+        );
+    }
+
+    #[test]
+    fn session_config_parses_top_level_section() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[session]
+summarize_on_overflow = true
+keep_recent = 8
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(config.session.summarize_on_overflow);
+        assert_eq!(config.session.keep_recent, 8);
+        assert_eq!(config.session.effective_keep_recent(), 8);
+        assert!(!config.heartbeat.enabled);
+    }
+
+    #[test]
+    fn session_config_parses_from_json_and_omitted_keep_recent_defaults() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "session": {
+                "summarize_on_overflow": true
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(config.session.summarize_on_overflow);
+        assert_eq!(config.session.keep_recent, DEFAULT_SESSION_KEEP_RECENT);
+    }
+
+    #[test]
+    fn omitted_session_section_keeps_hard_truncate_defaults() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.session.summarize_on_overflow);
+        assert_eq!(config.session.keep_recent, DEFAULT_SESSION_KEEP_RECENT);
     }
 }

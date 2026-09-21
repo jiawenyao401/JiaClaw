@@ -11,15 +11,17 @@
 
 pub use jiaclaw_core::{
     AgentConfig, ChatMessage, ChatRequest, ChatResponse, HeartbeatConfig, HttpConfig,
-    IdentityConfig, JiaClawError, MemoryConfig, MessageRole, ProviderConfig, RunStatus, ToolCall,
-    DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-    DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MEMORY_PROMPT_MAX_BYTES,
+    IdentityConfig, JiaClawError, MemoryConfig, MessageRole, ProviderConfig, RunStatus,
+    SessionConfig, ToolCall, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
+    DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
+    DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_SESSION_MESSAGES, MEMORY_PROMPT_MAX_BYTES,
 };
 
 mod heartbeat;
 mod identity;
 mod memory;
 mod provider;
+mod session;
 mod skills;
 mod tools;
 mod workspace;
@@ -35,6 +37,12 @@ pub use memory::{
     MemoryAppendTool, MemoryFileStatus,
 };
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
+pub use session::{
+    compact_session_history, compact_session_history_default, format_messages_for_summary,
+    hard_truncate_session_messages, local_conversation_digest, ConversationSummarizer,
+    SESSION_SUMMARY_MAX_TOKENS, SESSION_SUMMARY_PREFIX, SESSION_SUMMARY_PROMPT,
+    SESSION_SUMMARY_TEMPERATURE,
+};
 pub use skills::{Skill, SkillDiscovery};
 pub use tools::{
     DateTimeTool, FileCopyTool, FileDeleteTool, FileListTool, FileReadTool, FileWriteTool,
@@ -266,6 +274,118 @@ impl JiaClawAgent {
                 )
                 .await
             }
+        }
+    }
+
+    /// 会话接近上限时压缩历史：未开启则硬截断；开启则摘要，失败回退截断。
+    pub async fn compact_session_messages(&self, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        compact_session_history(
+            messages,
+            MAX_SESSION_MESSAGES,
+            self.config.session.effective_summarize_on_overflow(),
+            self.config.session.effective_keep_recent(),
+            self,
+        )
+        .await
+    }
+
+    /// 使用当前 LLM provider 生成会话摘要（无工具、限制 `max_tokens`）。
+    ///
+    /// 无 API key 时返回确定性本地摘要，不走 stub tool loop。
+    ///
+    /// # Errors
+    ///
+    /// 提供商调用失败或返回空文本时返回错误，由调用方回退硬截断。
+    pub async fn summarize_conversation(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<String, JiaClawError> {
+        self.summarize_messages_for_session(messages).await
+    }
+
+    async fn summarize_messages_for_session(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<String, JiaClawError> {
+        if messages.is_empty() {
+            return Err(JiaClawError::InvalidRequest("没有可摘要的消息".to_string()));
+        }
+
+        let transcript = format_messages_for_summary(messages);
+        let env_key = std::env::var("JIACLAW_API_KEY").ok();
+        let api_key = self
+            .config
+            .provider
+            .api_key
+            .as_deref()
+            .or(env_key.as_deref());
+
+        let Some(key) = api_key else {
+            return Ok(local_conversation_digest(messages));
+        };
+
+        let prompt_messages = [ChatMessage {
+            role: MessageRole::User,
+            content: transcript,
+        }];
+
+        let response = self
+            .complete_without_tools(
+                SESSION_SUMMARY_PROMPT,
+                &prompt_messages,
+                self.config.provider.provider_type.as_str(),
+                key,
+                SESSION_SUMMARY_TEMPERATURE,
+                SESSION_SUMMARY_MAX_TOKENS,
+            )
+            .await?;
+
+        let text = response.message.content.trim();
+        if text.is_empty() {
+            return Err(JiaClawError::InvalidRequest("摘要为空".to_string()));
+        }
+        Ok(text.to_string())
+    }
+
+    /// 单次补全，不进入 tool loop（供摘要压缩使用，避免递归工具/心跳爆炸）。
+    async fn complete_without_tools(
+        &self,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        provider_type: &str,
+        api_key: &str,
+        temperature: f32,
+        max_tokens: u32,
+    ) -> Result<ChatResponse, JiaClawError> {
+        match provider_type {
+            "brokerrouter" => {
+                let provider = BrokerrouterProvider::new(&self.config.provider.base_url, api_key);
+                provider
+                    .chat(
+                        &self.config.provider.model,
+                        system_prompt,
+                        messages,
+                        temperature,
+                        max_tokens,
+                    )
+                    .await
+            }
+            "openai_compatible" => {
+                let provider =
+                    OpenAICompatibleProvider::new(&self.config.provider.base_url, api_key);
+                provider
+                    .chat(
+                        &self.config.provider.model,
+                        system_prompt,
+                        messages,
+                        temperature,
+                        max_tokens,
+                    )
+                    .await
+            }
+            other => Err(JiaClawError::Configuration(format!(
+                "未知的提供商类型: {other}"
+            ))),
         }
     }
 
@@ -813,6 +933,16 @@ impl JiaClawAgent {
     }
 }
 
+#[async_trait::async_trait]
+impl ConversationSummarizer for JiaClawAgent {
+    async fn summarize_conversation(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<String, JiaClawError> {
+        self.summarize_messages_for_session(messages).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,5 +1465,123 @@ mod tests {
         assert!(!prompt.contains("## Soul（人格）"));
         assert!(!prompt.contains("## User（用户画像）"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn overflow_messages(count: usize) -> Vec<ChatMessage> {
+        (0..count)
+            .map(|i| ChatMessage {
+                role: MessageRole::User,
+                content: format!("消息 {i}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compact_session_messages_off_hard_truncates() {
+        let config = AgentConfig::default();
+        assert!(!config.session.effective_summarize_on_overflow());
+        let agent = JiaClawAgent::new(config).unwrap();
+        let compacted = agent.compact_session_messages(overflow_messages(60)).await;
+        let expected = hard_truncate_session_messages(overflow_messages(60), MAX_SESSION_MESSAGES);
+        assert_eq!(compacted, expected);
+        assert_eq!(compacted.len(), MAX_SESSION_MESSAGES);
+        assert_eq!(compacted.last().unwrap().content, "消息 59");
+        assert!(compacted.iter().all(|m| m.content != "消息 0"));
+    }
+
+    #[tokio::test]
+    async fn compact_session_messages_on_uses_local_digest_without_api_key() {
+        let config = AgentConfig {
+            session: SessionConfig {
+                summarize_on_overflow: true,
+                keep_recent: 10,
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let compacted = agent.compact_session_messages(overflow_messages(51)).await;
+        assert_eq!(compacted.len(), 11);
+        assert_eq!(compacted[0].role, MessageRole::System);
+        assert!(compacted[0].content.contains(SESSION_SUMMARY_PREFIX));
+        assert!(compacted[0].content.contains("消息 0"));
+        assert_eq!(compacted[1].content, "消息 41");
+        assert_eq!(compacted.last().unwrap().content, "消息 50");
+    }
+
+    #[tokio::test]
+    async fn summarize_conversation_uses_mock_provider_without_tools() {
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Summary: user asked about 0-9."
+                }
+            }]
+        });
+        let _mock = mockito::mock("POST", "/v1/chat/completions")
+            .match_header("Authorization", "Bearer brk_summary_key")
+            .with_status(200)
+            .with_body(response_body.to_string())
+            .expect(2)
+            .create();
+
+        let config = AgentConfig {
+            provider: ProviderConfig {
+                provider_type: "brokerrouter".to_string(),
+                base_url: mockito::server_url(),
+                api_key: Some("brk_summary_key".to_string()),
+                model: "gpt-4o-mini".to_string(),
+                temperature: 0.7,
+                max_tokens: 4096,
+            },
+            session: SessionConfig {
+                summarize_on_overflow: true,
+                keep_recent: 10,
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let summary = agent
+            .summarize_conversation(&overflow_messages(12))
+            .await
+            .expect("mock summary");
+        assert_eq!(summary, "Summary: user asked about 0-9.");
+
+        let compacted = agent.compact_session_messages(overflow_messages(51)).await;
+        assert_eq!(compacted.len(), 11);
+        assert!(compacted[0].content.contains(SESSION_SUMMARY_PREFIX));
+        assert!(compacted[0]
+            .content
+            .contains("Summary: user asked about 0-9."));
+        assert_eq!(compacted.last().unwrap().content, "消息 50");
+    }
+
+    #[tokio::test]
+    async fn summarize_provider_error_compacts_by_hard_truncate() {
+        let _mock = mockito::mock("POST", "/v1/chat/completions")
+            .match_header("Authorization", "Bearer brk_fail_key")
+            .with_status(500)
+            .with_body("upstream down")
+            .create();
+
+        let config = AgentConfig {
+            provider: ProviderConfig {
+                provider_type: "brokerrouter".to_string(),
+                base_url: mockito::server_url(),
+                api_key: Some("brk_fail_key".to_string()),
+                model: "gpt-4o-mini".to_string(),
+                temperature: 0.7,
+                max_tokens: 4096,
+            },
+            session: SessionConfig {
+                summarize_on_overflow: true,
+                keep_recent: 10,
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let compacted = agent.compact_session_messages(overflow_messages(60)).await;
+        let expected = hard_truncate_session_messages(overflow_messages(60), MAX_SESSION_MESSAGES);
+        assert_eq!(compacted, expected);
     }
 }

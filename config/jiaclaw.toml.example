@@ -94,6 +94,13 @@ persist_path = ".jiaclaw/sessions.json"
 # 未设置或 0：不启用。create/chat/get/list 触达会刷新 last_accessed。
 # session_ttl_secs = 3600
 
+[session]
+# 接近消息条数上限（50）时是否摘要压缩（默认 false，保持硬截断）
+# 环境变量 JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true 可强制开启
+# summarize_on_overflow = false
+# 摘要后保留的最近消息条数（默认 10）
+# keep_recent = 10
+
 [logging]
 # 日志级别: trace, debug, info, warn, error
 level = "info"

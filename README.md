@@ -66,6 +66,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **可选 Session TTL** - 闲置超时自动清理内存会话（长时间 `serve` 防堆积）
   - 配置 `session_ttl_secs` 或环境变量 `JIACLAW_SESSION_TTL_SECS`（正整数才启用；`0`/非法=关闭）
   - create/chat/get/list 触达刷新；过期后 list 不返回，GET/DELETE 与不存在一致（404）
+- ✅ **可选 Session 摘要压缩** - 接近消息条数上限时把旧消息折叠成一条摘要，避免硬截断丢上下文
+  - 配置 `[session] summarize_on_overflow`（默认 `false`，保持现有丢弃最旧消息行为）或环境变量 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` 强制开启
+  - `keep_recent` 默认 10；复用当前 LLM provider，固定中英 prompt，无工具且限制 `max_tokens`；失败 warn 并回退硬截断，不让 chat 失败
+  - HTTP / Telegram / Slack / webhook / heartbeat 走同一 session store 写入点
 - ✅ **可选工具超时** - 单次 `shell_exec` / `http_get` 等不会无限卡住 tool loop
   - 配置 `[agent] tool_timeout_secs` 或环境变量 `JIACLAW_TOOL_TIMEOUT_SECS`（正整数才启用；`0`/非法=关闭）
   - 超时把 `Tool timed out after Ns` 写入 tool result，不 panic，继续循环
@@ -192,6 +196,13 @@ persist_path = ".jiaclaw/sessions.json"
 # 未设置或 0：不启用。create/chat/get/list 触达会刷新。
 # session_ttl_secs = 3600
 
+[session]
+# 接近消息条数上限（50）时是否摘要压缩（默认 false，保持硬截断）
+# 环境变量 JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true 可强制开启
+# summarize_on_overflow = true
+# 摘要后保留的最近消息条数（默认 10）
+# keep_recent = 10
+
 # 工具调用超时写在 [agent] 段（环境变量 JIACLAW_TOOL_TIMEOUT_SECS 优先）
 # 正整数启用；未设置或 0 不限制（默认）。超时写入 tool result 并继续 loop。
 # [agent]
@@ -222,6 +233,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 # 可选：Session 闲置 TTL（秒，优先于配置文件）
 # export JIACLAW_SESSION_TTL_SECS=3600
+# 可选：接近消息上限时摘要压缩（1/true 强制开启，优先于 [session] summarize_on_overflow）
+# export JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1
 # 可选：单次工具调用超时（秒，优先于配置文件）
 # export JIACLAW_TOOL_TIMEOUT_SECS=30
 # 可选：Heartbeat 间隔（秒，优先于 [heartbeat] interval_secs；需 enabled = true）
@@ -403,6 +416,7 @@ export JIACLAW_SLACK_BOT_TOKEN=xoxb-your-bot-token
 - StateKnot 持久化功能尚未集成
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET 为 404
+- 可选 Session 摘要压缩：设置 `[session] summarize_on_overflow = true` 或 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` 后，接近上限时把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`（默认 10）条；未开启则仍硬截断。摘要失败会 warn 并回退截断，chat 不失败
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
@@ -501,6 +515,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Optional Session TTL** - idle sessions are expired to avoid unbounded memory growth during long `serve`
   - Configure `session_ttl_secs` or `JIACLAW_SESSION_TTL_SECS` (positive integer enables; `0`/invalid disables)
   - create/chat/get/list refresh last access; expired ids are omitted from list and GET/DELETE match not-found (404)
+- ✅ **Optional session summary compression** - fold older messages into one summary near the session cap instead of dropping them
+  - Configure `[session] summarize_on_overflow` (default `false`, keeps hard truncation) or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true` to force-enable
+  - `keep_recent` defaults to 10; reuses the current LLM provider with a fixed bilingual prompt, no tools, and a small `max_tokens`; on failure, warn and fall back to truncation without failing chat
+  - HTTP / Telegram / Slack / webhook / heartbeat share the same session-store write path
 - ✅ **Optional tool timeout** - a long `shell_exec` / `http_get` cannot stall the whole tool loop
   - Configure `[agent] tool_timeout_secs` or `JIACLAW_TOOL_TIMEOUT_SECS` (positive integer enables; `0`/invalid disables)
   - Timeout writes `Tool timed out after Ns` into the tool result, does not panic, and continues the loop
@@ -627,6 +645,12 @@ persist_path = ".jiaclaw/sessions.json"
 # Unset or 0: disabled. create/chat/get/list refresh last access.
 # session_ttl_secs = 3600
 
+[session]
+# When approaching the message cap (50), summarize older turns instead of dropping them (default false)
+# JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true force-enables this
+# summarize_on_overflow = true
+# keep_recent = 10
+
 # Per-tool timeout lives on [agent] (JIACLAW_TOOL_TIMEOUT_SECS env var takes priority)
 # Positive integer enables; unset or 0 is unlimited (default). Timeout writes into the tool result and the loop continues.
 # [agent]
@@ -657,6 +681,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 # Optional: session idle TTL in seconds (overrides config file)
 # export JIACLAW_SESSION_TTL_SECS=3600
+# Optional: summarize older session messages near the cap (1/true force-enables)
+# export JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1
 # Optional: per-tool timeout in seconds (overrides config file)
 # export JIACLAW_TOOL_TIMEOUT_SECS=30
 # Optional: heartbeat interval in seconds (overrides [heartbeat] interval_secs; requires enabled = true)
@@ -826,6 +852,7 @@ export JIACLAW_SLACK_BOT_TOKEN=xoxb-your-bot-token
 - StateKnot persistence features not yet integrated
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, and `/hooks/slack` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET of an expired id returns 404
+- Optional session summary compression: set `[session] summarize_on_overflow = true` or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` to fold older messages into one `[session-summary]` system message while keeping the latest `keep_recent` (default 10); unset keeps hard truncation. Summary failure warns and falls back; chat still succeeds
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
