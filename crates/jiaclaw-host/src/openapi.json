@@ -3,7 +3,7 @@
   "info": {
     "title": "JiaClaw HTTP API",
     "version": "0.1.0",
-    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n- Telegram secret：当配置了 `JIACLAW_TELEGRAM_SECRET` 或 `[http].telegram_secret` 时，`POST /hooks/telegram` 需要 `X-Telegram-Bot-Api-Secret-Token`（Telegram 官方 secret token）。未配置则与本地 webhook 一样开放。\n\nTelegram 出站：当配置了 `JIACLAW_TELEGRAM_BOT_TOKEN` 或 `[http].telegram_bot_token` 时，成功得到 assistant 回复后会调用 Bot `sendMessage` 推回聊天（文本按 4096 截断）。出站失败仍返回 200 + 原 `reply`，避免 Telegram webhook 重试；响应可带 `delivered` / `delivery_error`。未配置 token 时仅同步 JSON。用 `setWebhook` 将公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。"
+    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n- Telegram secret：当配置了 `JIACLAW_TELEGRAM_SECRET` 或 `[http].telegram_secret` 时，`POST /hooks/telegram` 需要 `X-Telegram-Bot-Api-Secret-Token`（Telegram 官方 secret token）。未配置则与本地 webhook 一样开放。\n\nTelegram 出站：当配置了 `JIACLAW_TELEGRAM_BOT_TOKEN` 或 `[http].telegram_bot_token` 时，成功得到 assistant 回复后会调用 Bot `sendMessage` 推回聊天（文本按 4096 截断）。出站失败仍返回 200 + 原 `reply`，避免 Telegram webhook 重试；响应可带 `delivered` / `delivery_error`。未配置 token 时仅同步 JSON。用 `setWebhook` 将公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。\n\n可选 SSE：`POST /api/chat` 在 `Accept: text/event-stream` 或 body `stream: true` 时返回 `text/event-stream`（事件：meta / token / tool / done / error）。未请求流式时 JSON 响应不变。当前为整轮 tool loop 完成后的分块推送；Brokerrouter 真流式后续。"
   },
   "servers": [
     {
@@ -45,6 +45,7 @@
         "tags": ["chat"],
         "summary": "发送聊天消息",
         "operationId": "postChat",
+        "description": "默认同步 JSON。当请求头 `Accept: text/event-stream` 或 body `stream: true`（二者其一即可）时返回 Server-Sent Events。鉴权失败仍为 JSON 401。当前 token 事件为整轮完成后的分块推送；Brokerrouter 真流式后续。",
         "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
         "requestBody": {
           "required": true,
@@ -56,13 +57,16 @@
         },
         "responses": {
           "200": {
-            "description": "聊天响应",
+            "description": "聊天响应（JSON 或 SSE）",
             "headers": {
               "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
             },
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/ChatResponse" }
+              },
+              "text/event-stream": {
+                "schema": { "$ref": "#/components/schemas/ChatSseStream" }
               }
             }
           },
@@ -441,7 +445,12 @@
             "default": []
           },
           "auto_skills": { "type": "boolean", "default": true },
-          "session_id": { "type": "string", "nullable": true }
+          "session_id": { "type": "string", "nullable": true },
+          "stream": {
+            "type": "boolean",
+            "default": false,
+            "description": "为 true 时返回 `text/event-stream`。也可通过请求头 `Accept: text/event-stream` 开启。未设置时保持 JSON。"
+          }
         }
       },
       "ToolCall": {
@@ -466,6 +475,10 @@
           },
           "session_id": { "type": "string", "nullable": true }
         }
+      },
+      "ChatSseStream": {
+        "type": "string",
+        "description": "Server-Sent Events。每条事件为 `event: <name>` + `data: <json>`。\n\n- `meta`: `{ session_id, request_id }`\n- `token`（或后续 `delta`）: `{ text }` assistant 文本增量。**当前为整轮 tool loop 完成后的按句/按块推送；Brokerrouter 真流式后续。**\n- `tool`: `{ name, ok }` 工具摘要；失败时带 `error`\n- `done`: `{ reply, status, session_id }` 最终回复后关闭流\n- `error`: `{ error }` 错误后关闭流\n\n鉴权失败不走 SSE，仍返回 JSON 401。"
       },
       "CreateSessionResponse": {
         "type": "object",

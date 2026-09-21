@@ -75,6 +75,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 同步回传 `{ ok: true, reply }` 便于长轮询调试
   - 可选 `JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token`：成功回复后调用 Bot `sendMessage` 推回聊天（文本按 4096 截断）；出站失败仍 200 + 原 `reply`（可带 `delivered` / `delivery_error`）
 - ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
+- ✅ **可选 SSE 流式** - `POST /api/chat` 在 `Accept: text/event-stream` 或 body `stream: true` 时返回事件流
+  - 事件：`meta`（session_id / request_id）、`token`（文本增量）、`tool`（name + ok/error）、`done`（最终 reply）、`error`
+  - **当前为整轮 tool loop 完成后的分块推送；Brokerrouter 真流式后续**
+  - 未请求流式时 JSON 响应完全不变；鉴权失败仍为 JSON 401
 - ✅ **Session 查询 API** - `GET /api/sessions` 列表、`GET /api/sessions/:id` 读取历史（不存在 404）
 - ✅ **工作区 MEMORY.md** - 跨会话长期记忆注入系统提示
   - 默认 `{workspace}/MEMORY.md`，可用 `[memory] path` 覆盖
@@ -297,6 +301,16 @@ curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \
   -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"我是谁？\"}]}"
 
+# 可选 SSE 流式（Accept 或 body.stream=true；当前为完成后分块推送，Brokerrouter 真流式后续）
+curl -N -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"messages": [{"role": "user", "content": "你好"}]}'
+
+curl -N -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"stream": true, "messages": [{"role": "user", "content": "你好"}]}'
+
 # 读取会话历史（不存在返回 404）
 curl http://127.0.0.1:8080/api/sessions/$SESSION_ID
 
@@ -348,6 +362,7 @@ curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
+- 可选 SSE：`POST /api/chat` 在 `Accept: text/event-stream` 或 `"stream": true` 时返回 `text/event-stream`（`meta` / `token` / `tool` / `done` / `error`）。未请求流式时 JSON 不变。**当前为分块推送；Brokerrouter 真流式后续**
 - Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
 - Telegram Bot 入站：`POST /hooks/telegram` 解析 Bot API Update（`message.text` / `edited_message.text`），会话键 `telegram:{chat.id}`；无文本返回 200 + 跳过说明。可选 `JIACLAW_TELEGRAM_SECRET`。配置 `JIACLAW_TELEGRAM_BOT_TOKEN` 后会调用 `sendMessage` 出站（文本超 4096 截断）；出站失败仍返回 200 + 原 `reply`，避免 Telegram 重试。用 `setWebhook` 把公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`
 
@@ -449,6 +464,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Sync JSON `{ ok: true, reply }` for long-poll debugging
   - Optional `JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token`: after a successful reply, call Bot `sendMessage` (text truncated at 4096). Outbound failure still returns 200 + the original `reply` (may include `delivered` / `delivery_error`)
 - ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
+- ✅ **Optional SSE** - `POST /api/chat` returns `text/event-stream` when `Accept: text/event-stream` or body `stream: true`
+  - Events: `meta` (session_id / request_id), `token` (text chunks), `tool` (name + ok/error), `done` (final reply), `error`
+  - **Currently chunked after the full tool loop; Brokerrouter true streaming comes later**
+  - JSON responses stay unchanged when streaming is not requested; auth failures remain JSON 401
 - ✅ **Session query API** - `GET /api/sessions` list, `GET /api/sessions/:id` history (404 if missing)
 - ✅ **Workspace MEMORY.md** - cross-session facts injected into the system prompt
   - Default `{workspace}/MEMORY.md`, overridable via `[memory] path`
@@ -659,6 +678,16 @@ curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \
   -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"What is my name?\"}]}"
 
+# Optional SSE (Accept or body.stream=true; currently chunked after the tool loop, Brokerrouter true streaming later)
+curl -N -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"messages": [{"role": "user", "content": "Hello"}]}'
+
+curl -N -X POST http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"stream": true, "messages": [{"role": "user", "content": "Hello"}]}'
+
 # Read session history (404 if missing)
 curl http://127.0.0.1:8080/api/sessions/$SESSION_ID
 
@@ -710,6 +739,7 @@ curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
+- Optional SSE: `POST /api/chat` returns `text/event-stream` when `Accept: text/event-stream` or `"stream": true` (`meta` / `token` / `tool` / `done` / `error`). JSON is unchanged when streaming is not requested. **Currently chunked after the full loop; Brokerrouter true streaming comes later**
 - Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)
 - Telegram Bot inbound: `POST /hooks/telegram` parses Bot API Updates (`message.text` / `edited_message.text`) into session `telegram:{chat.id}`; updates without text return 200 + a skip reason. Optional `JIACLAW_TELEGRAM_SECRET`. With `JIACLAW_TELEGRAM_BOT_TOKEN`, replies are also sent via `sendMessage` (text truncated at 4096); outbound failure still returns 200 + the original `reply` so Telegram does not retry. Point `setWebhook` at the public `https://…/hooks/telegram` URL, optionally with `secret_token`
 
