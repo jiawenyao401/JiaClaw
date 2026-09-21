@@ -183,6 +183,12 @@ enabled = true
 # 可选参数 paths 指定工作区相对路径；禁止 .. / 绝对路径 / symlink 逃逸。不引入向量数据库。
 enabled = true
 
+[tools.memory_write]
+# 可选工作区记忆写入（默认启用并注册）。只写配置的 MEMORY.md / [memory] path。
+# content 必填；mode=append（默认）追加，mode=overwrite 覆盖。结果上限 32KiB（与注入截断对齐）。
+# tmp + rename 原子写；忽略 path 参数，禁止穿越。enabled = false 不注册。不引入向量库或远程 sync。
+enabled = true
+
 [skills]
 # 启用的技能列表（示例）
 enabled = [
@@ -200,7 +206,7 @@ enabled = [
 [memory]
 # 工作区长期记忆文件（相对于 workspace，默认 MEMORY.md）
 # 每次对话开始时若文件存在且非空则注入系统提示；过大时截断到 32KiB。
-# 可用工具 memory_append 追加或覆盖；变长后可用 memory_search 按关键词检索。缺省本段不影响现有配置。
+# 可用工具 memory_write（mode=append|overwrite，上限 32KiB）或 memory_append 写入；变长后可用 memory_search 按关键词检索。缺省本段不影响现有配置。
 path = "MEMORY.md"
 
 [identity]

@@ -11,13 +11,13 @@
 
 pub use jiaclaw_core::{
     AgentConfig, ChatMessage, ChatRequest, ChatResponse, HeartbeatConfig, HttpConfig,
-    IdentityConfig, JiaClawError, MemoryConfig, MemorySearchToolConfig, MessageRole,
-    ProviderConfig, RunStatus, SessionConfig, ToolCall, ToolsConfig, WebFetchToolConfig,
-    WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
-    DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_MAX_TOOL_ITERATIONS,
-    DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
-    MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MEMORY_PROMPT_MAX_BYTES,
-    MIN_MAX_TOOL_ITERATIONS,
+    IdentityConfig, JiaClawError, MemoryConfig, MemorySearchToolConfig, MemoryWriteToolConfig,
+    MessageRole, ProviderConfig, RunStatus, SessionConfig, ToolCall, ToolsConfig,
+    WebFetchToolConfig, WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
+    DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS,
+    DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
+    DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
+    MEMORY_PROMPT_MAX_BYTES, MIN_MAX_TOOL_ITERATIONS,
 };
 
 mod heartbeat;
@@ -36,11 +36,12 @@ pub use identity::{
 };
 pub use memory::{
     clamp_memory_search_max_results, inspect_memory_file, inspect_workspace_file,
-    load_memory_for_prompt, load_prompt_file, parse_memory_search_args, resolve_memory_path,
-    resolve_workspace_relative_path, search_memory_windows, write_memory, write_workspace_file,
-    MemoryAppendTool, MemoryFileStatus, MemorySearchHit, MemorySearchTool,
-    MEMORY_SEARCH_DEFAULT_MAX_RESULTS, MEMORY_SEARCH_FILE_MAX_BYTES, MEMORY_SEARCH_LINE_RADIUS,
-    MEMORY_SEARCH_MAX_RESULTS,
+    load_memory_for_prompt, load_prompt_file, parse_memory_search_args, parse_memory_write_args,
+    resolve_memory_path, resolve_workspace_relative_path, search_memory_windows, write_memory,
+    write_memory_with_limit, write_workspace_file, write_workspace_file_with_limit,
+    MemoryAppendTool, MemoryFileStatus, MemorySearchHit, MemorySearchTool, MemoryWriteMode,
+    MemoryWriteTool, MEMORY_SEARCH_DEFAULT_MAX_RESULTS, MEMORY_SEARCH_FILE_MAX_BYTES,
+    MEMORY_SEARCH_LINE_RADIUS, MEMORY_SEARCH_MAX_RESULTS, MEMORY_WRITE_MAX_BYTES,
 };
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
 pub use session::{
@@ -138,6 +139,12 @@ impl JiaClawAgent {
                     config.identity.soul_path.clone(),
                     config.identity.user_path.clone(),
                 ],
+            )));
+        }
+        if config.tools.memory_write.enabled {
+            tools.register(Box::new(MemoryWriteTool::new(
+                &config.workspace_path,
+                config.memory.path.clone(),
             )));
         }
         tools.register(Box::new(IdentityWriteTool::soul(
@@ -1319,6 +1326,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn memory_write_is_registered_by_default() {
+        let agent = JiaClawAgent::new(AgentConfig::default()).unwrap();
+        assert!(
+            agent.tools().get("memory_write").is_some(),
+            "memory_write should be in the default tool list"
+        );
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            prompt.contains("memory_write"),
+            "system prompt should describe memory_write"
+        );
+        assert!(prompt.contains("overwrite"), "{prompt}");
+    }
+
+    #[test]
+    fn memory_write_is_not_registered_when_disabled() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                memory_write: MemoryWriteToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        assert!(agent.tools().get("memory_write").is_none());
+        assert!(agent.tools().get("memory_search").is_some());
+        assert!(agent.tools().get("memory_append").is_some());
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            !prompt.contains("### memory_write"),
+            "disabled memory_write must not appear in tool docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_write_execute_when_unregistered_returns_missing_tool() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                memory_write: MemoryWriteToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let err = agent
+            .tools()
+            .execute(&ToolCall {
+                tool_name: "memory_write".to_string(),
+                arguments: serde_json::json!({"content": "hello"}),
+                result: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("工具不存在"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_chat_stub() {
         let config = AgentConfig::default();
@@ -1784,6 +1863,36 @@ mod tests {
 
         let prompt_after = agent.build_system_prompt(&sample_request());
         assert!(prompt_after.contains("learned-fact-xyz"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_write_then_prompt_sees_file() {
+        let dir = unique_workspace("jiaclaw_agent_write_mem");
+        let config = AgentConfig {
+            workspace_path: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+
+        let prompt_before = agent.build_system_prompt(&sample_request());
+        assert!(!prompt_before.contains("written-fact-abc"));
+
+        let call = ToolCall {
+            tool_name: "memory_write".to_string(),
+            arguments: serde_json::json!({"content": "- written-fact-abc"}),
+            result: None,
+        };
+        let result = agent.tools().execute(&call).await.unwrap();
+        assert!(result.contains("append"), "{result}");
+        assert!(result.contains("bytes_written"), "{result}");
+        assert!(result.contains("MEMORY.md"), "{result}");
+
+        let on_disk = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+        assert!(on_disk.contains("written-fact-abc"));
+
+        let prompt_after = agent.build_system_prompt(&sample_request());
+        assert!(prompt_after.contains("written-fact-abc"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

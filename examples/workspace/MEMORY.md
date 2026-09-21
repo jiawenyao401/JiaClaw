@@ -2,7 +2,8 @@
 
 此文件会在每次 `chat` 开始时注入系统提示（内容原样）。
 
-- 可手动编辑，或让 Agent 调用 `memory_append`（`replace=false` 追加 / `replace=true` 覆盖）。
+- 可手动编辑，或让 Agent 调用 `memory_write`（`mode=append` 追加 / `mode=overwrite` 覆盖；结果上限 32KiB）。
+- 兼容工具 `memory_append`（`replace=false` 追加 / `replace=true` 覆盖）。
 - 文件变长后可用 `memory_search` 按关键词检索片段，避免整文件塞进上下文。
 - 默认路径：`{workspace}/MEMORY.md`；配置示例：`[memory] path = "MEMORY.md"`。
 - 文件不存在或为空时对话不会报错，只是不注入该区块。

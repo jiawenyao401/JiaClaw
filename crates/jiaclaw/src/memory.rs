@@ -198,6 +198,21 @@ pub fn write_workspace_file(
     content: &str,
     replace: bool,
 ) -> Result<PathBuf, JiaClawError> {
+    write_workspace_file_with_limit(workspace, configured, content, replace, None)
+}
+
+/// 写入工作区约定文件；`max_bytes` 若设置，结果超过上限则报错且不落盘。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、超过上限，或 IO 失败时返回错误。
+pub fn write_workspace_file_with_limit(
+    workspace: &Path,
+    configured: &str,
+    content: &str,
+    replace: bool,
+    max_bytes: Option<usize>,
+) -> Result<PathBuf, JiaClawError> {
     let path = resolve_workspace_relative_path(workspace, configured)?;
     ensure_path_within_workspace(workspace, &path)?;
 
@@ -220,6 +235,15 @@ pub fn write_workspace_file(
         join_memory_append(&existing, content)
     };
 
+    if let Some(limit) = max_bytes {
+        if new_contents.len() > limit {
+            return Err(JiaClawError::ToolExecution(format!(
+                "记忆文件超过上限 {limit} 字节（将写入 {} 字节）",
+                new_contents.len()
+            )));
+        }
+    }
+
     atomic_write(&path, &new_contents)?;
     Ok(path)
 }
@@ -237,7 +261,22 @@ pub fn write_memory(
     content: &str,
     replace: bool,
 ) -> Result<PathBuf, JiaClawError> {
-    write_workspace_file(workspace, configured, content, replace)
+    write_memory_with_limit(workspace, configured, content, replace, None)
+}
+
+/// 写入记忆文件；`max_bytes` 若设置，结果超过上限则报错且不落盘。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、超过上限，或 IO 失败时返回错误。
+pub fn write_memory_with_limit(
+    workspace: &Path,
+    configured: &str,
+    content: &str,
+    replace: bool,
+    max_bytes: Option<usize>,
+) -> Result<PathBuf, JiaClawError> {
+    write_workspace_file_with_limit(workspace, configured, content, replace, max_bytes)
 }
 
 /// 追加时用空行分隔已有内容与新段落。
@@ -428,6 +467,155 @@ impl Tool for MemoryAppendTool {
             path.display(),
             self.memory_rel_path
         ))
+    }
+}
+
+/// `memory_write` 落盘上限（字节），与系统提示注入截断对齐。
+pub const MEMORY_WRITE_MAX_BYTES: usize = MEMORY_PROMPT_MAX_BYTES;
+
+/// `memory_write` 写入模式：整文件追加或覆盖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryWriteMode {
+    /// 在已有内容后追加（默认）
+    Append,
+    /// 覆盖整个记忆文件
+    Overwrite,
+}
+
+impl MemoryWriteMode {
+    /// 解析 `append` / `overwrite`（大小写不敏感，首尾空白忽略）。
+    ///
+    /// # Errors
+    ///
+    /// 其它字符串返回错误。
+    pub fn parse(raw: &str) -> Result<Self, JiaClawError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "append" => Ok(Self::Append),
+            "overwrite" => Ok(Self::Overwrite),
+            _ => Err(JiaClawError::ToolExecution(
+                "参数 'mode' 必须是 append 或 overwrite（默认 append）".to_string(),
+            )),
+        }
+    }
+
+    /// 配置 / JSON 用短名。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Overwrite => "overwrite",
+        }
+    }
+
+    /// `overwrite` 对应 `replace = true`。
+    #[must_use]
+    pub fn is_overwrite(self) -> bool {
+        matches!(self, Self::Overwrite)
+    }
+}
+
+/// 解析 `memory_write` 参数：必填 `content`，可选 `mode`（默认 `append`）。
+///
+/// 忽略 `path` / `section` 等额外字段，始终只写配置的 MEMORY 路径。
+///
+/// # Errors
+///
+/// `content` 缺失或不是字符串，或 `mode` 非法时返回错误。
+pub fn parse_memory_write_args(args: &Value) -> Result<(String, MemoryWriteMode), JiaClawError> {
+    let content = args
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'content'".to_string()))?;
+
+    let mode = match args.get("mode") {
+        None | Some(Value::Null) => MemoryWriteMode::Append,
+        Some(Value::String(raw)) => MemoryWriteMode::parse(raw)?,
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'mode' 必须是 append 或 overwrite（默认 append）".to_string(),
+            ));
+        }
+    };
+
+    Ok((content.to_string(), mode))
+}
+
+#[derive(Serialize)]
+struct MemoryWriteOutput {
+    path: String,
+    mode: MemoryWriteMode,
+    bytes_written: usize,
+}
+
+/// `memory_write` 工具：向约定 MEMORY 路径追加或覆盖 Markdown（不调用 LLM）。
+pub struct MemoryWriteTool {
+    workspace_path: PathBuf,
+    memory_rel_path: String,
+}
+
+impl MemoryWriteTool {
+    /// 创建工具；`memory_rel_path` 相对工作空间，默认 `MEMORY.md`。
+    #[must_use]
+    pub fn new(workspace_path: &Path, memory_rel_path: impl Into<String>) -> Self {
+        let canonical_workspace = canonicalize_existing_or_clone(workspace_path);
+        Self {
+            workspace_path: canonical_workspace,
+            memory_rel_path: memory_rel_path.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryWriteTool {
+    fn name(&self) -> &str {
+        "memory_write"
+    }
+
+    fn description(&self) -> &str {
+        "将 Markdown 写入工作区长期记忆文件（配置的 MEMORY.md / [memory] path）。mode=append（默认）追加并换行分隔；mode=overwrite 覆盖整个文件。只能写约定路径，禁止穿越。结果文件不得超过 32KiB。返回 {path, mode, bytes_written}。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "要写入的 Markdown 内容"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["append", "overwrite"],
+                    "description": "append（默认）追加；overwrite 覆盖整个文件",
+                    "default": "append"
+                }
+            },
+            "required": ["content"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let (content, mode) = parse_memory_write_args(&args)?;
+        let path = write_memory_with_limit(
+            &self.workspace_path,
+            &self.memory_rel_path,
+            &content,
+            mode.is_overwrite(),
+            Some(MEMORY_WRITE_MAX_BYTES),
+        )?;
+
+        let bytes_written = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| usize::try_from(m.len()).ok())
+            .unwrap_or(0);
+        let output = MemoryWriteOutput {
+            path: self.memory_rel_path.clone(),
+            mode,
+            bytes_written,
+        };
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化写入结果失败: {e}")))
     }
 }
 
@@ -1174,6 +1362,185 @@ mod tests {
         assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("安全") || err.contains("工作空间"), "{err}");
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn parse_memory_write_args_requires_content_and_defaults_mode() {
+        let err = parse_memory_write_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("content"), "{err}");
+
+        let (content, mode) =
+            parse_memory_write_args(&serde_json::json!({"content": "- likes tea"})).unwrap();
+        assert_eq!(content, "- likes tea");
+        assert_eq!(mode, MemoryWriteMode::Append);
+        assert_eq!(MemoryWriteMode::Append.as_str(), "append");
+        assert_eq!(MemoryWriteMode::Overwrite.as_str(), "overwrite");
+
+        let (_, mode) = parse_memory_write_args(&serde_json::json!({
+            "content": "x",
+            "mode": "overwrite"
+        }))
+        .unwrap();
+        assert_eq!(mode, MemoryWriteMode::Overwrite);
+
+        let (_, mode) = parse_memory_write_args(&serde_json::json!({
+            "content": "x",
+            "mode": " APPEND "
+        }))
+        .unwrap();
+        assert_eq!(mode, MemoryWriteMode::Append);
+
+        let err = parse_memory_write_args(&serde_json::json!({
+            "content": "x",
+            "mode": "replace"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mode"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn memory_write_appends_with_separator_and_reports_json() {
+        let ws = unique_temp("jiaclaw_mem_write_append");
+        let tool = MemoryWriteTool::new(&ws, DEFAULT_MEMORY_PATH);
+        assert_eq!(tool.name(), "memory_write");
+
+        let first = tool
+            .execute(serde_json::json!({"content": "first"}))
+            .await
+            .unwrap();
+        assert!(
+            first.contains("\"mode\": \"append\"") || first.contains("\"mode\":\"append\""),
+            "{first}"
+        );
+        assert!(first.contains("MEMORY.md"), "{first}");
+        assert!(first.contains("bytes_written"), "{first}");
+
+        let second = tool
+            .execute(serde_json::json!({"content": "second", "mode": "append"}))
+            .await
+            .unwrap();
+        assert!(second.contains("append"), "{second}");
+
+        let text = fs::read_to_string(ws.join("MEMORY.md")).unwrap();
+        assert_eq!(text, "first\n\nsecond");
+        assert_eq!(text.len(), 13);
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_write_overwrite_replaces_file() {
+        let ws = unique_temp("jiaclaw_mem_write_overwrite");
+        let tool = MemoryWriteTool::new(&ws, DEFAULT_MEMORY_PATH);
+        tool.execute(serde_json::json!({"content": "old"}))
+            .await
+            .unwrap();
+        let result = tool
+            .execute(serde_json::json!({"content": "new", "mode": "overwrite"}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("\"mode\": \"overwrite\"") || result.contains("\"mode\":\"overwrite\""),
+            "{result}"
+        );
+        let text = fs::read_to_string(ws.join("MEMORY.md")).unwrap();
+        assert_eq!(text, "new");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_write_ignores_path_argument() {
+        let ws = unique_temp("jiaclaw_mem_write_ignore_path");
+        let tool = MemoryWriteTool::new(&ws, DEFAULT_MEMORY_PATH);
+        tool.execute(serde_json::json!({
+            "content": "safe",
+            "path": "../evil.md",
+            "section": "ignored"
+        }))
+        .await
+        .unwrap();
+        assert!(ws.join("MEMORY.md").exists());
+        assert!(!ws.join("evil.md").exists());
+        assert!(!ws.parent().unwrap().join("evil.md").exists());
+        let text = fs::read_to_string(ws.join("MEMORY.md")).unwrap();
+        assert_eq!(text, "safe");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_write_rejects_configured_path_traversal() {
+        let ws = unique_temp("jiaclaw_mem_write_trav");
+        let tool = MemoryWriteTool::new(&ws, "../evil.md");
+        let err = tool
+            .execute(serde_json::json!({"content": "nope"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+        assert!(!ws.parent().unwrap().join("evil.md").exists());
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_write_rejects_oversize_and_does_not_write() {
+        let ws = unique_temp("jiaclaw_mem_write_oversize");
+        let tool = MemoryWriteTool::new(&ws, DEFAULT_MEMORY_PATH);
+        fs::write(ws.join("MEMORY.md"), "keep-me").unwrap();
+
+        let too_big = "x".repeat(MEMORY_WRITE_MAX_BYTES + 1);
+        let err = tool
+            .execute(serde_json::json!({"content": too_big, "mode": "overwrite"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("上限"), "{err}");
+        assert!(err.contains(&MEMORY_WRITE_MAX_BYTES.to_string()), "{err}");
+        let text = fs::read_to_string(ws.join("MEMORY.md")).unwrap();
+        assert_eq!(text, "keep-me");
+
+        let almost = "y".repeat(MEMORY_WRITE_MAX_BYTES - 1);
+        tool.execute(serde_json::json!({"content": almost, "mode": "overwrite"}))
+            .await
+            .unwrap();
+        let err = tool
+            .execute(serde_json::json!({"content": "zz", "mode": "append"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("上限"), "{err}");
+        let after = fs::read_to_string(ws.join("MEMORY.md")).unwrap();
+        assert_eq!(after.len(), MEMORY_WRITE_MAX_BYTES - 1);
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_write_rejects_symlink_escape() {
+        let ws = unique_temp("jiaclaw_mem_write_symlink");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_mem_write_outside_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret-outside").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("MEMORY.md")).unwrap();
+
+        let tool = MemoryWriteTool::new(&ws, DEFAULT_MEMORY_PATH);
+        let result = tool
+            .execute(serde_json::json!({"content": "injected"}))
+            .await;
+        assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
+        let outside_text = fs::read_to_string(&outside).unwrap();
+        assert_eq!(outside_text, "secret-outside");
 
         let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(&ws);

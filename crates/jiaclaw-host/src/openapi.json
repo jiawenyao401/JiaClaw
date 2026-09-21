@@ -324,6 +324,7 @@
         "tags": ["catalog"],
         "summary": "列出已注册工具",
         "operationId": "listTools",
+        "description": "返回当前进程已注册的本地工具（含可选 web_search / web_fetch / memory_search / memory_write；对应 `[tools.*] enabled = false` 时不出现）。",
         "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
         "responses": {
           "200": {

@@ -1710,6 +1710,13 @@ fn memory_search_status_line(config: &AgentConfig) -> String {
     "已启用（默认扫描 MEMORY / SOUL / USER；子串检索，无向量库）".to_string()
 }
 
+fn memory_write_status_line(config: &AgentConfig) -> String {
+    if !config.tools.memory_write.enabled {
+        return "已关闭（[tools.memory_write] enabled = false，未注册）".to_string();
+    }
+    "已启用（只写配置的 MEMORY.md；append/overwrite，上限 32KiB）".to_string()
+}
+
 fn session_summarize_status_line(config: &AgentConfig) -> String {
     if config.session.effective_summarize_on_overflow() {
         format!(
@@ -2322,6 +2329,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • memory_search: 已关闭（未注册）");
     }
+    if config.tools.memory_write.enabled {
+        tracing::info!("   • memory_write: 已启用（只写配置的 MEMORY.md，上限 32KiB）");
+    } else {
+        tracing::info!("   • memory_write: 已关闭（未注册）");
+    }
     if config.heartbeat.enabled {
         tracing::info!(
             "   • Heartbeat: 已启用（间隔 {heartbeat_interval_secs} 秒，session={}, 文件 {}）",
@@ -2515,6 +2527,18 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         println!(
             "   • memory_search: ⚠️  {}",
             memory_search_status_line(&config)
+        );
+    }
+
+    if config.tools.memory_write.enabled {
+        println!(
+            "   • memory_write: ✅ {}",
+            memory_write_status_line(&config)
+        );
+    } else {
+        println!(
+            "   • memory_write: ⚠️  {}",
+            memory_write_status_line(&config)
         );
     }
 
@@ -4332,7 +4356,7 @@ fn memory_show_command(config_path: Option<PathBuf>) -> Result<()> {
     if !status.exists {
         println!("   状态:     ⚠️  不存在 (0 bytes)");
         println!("\n💡 文件缺失时对话仍可进行，不会报错。");
-        println!("   可手动创建该文件，或让 Agent 调用 memory_append。");
+        println!("   可手动创建该文件，或让 Agent 调用 memory_write / memory_append。");
         return Ok(());
     }
 
@@ -4474,7 +4498,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
                             println!("           ✅ 存在 ({} bytes)", status.size_bytes);
                         } else {
                             println!("           ⚠️  不存在");
-                            println!("           💡 可手动创建，或在对话中使用 memory_append 写入");
+                            println!("           💡 可手动创建，或在对话中使用 memory_write / memory_append 写入");
                         }
                     }
                     Err(e) => {
@@ -4640,6 +4664,12 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
             "   memory_search: ⚠️  {}",
             memory_search_status_line(&config)
         );
+    }
+
+    if config.tools.memory_write.enabled {
+        println!("   memory_write: ✅ {}", memory_write_status_line(&config));
+    } else {
+        println!("   memory_write: ⚠️  {}", memory_write_status_line(&config));
     }
 
     // 3. 检查提供商配置
@@ -5047,8 +5077,8 @@ mod tests {
     };
     use jiaclaw::SESSION_SUMMARY_PREFIX;
     use jiaclaw_core::{
-        ChatMessage, ChatRequest, HeartbeatConfig, MemorySearchToolConfig, MessageRole,
-        SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+        ChatMessage, ChatRequest, HeartbeatConfig, MemorySearchToolConfig, MemoryWriteToolConfig,
+        MessageRole, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
     };
     use tower::ServiceExt;
 
@@ -7413,6 +7443,13 @@ mod tests {
                 .any(|t| t.name == "memory_search"),
             "应注册默认 memory_search 工具"
         );
+        assert!(
+            tools_response
+                .tools
+                .iter()
+                .any(|t| t.name == "memory_write"),
+            "应注册默认 memory_write 工具"
+        );
 
         // 验证工具信息包含名称和描述
         for tool in &tools_response.tools {
@@ -7608,6 +7645,86 @@ mod tests {
             tools_response.tools.iter().any(|t| t.name == "web_fetch"),
             "关闭 memory_search 不应影响 web_fetch"
         );
+        assert!(
+            tools_response
+                .tools
+                .iter()
+                .any(|t| t.name == "memory_write"),
+            "关闭 memory_search 不应影响 memory_write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_endpoint_omits_memory_write_when_disabled() {
+        let config = AgentConfig {
+            workspace_path: unique_workspace("jiaclaw-memory-write-off"),
+            tools: ToolsConfig {
+                memory_write: MemoryWriteToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            discord_public_key: None,
+            discord_bot_token: None,
+            discord_api_base: DISCORD_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tools_response: ToolsResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            tools_response
+                .tools
+                .iter()
+                .all(|t| t.name != "memory_write"),
+            "enabled=false 时不应出现 memory_write"
+        );
+        assert!(
+            tools_response
+                .tools
+                .iter()
+                .any(|t| t.name == "memory_search"),
+            "关闭 memory_write 不应影响 memory_search"
+        );
+        assert!(
+            tools_response
+                .tools
+                .iter()
+                .any(|t| t.name == "memory_append"),
+            "关闭 memory_write 不应影响 memory_append"
+        );
     }
 
     #[test]
@@ -7675,6 +7792,22 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(memory_search_status_line(&disabled).contains("已关闭"));
+    }
+
+    #[test]
+    fn memory_write_status_line_reports_enabled_and_disabled() {
+        let enabled = AgentConfig::default();
+        assert!(memory_write_status_line(&enabled).contains("已启用"));
+        assert!(memory_write_status_line(&enabled).contains("MEMORY"));
+
+        let disabled = AgentConfig {
+            tools: ToolsConfig {
+                memory_write: MemoryWriteToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(memory_write_status_line(&disabled).contains("已关闭"));
     }
 
     #[test]
