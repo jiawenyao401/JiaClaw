@@ -65,6 +65,7 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 超限返回 429 + `Retry-After`；`GET /health` 始终不限流
 - ✅ **请求追踪** - 所有 HTTP 响应回写 `X-Request-Id`（请求未带则生成 UUID）
 - ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
+- ✅ **Session 查询 API** - `GET /api/sessions` 列表、`GET /api/sessions/:id` 读取历史（不存在 404）
 - ✅ **工作区 MEMORY.md** - 跨会话长期记忆注入系统提示
   - 默认 `{workspace}/MEMORY.md`，可用 `[memory] path` 覆盖
   - 每次 `chat` 重读；过大截断（32KiB）并 warn
@@ -233,6 +234,9 @@ curl http://127.0.0.1:8080/api/tools
 # 列出已发现的技能
 curl http://127.0.0.1:8080/api/skills
 
+# 列出会话（创建后可见；message_count 为内存中当前条数）
+curl http://127.0.0.1:8080/api/sessions
+
 # 无状态聊天
 curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \
@@ -247,6 +251,12 @@ curl -X POST http://127.0.0.1:8080/api/chat \
 curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \
   -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"我是谁？\"}]}"
+
+# 读取会话历史（不存在返回 404）
+curl http://127.0.0.1:8080/api/sessions/$SESSION_ID
+
+# 删除会话
+curl -X DELETE http://127.0.0.1:8080/api/sessions/$SESSION_ID
 
 # Webhook 入站（无需鉴权）
 curl -X POST http://127.0.0.1:8080/hooks/inbound \
@@ -270,6 +280,7 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
+- Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
 
 ## 项目结构
 
@@ -359,6 +370,7 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Over-limit returns 429 + `Retry-After`; `GET /health` is never limited
 - ✅ **Request tracing** - every HTTP response writes `X-Request-Id` (generated UUID if missing)
 - ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
+- ✅ **Session query API** - `GET /api/sessions` list, `GET /api/sessions/:id` history (404 if missing)
 - ✅ **Workspace MEMORY.md** - cross-session facts injected into the system prompt
   - Default `{workspace}/MEMORY.md`, overridable via `[memory] path`
   - Re-read on every `chat`; truncate at 32KiB with a warning
@@ -515,6 +527,9 @@ curl -D - http://127.0.0.1:8080/health
 # OpenAPI 3 sketch (anonymous when no API token; Bearer required when token is enabled, same as /api/tools)
 curl http://127.0.0.1:8080/api/openapi.json
 
+# List sessions
+curl http://127.0.0.1:8080/api/sessions
+
 # Stateless chat
 curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \
@@ -529,6 +544,12 @@ curl -X POST http://127.0.0.1:8080/api/chat \
 curl -X POST http://127.0.0.1:8080/api/chat \
   -H "Content-Type: application/json" \
   -d "{\"session_id\": \"$SESSION_ID\", \"messages\": [{\"role\": \"user\", \"content\": \"What is my name?\"}]}"
+
+# Read session history (404 if missing)
+curl http://127.0.0.1:8080/api/sessions/$SESSION_ID
+
+# Delete session
+curl -X DELETE http://127.0.0.1:8080/api/sessions/$SESSION_ID
 
 # Webhook inbound (no auth)
 curl -X POST http://127.0.0.1:8080/hooks/inbound \
@@ -552,6 +573,7 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*` and `/hooks/inbound` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
+- Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)
 
 ### Documentation
 
