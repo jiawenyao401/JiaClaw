@@ -60,6 +60,9 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 可配置的持久化开关
   - 原子写入保证数据安全
   - 自动处理文件损坏情况
+- ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*` 与 `/hooks/inbound`
+  - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
+  - 超限返回 429 + `Retry-After`；`GET /health` 始终不限流
 
 ### 待实现
 
@@ -127,12 +130,19 @@ cors_allow_origins = ["*"]
 # Session 持久化配置（可选）
 persist = true  # 启用 session 持久化
 persist_path = ".jiaclaw/sessions.json"
+
+# HTTP 限流（可选，环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE 优先）
+# 正整数：对 /api/* 与 /hooks/inbound 做进程内全局限流（次/分钟）
+# 未设置或 0：不限流。GET /health 始终不限流；超限返回 429 + Retry-After。
+# rate_limit_per_minute = 60
 ```
 
 或使用环境变量：
 
 ```bash
 export JIACLAW_API_KEY=brk_live_your_key_here
+# 可选：HTTP 限流（次/分钟，优先于配置文件）
+# export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 ```
 
 ### 运行示例
@@ -239,6 +249,7 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - 使用 Brokerrouter 需要有效的虚拟密钥（`brk_live_...`）
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
+- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
 
 ## 项目结构
 
@@ -322,6 +333,9 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Configurable persistence toggle
   - Atomic writes for data safety
   - Automatic handling of corrupted files
+- ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*` and `/hooks/inbound`
+  - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
+  - Over-limit returns 429 + `Retry-After`; `GET /health` is never limited
 
 #### Pending
 
@@ -389,12 +403,19 @@ cors_allow_origins = ["*"]
 # Session persistence config (optional)
 persist = true  # Enable session persistence
 persist_path = ".jiaclaw/sessions.json"
+
+# Optional HTTP rate limit (JIACLAW_RATE_LIMIT_PER_MINUTE env var takes priority)
+# Positive integer: process-wide limit for /api/* and /hooks/inbound (requests/minute)
+# Unset or 0: disabled. GET /health is never limited; over-limit returns 429 + Retry-After.
+# rate_limit_per_minute = 60
 ```
 
 Or use environment variable:
 
 ```bash
 export JIACLAW_API_KEY=brk_live_your_key_here
+# Optional: HTTP rate limit (requests/minute, overrides config file)
+# export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 ```
 
 #### Run Examples
@@ -489,6 +510,7 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - Brokerrouter requires a valid virtual key (`brk_live_...`)
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
+- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*` and `/hooks/inbound` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
 
 ### Documentation
 

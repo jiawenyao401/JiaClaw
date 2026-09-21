@@ -5,23 +5,33 @@
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Json},
+    extract::{Path, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
     Router,
 };
 use clap::{Parser, Subcommand};
+use governor::{
+    clock::{Clock, DefaultClock},
+    state::{InMemoryState, NotKeyed},
+    Quota, RateLimiter,
+};
 use jiaclaw::{JiaClawAgent, Workspace};
 use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::HashMap,
+    num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tower_http::cors::{Any, CorsLayer};
+
+/// 进程内全局（非按 IP）速率限制器，oneshot 测试无需 `ConnectInfo`。
+type GlobalRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 #[derive(Parser)]
 #[command(name = "jiaclaw")]
@@ -200,6 +210,7 @@ struct AppState {
     webhook_secret: Option<String>,
     persist_enabled: bool,
     persist_path: Arc<PathBuf>,
+    rate_limiter: Option<Arc<GlobalRateLimiter>>,
 }
 
 /// 健康检查响应
@@ -223,6 +234,77 @@ struct InboundWebhookRequest {
 
 fn default_channel() -> String {
     "webhook".to_string()
+}
+
+fn build_rate_limiter(per_minute: u32) -> Option<Arc<GlobalRateLimiter>> {
+    NonZeroU32::new(per_minute).map(|nz| Arc::new(RateLimiter::direct(Quota::per_minute(nz))))
+}
+
+fn is_rate_limited_path(path: &str) -> bool {
+    path.starts_with("/api/") || path == "/hooks/inbound"
+}
+
+fn rate_limited_response(retry_after_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": "rate_limit_exceeded"})),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// 全局限流中间件：返回 `Response`，不依赖 `ConnectInfo`，也不使用 `Err(StatusCode)`。
+async fn rate_limit_middleware(
+    State(limiter): State<Option<Arc<GlobalRateLimiter>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if !is_rate_limited_path(&path) {
+        return next.run(request).await;
+    }
+
+    let Some(limiter) = limiter.as_ref() else {
+        return next.run(request).await;
+    };
+
+    match limiter.check() {
+        Ok(()) => next.run(request).await,
+        Err(not_until) => {
+            let wait = not_until.wait_time_from(DefaultClock::default().now());
+            let retry_after_secs = wait.as_secs().max(1);
+            tracing::warn!(path, retry_after_secs, "HTTP 请求超过速率限制");
+            rate_limited_response(retry_after_secs)
+        }
+    }
+}
+
+fn build_router(state: AppState) -> Router {
+    let limiter = state.rate_limiter.clone();
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/api/chat", post(chat_handler))
+        .route("/api/sessions", post(create_session_handler))
+        .route("/api/sessions/:id", delete(delete_session_handler))
+        .route("/api/tools", get(tools_handler))
+        .route("/api/skills", get(skills_handler))
+        .route("/hooks/inbound", post(hooks_inbound_handler))
+        .layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit_middleware,
+        ))
+        .with_state(state)
+}
+
+fn rate_limit_config_source() -> &'static str {
+    if std::env::var("JIACLAW_RATE_LIMIT_PER_MINUTE").is_ok() {
+        "环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE"
+    } else {
+        "配置文件"
+    }
 }
 
 /// Webhook 入站响应
@@ -264,24 +346,28 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
 
     // 创建 agent
     let agent = JiaClawAgent::new(config.clone()).context("创建 JiaClawAgent 失败")?;
-    
+
     // 读取 API token（环境变量优先于配置文件）
     let api_token = std::env::var("JIACLAW_API_TOKEN")
         .ok()
         .or(config.http.api_token.clone());
-    
+
     // 读取 webhook secret（环境变量优先于配置文件）
     let webhook_secret = std::env::var("JIACLAW_WEBHOOK_SECRET")
         .ok()
         .or(config.http.webhook_secret.clone());
-    
+
+    // 读取限流配置（环境变量优先于配置文件）
+    let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
+    let rate_limiter = rate_limit_per_minute.and_then(build_rate_limiter);
+
     // 解析持久化路径
     let persist_path = if config.http.persist_path.starts_with('/') {
         PathBuf::from(&config.http.persist_path)
     } else {
         config.workspace_path.join(&config.http.persist_path)
     };
-    
+
     // 加载持久化的 sessions（如果启用）
     let sessions = if config.http.persist {
         tracing::info!("Session 持久化已启用，路径: {}", persist_path.display());
@@ -290,7 +376,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         tracing::info!("Session 持久化未启用");
         HashMap::new()
     };
-    
+
     let state = AppState {
         agent: Arc::new(agent),
         sessions: Arc::new(Mutex::new(sessions)),
@@ -298,12 +384,12 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         webhook_secret: webhook_secret.clone(),
         persist_enabled: config.http.persist,
         persist_path: Arc::new(persist_path),
+        rate_limiter,
     };
 
     // 配置 CORS
     let cors = if config.http.cors_allow_origins.is_empty()
-        || (config.http.cors_allow_origins.len() == 1
-            && config.http.cors_allow_origins[0] == "*")
+        || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
     {
         // 允许所有来源
         CorsLayer::new()
@@ -324,17 +410,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
             .allow_headers(Any)
     };
 
-    // 构建路由
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/api/chat", post(chat_handler))
-        .route("/api/sessions", post(create_session_handler))
-        .route("/api/sessions/:id", delete(delete_session_handler))
-        .route("/api/tools", get(tools_handler))
-        .route("/api/skills", get(skills_handler))
-        .route("/hooks/inbound", post(hooks_inbound_handler))
-        .layer(cors)
-        .with_state(state);
+    // 构建路由（限流中间件不依赖 ConnectInfo，oneshot 测试不会 500）
+    let app = build_router(state).layer(cors);
 
     // 绑定地址
     let listener = tokio::net::TcpListener::bind(&config.http.bind)
@@ -350,13 +427,21 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • GET    /api/tools           - 列出已注册工具");
     tracing::info!("   • GET    /api/skills          - 列出已发现技能");
     tracing::info!("   • POST   /hooks/inbound       - Webhook 入站端点");
-    
+    if let Some(limit) = rate_limit_per_minute {
+        tracing::info!(
+            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound；GET /health 不限流）"
+        );
+    } else {
+        tracing::info!("   • HTTP 限流: 未启用");
+    }
+
     // 打印配置摘要（不打印 secret 明文）
     println!("\n📋 HTTP 配置摘要:");
     println!("   • 绑定地址: {}", config.http.bind);
-    
+
     if api_token.is_some() {
-        println!("   • API 鉴权: ✅ 已启用（通过 {}）",
+        println!(
+            "   • API 鉴权: ✅ 已启用（通过 {}）",
             if std::env::var("JIACLAW_API_TOKEN").is_ok() {
                 "环境变量 JIACLAW_API_TOKEN"
             } else {
@@ -366,9 +451,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         println!("   • API 鉴权: ⚠️  未启用（API 端点无需鉴权，本地开发友好）");
     }
-    
+
     if webhook_secret.is_some() {
-        println!("   • Webhook 鉴权: ✅ 已启用（通过 {}）",
+        println!(
+            "   • Webhook 鉴权: ✅ 已启用（通过 {}）",
             if std::env::var("JIACLAW_WEBHOOK_SECRET").is_ok() {
                 "环境变量 JIACLAW_WEBHOOK_SECRET"
             } else {
@@ -378,10 +464,18 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         println!("   • Webhook 鉴权: ⚠️  未启用（任何请求都可访问 /hooks/inbound）");
     }
-    
+
+    if let Some(limit) = rate_limit_per_minute {
+        println!(
+            "   • HTTP 限流: ✅ 已启用（{limit} 次/分钟，通过 {}）",
+            rate_limit_config_source()
+        );
+    } else {
+        println!("   • HTTP 限流: ⚠️  未启用（/api/* 与 /hooks/inbound 不限流）");
+    }
+
     if config.http.cors_allow_origins.is_empty()
-        || (config.http.cors_allow_origins.len() == 1
-            && config.http.cors_allow_origins[0] == "*")
+        || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
     {
         println!("   • CORS 模式: 允许所有来源（Permissive）");
     } else {
@@ -390,7 +484,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
             config.http.cors_allow_origins.join(", ")
         );
     }
-    
+
     println!("\n💡 试试：curl http://{}/health", config.http.bind);
     println!("按 Ctrl+C 停止服务\n");
 
@@ -467,7 +561,7 @@ async fn chat_handler(
             // 将历史消息和新消息合并
             let mut all_messages = history.clone();
             all_messages.extend(request.messages.clone());
-            
+
             // 检查消息数上限，防止内存涨爆
             if all_messages.len() > MAX_SESSION_MESSAGES {
                 tracing::info!(
@@ -476,28 +570,28 @@ async fn chat_handler(
                     all_messages.len(),
                     MAX_SESSION_MESSAGES
                 );
-                
+
                 // 保留 system 消息（如果有）和最新的消息
                 let system_messages: Vec<_> = all_messages
                     .iter()
                     .filter(|m| m.role == MessageRole::System)
                     .cloned()
                     .collect();
-                
+
                 let non_system_messages: Vec<_> = all_messages
                     .into_iter()
                     .filter(|m| m.role != MessageRole::System)
                     .collect();
-                
+
                 // 计算可以保留多少非 system 消息
                 let system_count = system_messages.len();
                 let available_slots = MAX_SESSION_MESSAGES.saturating_sub(system_count);
                 let skip_count = non_system_messages.len().saturating_sub(available_slots);
-                
+
                 // 重新组合：system 消息 + 最新的非 system 消息
                 all_messages = system_messages;
                 all_messages.extend(non_system_messages.into_iter().skip(skip_count));
-                
+
                 tracing::info!(
                     "截断后消息数: {} (system: {}, 其他: {})",
                     all_messages.len(),
@@ -505,9 +599,13 @@ async fn chat_handler(
                     all_messages.len() - system_count
                 );
             }
-            
+
             request.messages = all_messages;
-            tracing::info!("使用 session {}, 合并后消息数: {}", sid, request.messages.len());
+            tracing::info!(
+                "使用 session {}, 合并后消息数: {}",
+                sid,
+                request.messages.len()
+            );
         } else {
             tracing::info!("创建新 session: {}", sid);
         }
@@ -523,9 +621,16 @@ async fn chat_handler(
     if let Some(ref sid) = session_id {
         let mut sessions = state.sessions.lock().unwrap();
         sessions.insert(sid.clone(), request.messages.clone());
-        sessions.entry(sid.clone()).or_default().push(response.message.clone());
-        tracing::info!("更新 session {}, 当前消息数: {}", sid, sessions.get(sid).unwrap().len());
-        
+        sessions
+            .entry(sid.clone())
+            .or_default()
+            .push(response.message.clone());
+        tracing::info!(
+            "更新 session {}, 当前消息数: {}",
+            sid,
+            sessions.get(sid).unwrap().len()
+        );
+
         // 持久化到磁盘（如果启用）
         if state.persist_enabled {
             if let Err(e) = save_sessions(&state.persist_path, &sessions) {
@@ -564,11 +669,11 @@ async fn create_session_handler(
         return Err(AppError::Unauthorized);
     }
     let session_id = uuid::Uuid::new_v4().to_string();
-    
+
     // 立即在 sessions map 中创建空的 Vec，这样后续 DELETE 能正确返回 success=true
     let mut sessions = state.sessions.lock().unwrap();
     sessions.insert(session_id.clone(), Vec::new());
-    
+
     tracing::info!("创建新 session: {}", session_id);
     Ok(Json(CreateSessionResponse { session_id }))
 }
@@ -623,14 +728,14 @@ async fn delete_session_handler(
 
     if existed {
         tracing::info!("删除 session: {}", session_id);
-        
+
         // 持久化到磁盘（如果启用）
         if state.persist_enabled {
             if let Err(e) = save_sessions(&state.persist_path, &sessions) {
                 tracing::error!("保存 sessions 失败: {}", e);
             }
         }
-        
+
         Ok(Json(DeleteSessionResponse {
             success: true,
             message: format!("会话 {session_id} 已删除"),
@@ -821,7 +926,7 @@ async fn hooks_inbound_handler(
             session_id,
             sessions.get(&session_id).unwrap().len()
         );
-        
+
         // 持久化到磁盘（如果启用）
         if state.persist_enabled {
             if let Err(e) = save_sessions(&state.persist_path, &sessions) {
@@ -872,9 +977,7 @@ impl IntoResponse for AppError {
 
 /// 优雅关闭信号
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("等待 Ctrl+C 信号失败");
+    tokio::signal::ctrl_c().await.expect("等待 Ctrl+C 信号失败");
     tracing::info!("收到关闭信号，正在停止服务器...");
 }
 
@@ -886,18 +989,16 @@ fn load_sessions(path: &PathBuf) -> HashMap<String, Vec<ChatMessage>> {
     }
 
     match std::fs::read_to_string(path) {
-        Ok(content) => {
-            match serde_json::from_str::<HashMap<String, Vec<ChatMessage>>>(&content) {
-                Ok(sessions) => {
-                    tracing::info!("成功加载 {} 个 sessions", sessions.len());
-                    sessions
-                }
-                Err(e) => {
-                    tracing::warn!("Session 文件损坏，无法解析: {}。从空 map 开始", e);
-                    HashMap::new()
-                }
+        Ok(content) => match serde_json::from_str::<HashMap<String, Vec<ChatMessage>>>(&content) {
+            Ok(sessions) => {
+                tracing::info!("成功加载 {} 个 sessions", sessions.len());
+                sessions
             }
-        }
+            Err(e) => {
+                tracing::warn!("Session 文件损坏，无法解析: {}。从空 map 开始", e);
+                HashMap::new()
+            }
+        },
         Err(e) => {
             tracing::warn!("无法读取 session 文件: {}。从空 map 开始", e);
             HashMap::new()
@@ -912,15 +1013,19 @@ fn save_sessions(path: &PathBuf, sessions: &HashMap<String, Vec<ChatMessage>>) -
             .with_context(|| format!("无法创建目录: {}", parent.display()))?;
     }
 
-    let json = serde_json::to_string_pretty(sessions)
-        .context("序列化 sessions 失败")?;
+    let json = serde_json::to_string_pretty(sessions).context("序列化 sessions 失败")?;
 
     let temp_path = path.with_extension("tmp");
     std::fs::write(&temp_path, json)
         .with_context(|| format!("无法写入临时文件: {}", temp_path.display()))?;
 
-    std::fs::rename(&temp_path, path)
-        .with_context(|| format!("无法重命名文件: {} -> {}", temp_path.display(), path.display()))?;
+    std::fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "无法重命名文件: {} -> {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -1026,7 +1131,7 @@ async fn single_chat(
     println!("\n助手回复:");
     println!("{}", response.message.content);
     println!("\n状态: {:?}", response.status);
-    
+
     if let Some(sid) = session_id {
         println!("会话 ID: {sid}");
     }
@@ -1163,7 +1268,7 @@ fn skills_command(config_path: Option<PathBuf>, verbose: bool) -> Result<()> {
     println!("📁 工作空间: {}\n", config.workspace_path.display());
 
     let skills_dir = config.workspace_path.join("skills");
-    
+
     if !skills_dir.exists() {
         println!("❌ 技能目录不存在: {}", skills_dir.display());
         println!("\n💡 运行 'jiaclaw init' 创建工作空间和示例技能");
@@ -1171,33 +1276,37 @@ fn skills_command(config_path: Option<PathBuf>, verbose: bool) -> Result<()> {
     }
 
     let discovery = jiaclaw::SkillDiscovery::new(&config.workspace_path);
-    
+
     match discovery.discover() {
         Ok(skills) => {
             if skills.is_empty() {
                 println!("⚠️  未发现任何技能");
-                println!("\n💡 在 {} 中创建技能目录和 SKILL.md 文件", skills_dir.display());
+                println!(
+                    "\n💡 在 {} 中创建技能目录和 SKILL.md 文件",
+                    skills_dir.display()
+                );
                 println!("   每个技能应包含:");
                 println!("   • YAML frontmatter（name, description, triggers）");
                 println!("   • Markdown 内容（技能说明）");
             } else {
                 println!("✅ 发现 {} 个技能:\n", skills.len());
-                
+
                 for (i, skill) in skills.iter().enumerate() {
                     println!("{}. {}", i + 1, skill.name);
                     println!("   描述: {}", skill.description);
-                    
+
                     if skill.triggers.is_empty() {
                         println!("   触发词: 无");
                     } else {
                         println!("   触发词: {}", skill.triggers.join(", "));
                     }
-                    
+
                     println!("   路径: {}", skill.path.display());
-                    
+
                     if verbose {
                         println!("\n   内容预览:");
-                        let preview = skill.content
+                        let preview = skill
+                            .content
                             .lines()
                             .take(5)
                             .collect::<Vec<_>>()
@@ -1207,10 +1316,10 @@ fn skills_command(config_path: Option<PathBuf>, verbose: bool) -> Result<()> {
                             println!("   ...");
                         }
                     }
-                    
+
                     println!();
                 }
-                
+
                 println!("💡 使用提示:");
                 println!("   • 显式启用: 在 ChatRequest 的 enabled_skills 字段中指定");
                 println!("   • 自动激活: 当用户消息包含触发词时自动启用");
@@ -1381,14 +1490,15 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     // 4. HTTP 配置检查
     println!("\n🌐 HTTP 配置");
     println!("   绑定地址: {}", config.http.bind);
-    
+
     // 检查 API token（环境变量优先）
     let api_token = std::env::var("JIACLAW_API_TOKEN")
         .ok()
         .or(config.http.api_token.clone());
-    
+
     if api_token.is_some() {
-        println!("   API 鉴权: ✅ 已启用（通过 {}）",
+        println!(
+            "   API 鉴权: ✅ 已启用（通过 {}）",
             if std::env::var("JIACLAW_API_TOKEN").is_ok() {
                 "环境变量 JIACLAW_API_TOKEN"
             } else {
@@ -1399,14 +1509,15 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   API 鉴权: ⚠️  未启用（本地开发友好）");
         println!("   💡 生产环境建议设置: export JIACLAW_API_TOKEN=your-token");
     }
-    
+
     // 检查 webhook secret（环境变量优先）
     let webhook_secret = std::env::var("JIACLAW_WEBHOOK_SECRET")
         .ok()
         .or(config.http.webhook_secret.clone());
-    
+
     if webhook_secret.is_some() {
-        println!("   Webhook 鉴权: ✅ 已启用（通过 {}）",
+        println!(
+            "   Webhook 鉴权: ✅ 已启用（通过 {}）",
             if std::env::var("JIACLAW_WEBHOOK_SECRET").is_ok() {
                 "环境变量 JIACLAW_WEBHOOK_SECRET"
             } else {
@@ -1417,11 +1528,21 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   Webhook 鉴权: ⚠️  未启用");
         println!("   💡 设置环境变量: export JIACLAW_WEBHOOK_SECRET=your-secret");
     }
-    
+
+    let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
+    if let Some(limit) = rate_limit_per_minute {
+        println!(
+            "   HTTP 限流: ✅ 已启用（{limit} 次/分钟，通过 {}）",
+            rate_limit_config_source()
+        );
+    } else {
+        println!("   HTTP 限流: ⚠️  未启用");
+        println!("   💡 设置环境变量: export JIACLAW_RATE_LIMIT_PER_MINUTE=60");
+    }
+
     // CORS 配置
     if config.http.cors_allow_origins.is_empty()
-        || (config.http.cors_allow_origins.len() == 1
-            && config.http.cors_allow_origins[0] == "*")
+        || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
     {
         println!("   CORS 模式: 允许所有来源（Permissive）");
     } else {
@@ -1444,15 +1565,37 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("   • 已发现技能: {skills_count} 个");
     println!("   • 已注册工具: {tools_count} 个");
     println!("   • HTTP 绑定: {}", config.http.bind);
-    println!("   • API 鉴权: {}", if api_token.is_some() { "已启用" } else { "未启用" });
-    println!("   • Webhook 鉴权: {}", if webhook_secret.is_some() { "已启用" } else { "未启用" });
-    
+    println!(
+        "   • API 鉴权: {}",
+        if api_token.is_some() {
+            "已启用"
+        } else {
+            "未启用"
+        }
+    );
+    println!(
+        "   • Webhook 鉴权: {}",
+        if webhook_secret.is_some() {
+            "已启用"
+        } else {
+            "未启用"
+        }
+    );
+    println!(
+        "   • HTTP 限流: {}",
+        if let Some(limit) = rate_limit_per_minute {
+            format!("已启用（{limit} 次/分钟）")
+        } else {
+            "未启用".to_string()
+        }
+    );
+
     if !has_key {
         println!("\n   ⚠️  运行模式: Stub（存根模式）");
         println!("   💡 未检测到 Brokerrouter/API key，将使用演示模式");
         println!("   💡 配置 JIACLAW_API_KEY 环境变量以启用真实模型调用");
     }
-    
+
     if workspace_ok {
         println!("\n   ✅ 配置良好，可以开始使用");
         println!("   💡 试试: jiaclaw serve");
@@ -1482,10 +1625,26 @@ mod tests {
         create_test_app_with_auth(None, webhook_secret)
     }
 
-    fn create_test_app_with_auth(api_token: Option<String>, webhook_secret: Option<String>) -> Router {
+    fn create_test_app_with_auth(
+        api_token: Option<String>,
+        webhook_secret: Option<String>,
+    ) -> Router {
+        create_test_app_with_options(api_token, webhook_secret, None)
+    }
+
+    fn create_test_app_with_rate_limit(per_minute: u32) -> Router {
+        create_test_app_with_options(None, None, Some(per_minute))
+    }
+
+    fn create_test_app_with_options(
+        api_token: Option<String>,
+        webhook_secret: Option<String>,
+        rate_limit_per_minute: Option<u32>,
+    ) -> Router {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
-        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1493,17 +1652,10 @@ mod tests {
             webhook_secret,
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
+            rate_limiter: rate_limit_per_minute.and_then(build_rate_limiter),
         };
 
-        Router::new()
-            .route("/health", get(health_handler))
-            .route("/api/chat", post(chat_handler))
-            .route("/api/sessions", post(create_session_handler))
-            .route("/api/sessions/:id", delete(delete_session_handler))
-            .route("/api/tools", get(tools_handler))
-            .route("/api/skills", get(skills_handler))
-            .route("/hooks/inbound", post(hooks_inbound_handler))
-            .with_state(state)
+        build_router(state)
     }
 
     #[tokio::test]
@@ -1511,7 +1663,12 @@ mod tests {
         let app = create_test_app();
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1603,10 +1760,7 @@ mod tests {
         let chat_response: ChatResponse = serde_json::from_slice(&body).unwrap();
 
         // 在存根模式下，应该触发工具调用
-        assert!(
-            !chat_response.tool_calls.is_empty(),
-            "应该有工具调用"
-        );
+        assert!(!chat_response.tool_calls.is_empty(), "应该有工具调用");
         assert_eq!(chat_response.tool_calls[0].tool_name, "workspace_list");
     }
 
@@ -1795,7 +1949,8 @@ mod tests {
     async fn test_session_message_limit() {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
-        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1803,17 +1958,16 @@ mod tests {
             webhook_secret: None,
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
+            rate_limiter: None,
         };
 
         let session_id = "test-limit-session".to_string();
 
         // 创建超过上限的消息
-        let mut messages = vec![
-            ChatMessage {
-                role: MessageRole::System,
-                content: "你是一个助手".to_string(),
-            },
-        ];
+        let mut messages = vec![ChatMessage {
+            role: MessageRole::System,
+            content: "你是一个助手".to_string(),
+        }];
 
         // 添加 60 条消息（超过 MAX_SESSION_MESSAGES = 50）
         for i in 0..60 {
@@ -1880,7 +2034,12 @@ mod tests {
         let app = create_test_app();
 
         let response = app
-            .oneshot(Request::builder().uri("/api/tools").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -2147,8 +2306,9 @@ mod tests {
     async fn test_session_persistence_disabled() {
         let config = AgentConfig::default();
         let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
-        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
-        
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+
         let state = AppState {
             agent: Arc::new(agent),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -2156,15 +2316,14 @@ mod tests {
             webhook_secret: None,
             persist_enabled: false,
             persist_path: Arc::new(persist_path.clone()),
+            rate_limiter: None,
         };
 
         let session_id = "test-session".to_string();
-        let messages = vec![
-            ChatMessage {
-                role: MessageRole::User,
-                content: "测试消息".to_string(),
-            },
-        ];
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: "测试消息".to_string(),
+        }];
 
         {
             let mut sessions = state.sessions.lock().unwrap();
@@ -2176,15 +2335,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_persistence_enabled() {
-        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
-        
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+
         let session_id = "test-session".to_string();
-        let messages = vec![
-            ChatMessage {
-                role: MessageRole::User,
-                content: "测试消息".to_string(),
-            },
-        ];
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: "测试消息".to_string(),
+        }];
 
         {
             let mut sessions_map = HashMap::new();
@@ -2197,18 +2355,16 @@ mod tests {
         let loaded = load_sessions(&persist_path);
         assert_eq!(loaded.len(), 1, "应该加载 1 个 session");
         assert_eq!(loaded.get(&session_id).unwrap().len(), 1, "应该有 1 条消息");
-        assert_eq!(
-            loaded.get(&session_id).unwrap()[0].content,
-            "测试消息"
-        );
+        assert_eq!(loaded.get(&session_id).unwrap()[0].content, "测试消息");
 
         std::fs::remove_file(&persist_path).ok();
     }
 
     #[tokio::test]
     async fn test_session_persistence_corrupted_file() {
-        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
-        
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+
         std::fs::write(&persist_path, "{ invalid json ").expect("写入失败");
 
         let loaded = load_sessions(&persist_path);
@@ -2219,24 +2375,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_persistence_nonexistent_file() {
-        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
-        
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+
         let loaded = load_sessions(&persist_path);
         assert_eq!(loaded.len(), 0, "不存在的文件应该返回空 map");
     }
 
     #[tokio::test]
     async fn test_session_persistence_delete() {
-        let persist_path = std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
-        
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+
         let session_id1 = "test-session-1".to_string();
         let session_id2 = "test-session-2".to_string();
-        let messages = vec![
-            ChatMessage {
-                role: MessageRole::User,
-                content: "测试消息".to_string(),
-            },
-        ];
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: "测试消息".to_string(),
+        }];
 
         {
             let mut sessions_map = HashMap::new();
@@ -2543,5 +2699,160 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_disabled_allows_many_requests() {
+        let app = create_test_app();
+
+        for _ in 0..5 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/tools")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_returns_429_with_retry_after() {
+        let app = create_test_app_with_rate_limit(2);
+
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/tools")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            statuses.push(response.status());
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .expect("429 必须包含 Retry-After")
+                    .to_str()
+                    .unwrap();
+                let secs: u64 = retry_after.parse().expect("Retry-After 应为秒数");
+                assert!(secs >= 1, "Retry-After 至少为 1 秒");
+
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(payload["error"], "rate_limit_exceeded");
+            }
+        }
+
+        assert_eq!(statuses[0], StatusCode::OK);
+        assert_eq!(statuses[1], StatusCode::OK);
+        assert_eq!(statuses[2], StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_health_is_not_rate_limited() {
+        let app = create_test_app_with_rate_limit(1);
+
+        // 先打满 /api/* 配额
+        let limited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::OK);
+
+        let limited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // GET /health 仍应 200，且 oneshot 不依赖 ConnectInfo
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hooks_inbound_is_rate_limited() {
+        let app = create_test_app_with_rate_limit(1);
+
+        let webhook_request = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "rate-limit-chat".to_string(),
+            text: "限流测试".to_string(),
+            username: None,
+        };
+        let request_body = serde_json::to_string(&webhook_request).unwrap();
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(second.headers().get(header::RETRY_AFTER).is_some());
+    }
+
+    #[test]
+    fn test_is_rate_limited_path() {
+        assert!(is_rate_limited_path("/api/chat"));
+        assert!(is_rate_limited_path("/api/tools"));
+        assert!(is_rate_limited_path("/hooks/inbound"));
+        assert!(!is_rate_limited_path("/health"));
+        assert!(!is_rate_limited_path("/"));
+        assert!(!is_rate_limited_path("/api"));
     }
 }
