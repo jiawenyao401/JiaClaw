@@ -43,6 +43,8 @@ governor = "0.6"
 minreq = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
+# Ed25519 for Discord Interactions (ring 0.17 stays on Rust 1.83; ed25519-dalek 2.2 pulls edition2024 crates)
+ring = "0.17"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]

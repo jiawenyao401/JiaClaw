@@ -63,6 +63,27 @@ bind = "127.0.0.1:8080"
 # 出站失败仍返回 200 + 原 JSON reply，避免 Telegram webhook 重试。未设置则仅同步 JSON（与仅入站行为一致）
 # telegram_bot_token = "123456:ABC-your-bot-token"
 
+# Slack Events API signing secret（可选，环境变量 JIACLAW_SLACK_SIGNING_SECRET 优先）
+# 如果设置，/hooks/slack 校验 X-Slack-Signature + X-Slack-Request-Timestamp（v0 HMAC-SHA256，±5 分钟）
+# 未设置则开放（开发友好）。签名使用原始 body 字节。
+# slack_signing_secret = "your-slack-signing-secret"
+
+# Slack Bot token（可选，环境变量 JIACLAW_SLACK_BOT_TOKEN 优先）
+# 如果设置，成功回复后会 POST chat.postMessage 推回 channel；未设置则仅同步 JSON
+# slack_bot_token = "xoxb-your-bot-token"
+
+# Discord Interactions 公钥（可选，环境变量 JIACLAW_DISCORD_PUBLIC_KEY 优先）
+# 如果设置，/hooks/discord 校验 X-Signature-Ed25519 + X-Signature-Timestamp（Ed25519，timestamp + raw body）
+# 未设置则开放（开发友好，doctor 警告）
+# discord_public_key = "your-discord-hex-public-key"
+
+# Discord Bot token（可选，环境变量 JIACLAW_DISCORD_BOT_TOKEN 优先）
+# 如果设置，deferred ACK 后会 PATCH 编辑原始 Interaction；未设置则仅记 session
+# discord_bot_token = "your-discord-bot-token"
+
+# 将公网 HTTPS 端点登记为 Discord Interactions Endpoint URL：
+# https://your-host.example/hooks/discord
+
 # 将公网 HTTPS 端点登记为 Bot webhook（secret_token 对应上方 telegram_secret）：
 # curl "https://api.telegram.org/bot<token>/setWebhook" \
 #   -d "url=https://your-host.example/hooks/telegram" \
@@ -84,7 +105,7 @@ persist = false
 persist_path = ".jiaclaw/sessions.json"
 
 # HTTP 限流（可选，环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE 优先）
-# 正整数：对 /api/* 与 /hooks/inbound、/hooks/telegram 做进程内全局限流（次/分钟）
+# 正整数：对 /api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack、/hooks/discord 做进程内全局限流（次/分钟）
 # 未设置或 0：不限流。GET /health 始终不限流。
 # 超限返回 429 并带 Retry-After。
 # rate_limit_per_minute = 60

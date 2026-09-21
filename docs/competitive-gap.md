@@ -65,11 +65,12 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **Telegram Bot 出站** | ✅ 支持 | ⏳ 部分 | ✅ **可选 sendMessage** | P1 | - |
 | **Slack Events 入站** | ✅ 插件支持 | ❌ 无 | ✅ **POST /hooks/slack** | P1 | - |
 | **Slack Bot 出站** | ✅ 插件支持 | ❌ 无 | ✅ **可选 chat.postMessage** | P1 | - |
+| **Discord Interactions 入站** | ✅ 插件支持 | ❌ 无 | ✅ **POST /hooks/discord** | P1 | - |
+| **Discord Bot 出站** | ✅ 插件支持 | ❌ 无 | ✅ **可选 deferred PATCH** | P1 | - |
 | **Request ID** | ✅ 支持 | ⏳ 部分 | ✅ **X-Request-Id** | P1 | - |
 | **OpenAPI** | ✅ FastAPI 自动 | ⏳ 部分 | ✅ **GET /api/openapi.json** | P1 | - |
 | **SSE 事件流** | ✅ 支持 | ⏳ 部分 | ✅ **可选 SSE（完成后分块）** | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
 | **WebSocket** | ⏳ 社区贡献 | ❌ 无 | ⏳ 计划中（M4） | P2 | - |
-| **Discord** | ✅ 插件支持 | ❌ 无 | ⏳ 计划中（通过 MCP） | P2 | [#95](https://github.com/StateKnot/StateKnot/issues/95) MCP 集成 |
 | **gRPC** | ❌ 无 | ❌ 无 | ⏳ 可选（通过 StateKnot） | P2 | - |
 
 **JiaClaw 现状**:
@@ -79,14 +80,14 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - ✅ 技能开关：`--skill <name>` 可重复使用，`--no-auto-skill` 禁用自动激活
   - ✅ 会话管理：`--session <id>` 续聊支持
 - ✅ HTTP 服务已实现（GET /health, POST /api/chat，可选 SSE, GET/POST /api/sessions, GET/DELETE /api/sessions/:id, GET /api/tools, GET /api/skills, GET /api/openapi.json）
-- ✅ **可选 HTTP 限流**（`[http] rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`，进程内全局，超限 429 + Retry-After；GET /health 不限流；覆盖 `/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`）
+- ✅ **可选 HTTP 限流**（`[http] rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`，进程内全局，超限 429 + Retry-After；GET /health 不限流；覆盖 `/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord`）
 - ✅ **请求追踪**（缺失则生成 UUID，响应回写 `X-Request-Id`；chat/webhook tracing 带 request_id）
 - ✅ **OpenAPI 草图**（`GET /api/openapi.json`，手写 OpenAPI 3；鉴权与 `/api/tools` 一致）
 - ✅ **可选 SSE**（`POST /api/chat`：`Accept: text/event-stream` 或 body `stream: true` → `text/event-stream`；事件 `meta` / `token` / `tool` / `done` / `error`。未请求流式时 JSON 不变；鉴权失败仍 JSON 401。**当前为整轮完成后分块推送；Brokerrouter 真流式后续**）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史；默认硬截断超长历史，可开启摘要压缩）
 - ✅ **Session 查询 API**（`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息，不存在 404；读内存当前状态，落盘开启时与 store 一致）
 - ✅ **可选 Session TTL**（`[http] session_ttl_secs` / `JIACLAW_SESSION_TTL_SECS`，正整数启用闲置过期；create/chat/get/list 刷新；过期后 list 省略，GET/DELETE 与不存在一致）
-- ✅ **可选 Session 摘要压缩**（`[session] summarize_on_overflow` / `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true`，默认关保持硬截断；开启后把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`；失败 warn 回退截断。HTTP/Telegram/Slack/webhook/heartbeat 共用 store 写入点，摘要无工具循环）
+- ✅ **可选 Session 摘要压缩**（`[session] summarize_on_overflow` / `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true`，默认关保持硬截断；开启后把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`；失败 warn 回退截断。HTTP/Telegram/Slack/Discord/webhook/heartbeat 共用 store 写入点，摘要无工具循环）
 - ✅ **Session 可选落盘**（`[http] persist = true`，进程重启后可恢复历史，原子写入，自动处理损坏文件）
 - ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
 - ✅ 技能列表 API（GET /api/skills 列出已发现技能）
@@ -95,11 +96,13 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ **Telegram Bot 可选出站**（`JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token` 优先；成功回复后 POST `sendMessage`，文本按 4096 截断；出站失败 warn + 仍 200 原 JSON，避免 webhook 重试；未配置 token 时行为与仅入站一致。`setWebhook` 指向公网 `/hooks/telegram`）
 - ✅ **Slack Events API 入站**（POST /hooks/slack，手写 serde 解析 Events API 最小子集；`url_verification` 回传 `{ challenge }`；仅 `message` 且 `subtype` 为空；session `slack:{team_id}:{channel}` 或 `slack:{channel}`；可选 `JIACLAW_SLACK_SIGNING_SECRET` / `[http] slack_signing_secret` 校验官方 v0 HMAC-SHA256（raw body，±5 分钟）；无文本/忽略事件 200 跳过；同步回传 `{ ok, reply, session_id }`）
 - ✅ **Slack 可选出站**（`JIACLAW_SLACK_BOT_TOKEN` / `[http] slack_bot_token` 优先；成功回复后 POST `chat.postMessage`；出站失败 warn + 仍 200 原 JSON，避免 Events 重试；未配置 token 时仅同步 JSON）
+- ✅ **Discord Interactions 入站**（POST /hooks/discord，手写 serde 解析 Interactions 最小子集；`type=1` PING → `{ type: 1 }`；仅 Chat Input Command；session `discord:{guild_id}:{channel_id}` 或 `discord:dm:{channel_id}`；可选 `JIACLAW_DISCORD_PUBLIC_KEY` / `[http] discord_public_key` 校验官方 Ed25519（raw body）；立即 `type=5` deferred ACK，后台 chat）
+- ✅ **Discord 可选出站**（`JIACLAW_DISCORD_BOT_TOKEN` / `[http] discord_bot_token` 优先；deferred 完成后 PATCH 编辑原始 Interaction；无 token 时仍记 session + warn。不支持 Incoming Webhook 简化体）
 - ⏳ Brokerrouter / StateKnot **真 token 流式**仍待上游 SSE API（当前 HTTP SSE 为完成后分块）
 
 **目标方案**:
 - **P1 HTTP/SSE**: ✅ HTTP 可选 SSE 已落地（完成后分块）。真流式等待 Brokerrouter `stream:true` + StateKnot [#92](https://github.com/StateKnot/StateKnot/issues/92) `AgentHost` 事件订阅
-- **P2 Discord**: 通过 MCP 协议适配器，复用 StateKnot 的 `McpRemoteTool` 机制。Slack Events 入站已在本切片落地，不依赖 MCP
+- **P2 Discord**: ✅ Interactions HTTP 入站已落地（不依赖 MCP）。更丰富的组件/Gateway 仍可通过后续切片或 StateKnot MCP 扩展
 
 ---
 
@@ -370,7 +373,7 @@ triggers:
 **JiaClaw 现状**:
 - ✅ Cargo 工作空间已配置
 - ✅ `jiaclaw init` 命令创建工作空间
-- ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、slack_signing_secret、slack_bot_token、cors_allow_origins、可选限流、可选 Session TTL）
+- ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、slack_signing_secret、slack_bot_token、discord_public_key、discord_bot_token、cors_allow_origins、可选限流、可选 Session TTL）
 - ✅ 可选工具超时（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`）
 - ✅ 可选 `web_search`（`[tools.web_search] enabled` / `brave_api_key`，`JIACLAW_BRAVE_API_KEY` 优先；doctor 不打印 key）
 - ✅ 可选 `web_fetch`（`[tools.web_fetch] enabled` / `allow_private`；默认拒绝私网；doctor 报告是否启用）
@@ -380,7 +383,7 @@ triggers:
 **目标方案**:
 - **P1 运维配置**: ✅ **已实现**
   - TOML 配置支持 `[http]` 段落
-  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_SLACK_SIGNING_SECRET`、`JIACLAW_SLACK_BOT_TOKEN`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW`、`JIACLAW_TOOL_TIMEOUT_SECS`、`JIACLAW_HEARTBEAT_INTERVAL_SECS`、`JIACLAW_BRAVE_API_KEY` 优先）
+  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_SLACK_SIGNING_SECRET`、`JIACLAW_SLACK_BOT_TOKEN`、`JIACLAW_DISCORD_PUBLIC_KEY`、`JIACLAW_DISCORD_BOT_TOKEN`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW`、`JIACLAW_TOOL_TIMEOUT_SECS`、`JIACLAW_HEARTBEAT_INTERVAL_SECS`、`JIACLAW_BRAVE_API_KEY` 优先）
   - CORS 来源控制（空或 `["*"]` 保持 permissive，否则限制）
   - 可选进程内全局限流（`rate_limit_per_minute`，超限 429 + Retry-After）
   - 可选会话闲置 TTL（`session_ttl_secs`，过期清理内存 store；落盘开启时同步 save）
@@ -392,7 +395,7 @@ triggers:
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小
-  - HTTP 配置摘要（bind、webhook / Telegram / Slack 鉴权状态、Telegram/Slack Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、Heartbeat 是否开启及间隔/文件是否存在）
+  - HTTP 配置摘要（bind、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、Heartbeat 是否开启及间隔/文件是否存在）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
@@ -432,7 +435,7 @@ triggers:
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
 | **定时触发** | ✅ HEARTBEAT.md / APScheduler | ❌ 无 | ✅ **可选 HEARTBEAT.md（serve 内）** | P2 | - |
-| **事件触发** | ✅ Webhook | ❌ 无 | ⏳ 计划中（M4） | P2 | AgentHost HTTP |
+| **事件触发** | ✅ Webhook | ❌ 无 | ✅ **Webhook / Telegram / Slack / Discord** | P2 | AgentHost HTTP |
 | **任务队列** | ⏳ 简单 | ❌ 无 | ✅ **StateKnot 原生** | P1 | Fair Scheduler |
 | **并发控制** | ⏳ 简单 | ❌ 无 | ✅ **StateKnot 原生** | P1 | 调度器策略 |
 | **优先级队列** | ❌ 无 | ❌ 无 | ✅ **StateKnot 原生** | P2 | Fair Scheduler |
@@ -441,11 +444,11 @@ triggers:
 - ✅ StateKnot 的 Fair Scheduler 支持任务队列和并发控制
 - ✅ **可选 `HEARTBEAT.md` 定时心跳**（对照 OpenClaw）：仅挂在 `jiaclaw serve` 生命周期，tokio 间隔任务读取约定文件并跑一轮 chat；默认关闭；无外部 cron 守护进程
 - ⏳ 完整 cron 表达式 / 多任务调度仍待 M5
-- ✅ 事件触发已有 Webhook / Telegram 入站
+- ✅ 事件触发已有 Webhook / Telegram / Slack / Discord 入站
 
 **目标方案**:
 - **P2 定时触发**: ✅ **HEARTBEAT.md 已落地**；通用 cron 配置仍可后续扩展
-- **P2 事件触发**: ✅ Webhook / Telegram 入站已落地；更丰富的通道仍可通过 AgentHost HTTP 扩展
+- **P2 事件触发**: ✅ Webhook / Telegram / Slack / Discord 入站已落地；更丰富的通道仍可通过 AgentHost HTTP 扩展
 
 **竞争优势**:
 - 公平调度器支持跨租户的资源公平分配
@@ -506,7 +509,7 @@ triggers:
 | 功能 | 计划时间 |
 |------|---------|
 | WebSocket 通道 | M4 |
-| Discord 集成 | M4 |
+| Discord Interactions 入站 | ✅ 本切片 |
 | Slack Events 入站 | ✅ 本切片 |
 | 浏览器控制 | M3 |
 | Docker 沙箱 | M4 |

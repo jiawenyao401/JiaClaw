@@ -570,6 +570,21 @@ pub struct HttpConfig {
     #[serde(default)]
     pub slack_bot_token: Option<String>,
 
+    /// Discord Interactions 公钥（可选，环境变量 `JIACLAW_DISCORD_PUBLIC_KEY` 优先）
+    ///
+    /// 配置后，`POST /hooks/discord` 校验 `X-Signature-Ed25519` + `X-Signature-Timestamp`
+    ///（官方 Ed25519，签名消息为 `timestamp + raw body`）。未配置则开放（开发友好，与 slack 一致）。
+    #[serde(default)]
+    pub discord_public_key: Option<String>,
+
+    /// Discord Bot token（可选，环境变量 `JIACLAW_DISCORD_BOT_TOKEN` 优先）
+    ///
+    /// 配置后，`POST /hooks/discord` 在 deferred ACK 之后会
+    /// `PATCH /webhooks/{application_id}/{interaction_token}/messages/@original` 编辑最终回复。
+    /// 未配置则仅记录 session 并 warn，无法 follow-up。
+    #[serde(default)]
+    pub discord_bot_token: Option<String>,
+
     /// CORS 允许的来源列表（空或 `["*"]` 表示允许所有来源）
     #[serde(default = "default_cors_allow_origins")]
     pub cors_allow_origins: Vec<String>,
@@ -617,6 +632,8 @@ impl Default for HttpConfig {
             telegram_bot_token: None,
             slack_signing_secret: None,
             slack_bot_token: None,
+            discord_public_key: None,
+            discord_bot_token: None,
             cors_allow_origins: default_cors_allow_origins(),
             persist: false,
             persist_path: default_persist_path(),
@@ -756,6 +773,28 @@ impl HttpConfig {
         resolve_optional_secret(
             self.slack_bot_token.clone(),
             std::env::var("JIACLAW_SLACK_BOT_TOKEN").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的 Discord Interactions 公钥。
+    ///
+    /// 环境变量 `JIACLAW_DISCORD_PUBLIC_KEY` 优先于配置文件；空白视为未配置。
+    #[must_use]
+    pub fn effective_discord_public_key(&self) -> Option<String> {
+        resolve_optional_secret(
+            self.discord_public_key.clone(),
+            std::env::var("JIACLAW_DISCORD_PUBLIC_KEY").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的 Discord Bot token。
+    ///
+    /// 环境变量 `JIACLAW_DISCORD_BOT_TOKEN` 优先于配置文件；空白视为未配置。
+    #[must_use]
+    pub fn effective_discord_bot_token(&self) -> Option<String> {
+        resolve_optional_secret(
+            self.discord_bot_token.clone(),
+            std::env::var("JIACLAW_DISCORD_BOT_TOKEN").ok().as_deref(),
         )
     }
 }
@@ -1107,6 +1146,8 @@ session_ttl_secs = 3600
         assert_eq!(config.http.telegram_bot_token, None);
         assert_eq!(config.http.slack_signing_secret, None);
         assert_eq!(config.http.slack_bot_token, None);
+        assert_eq!(config.http.discord_public_key, None);
+        assert_eq!(config.http.discord_bot_token, None);
         assert_eq!(config.tool_timeout_secs, None);
     }
 
@@ -1116,6 +1157,8 @@ session_ttl_secs = 3600
         assert_eq!(HttpConfig::default().telegram_bot_token, None);
         assert_eq!(HttpConfig::default().slack_signing_secret, None);
         assert_eq!(HttpConfig::default().slack_bot_token, None);
+        assert_eq!(HttpConfig::default().discord_public_key, None);
+        assert_eq!(HttpConfig::default().discord_bot_token, None);
     }
 
     #[test]
@@ -1191,6 +1234,35 @@ slack_bot_token = "xoxb-test-token"
             Some("xoxb-test-token")
         );
         assert_eq!(config.http.telegram_bot_token, None);
+        assert_eq!(config.http.telegram_secret, None);
+        assert_eq!(config.http.discord_public_key, None);
+        assert_eq!(config.http.discord_bot_token, None);
+    }
+
+    #[test]
+    fn http_config_parses_discord_fields_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:8080"
+discord_public_key = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+discord_bot_token = "discord-bot-token"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(
+            config.http.discord_public_key.as_deref(),
+            Some("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+        );
+        assert_eq!(
+            config.http.discord_bot_token.as_deref(),
+            Some("discord-bot-token")
+        );
+        assert_eq!(config.http.slack_bot_token, None);
         assert_eq!(config.http.telegram_secret, None);
     }
 
