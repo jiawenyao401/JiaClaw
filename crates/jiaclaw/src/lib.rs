@@ -471,6 +471,7 @@ impl JiaClawAgent {
     }
 
     /// 构建系统提示（包含工作空间内容；每次调用重读 SOUL / USER / MEMORY）
+    #[cfg(test)]
     fn build_system_prompt(&self, request: &ChatRequest) -> String {
         let skills = self.skills.snapshot();
         self.build_system_prompt_with_skills(request, &skills)

@@ -368,7 +368,7 @@ impl SkillRegistry {
         let new_skills = SkillDiscovery::new(workspace_path).discover_strict()?;
         {
             let mut guard = self.lock_write();
-            *guard = new_skills.clone();
+            guard.clone_from(&new_skills);
         }
         Ok(new_skills)
     }
