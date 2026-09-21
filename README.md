@@ -113,6 +113,16 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 结果文件超过 32KiB（与注入截断对齐）时明确报错且不落盘；tmp + rename 原子写
   - 忽略 `path` 参数，禁止穿越；返回 `{path, mode, bytes_written}`，不调用 LLM
   - `enabled = false` 时不注册；无危险 shell；**不引入向量库或远程 sync**
+- ✅ **可选 read_file** - 默认注册的工作区只读文件工具（`path` 必填，工作区相对路径）
+  - 可选 `offset` / `limit` **按行**切片（1-indexed；`offset` 默认 1，`limit` 缺省读到文件末尾）
+  - 配置 `[tools.read_file] enabled`（默认 `true`）；超过 **256KiB** 明确报错；二进制（NUL / 非 UTF-8）拒绝读取
+  - 路径安全与 MEMORY 对齐：禁止 `..` / 绝对路径 / symlink 逃逸；只读真实文件，无 shell、不调用 LLM
+  - `enabled = false` 时不注册；`GET /api/tools` / system prompt / doctor 只反映已注册工具
+- ✅ **可选 list_dir** - 默认注册的工作区列目录工具（`path` 默认 `.`）
+  - 可选 `max_entries`（默认 200，钳制 1..=1000）、`recursive`（默认 `false`，且不跟随 symlink 目录）
+  - 返回 `{path, recursive, truncated, entries:[{name, type, size?}]}`；`type` 为 `file` 或 `dir`
+  - 配置 `[tools.list_dir] enabled`（默认 `true`）；禁止穿越 / 绝对路径 / symlink 逃逸
+  - `enabled = false` 时不注册；无 shell、不调用 LLM；**不做 write_file / exec**
 - ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
   - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
@@ -319,6 +329,16 @@ enabled = true
 # 可选工作区记忆写入（默认启用并注册）。只写配置的 MEMORY.md / [memory] path。
 # content 必填；mode=append（默认）追加，mode=overwrite 覆盖。结果上限 32KiB。原子写。
 # 忽略 path 参数，禁止穿越。enabled = false 不注册。不引入向量库或远程 sync。
+enabled = true
+
+[tools.read_file]
+# 可选工作区只读文件（默认启用并注册）。path 为工作区相对路径；可选 offset/limit 按行切片（1-indexed）。
+# 超过 256KiB 明确报错；二进制拒绝读取。禁止 .. / 绝对路径 / symlink 逃逸。enabled = false 不注册。
+enabled = true
+
+[tools.list_dir]
+# 可选工作区列目录（默认启用并注册）。path 默认 . ；可选 max_entries（默认 200）。默认不递归。
+# 返回 name / type(file|dir) / 可选 size。禁止穿越。enabled = false 不注册。无 shell。
 enabled = true
 ```
 
@@ -590,6 +610,8 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 web_fetch：默认注册。GET `http`/`https` URL，HTML 转为可读文本；默认拒绝 localhost/私网（`[tools.web_fetch] allow_private = true` 可放开）。`enabled = false` 不注册
 - 可选 memory_search：默认注册。在 MEMORY / SOUL / USER（或安全相对路径）中按关键词检索行窗片段；`enabled = false` 不注册。不引入向量数据库
 - 可选 memory_write：默认注册。只写配置的 MEMORY.md；`mode=append|overwrite`（默认 append）；结果超过 32KiB 报错；`enabled = false` 不注册。无向量库/远程 sync
+- 可选 read_file：默认注册。读取工作区相对路径文本文件；`offset`/`limit` 按行（1-indexed）；超过 256KiB 或二进制报错；禁穿越。`enabled = false` 不注册。无 shell
+- 可选 list_dir：默认注册。列出工作区目录（默认 `.`，不递归）；返回 name/type/size；禁穿越。`enabled = false` 不注册。无 shell
 
 ## 项目结构
 
@@ -727,6 +749,16 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Resulting file over 32KiB (aligned with prompt injection truncation) is rejected and not written; tmp + rename atomic write
   - Ignores a `path` argument (no traversal); returns `{path, mode, bytes_written}`; does not call an LLM
   - `enabled = false` skips registration; no dangerous shell; **no vector DB or remote sync**
+- ✅ **Optional read_file** - registered by default (`path` required, workspace-relative)
+  - Optional `offset` / `limit` slice **by line** (1-indexed; `offset` defaults to 1, omitted `limit` reads to EOF)
+  - Configure `[tools.read_file] enabled` (default `true`); files over **256KiB** error; binary (NUL / non-UTF-8) is rejected
+  - Same path policy as MEMORY: no `..` / absolute paths / symlink escape; real files only; no shell, no LLM
+  - `enabled = false` skips registration; `GET /api/tools` / system prompt / doctor only show registered tools
+- ✅ **Optional list_dir** - registered by default (`path` defaults to `.`)
+  - Optional `max_entries` (default 200, clamped to 1..=1000) and `recursive` (default `false`; symlink dirs are not followed)
+  - Returns `{path, recursive, truncated, entries:[{name, type, size?}]}`; `type` is `file` or `dir`
+  - Configure `[tools.list_dir] enabled` (default `true`); traversal / absolute / symlink escape is rejected
+  - `enabled = false` skips registration; no shell, no LLM; **no write_file / exec**
 - ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
   - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
   - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
@@ -932,6 +964,16 @@ enabled = true
 # Optional workspace memory write (registered by default). Writes only the configured MEMORY.md / [memory] path.
 # content is required; mode=append (default) or overwrite. Result cap 32KiB. Atomic write.
 # Path arguments are ignored (no traversal). enabled = false skips registration. No vector DB / remote sync.
+enabled = true
+
+[tools.read_file]
+# Optional workspace file read (registered by default). path is workspace-relative; optional offset/limit are 1-indexed lines.
+# Over 256KiB is rejected; binary (NUL / non-UTF-8) is refused. No .. / absolute / symlink escape.
+enabled = true
+
+[tools.list_dir]
+# Optional workspace directory listing (registered by default). path defaults to . ; max_entries default 200.
+# recursive defaults to false. Returns name / type(file|dir) / optional size. Traversal is rejected. No shell.
 enabled = true
 ```
 
@@ -1196,6 +1238,8 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional web_fetch: registered by default. GET `http`/`https` URLs and convert HTML to readable text; localhost/private ranges are blocked unless `[tools.web_fetch] allow_private = true`. `enabled = false` skips registration
 - Optional memory_search: registered by default. Keyword/line-window search over MEMORY / SOUL / USER (or safe relative paths); `enabled = false` skips registration. No vector database
 - Optional memory_write: registered by default. Writes only the configured MEMORY.md; `mode=append|overwrite` (default append); oversize >32KiB is rejected; `enabled = false` skips registration. No vector DB / remote sync
+- Optional read_file: registered by default. Reads a workspace-relative text file; `offset`/`limit` are 1-indexed lines; over 256KiB or binary is rejected; no traversal. `enabled = false` skips registration. No shell
+- Optional list_dir: registered by default. Lists a workspace directory (default `.`, non-recursive); returns name/type/size; no traversal. `enabled = false` skips registration. No shell
 
 ### Documentation
 

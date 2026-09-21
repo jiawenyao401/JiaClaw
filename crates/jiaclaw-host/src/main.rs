@@ -1814,6 +1814,20 @@ fn memory_write_status_line(config: &AgentConfig) -> String {
     "已启用（只写配置的 MEMORY.md；append/overwrite，上限 32KiB）".to_string()
 }
 
+fn read_file_status_line(config: &AgentConfig) -> String {
+    if !config.tools.read_file.enabled {
+        return "已关闭（[tools.read_file] enabled = false，未注册）".to_string();
+    }
+    "已启用（工作区相对路径只读；禁穿越/symlink 逃逸；上限 256KiB；按行 offset/limit）".to_string()
+}
+
+fn list_dir_status_line(config: &AgentConfig) -> String {
+    if !config.tools.list_dir.enabled {
+        return "已关闭（[tools.list_dir] enabled = false，未注册）".to_string();
+    }
+    "已启用（工作区列目录；默认不递归；禁穿越/symlink 逃逸）".to_string()
+}
+
 fn session_summarize_status_line(config: &AgentConfig) -> String {
     if config.session.effective_summarize_on_overflow() {
         format!(
@@ -2416,6 +2430,16 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • memory_write: 已关闭（未注册）");
     }
+    if config.tools.read_file.enabled {
+        tracing::info!("   • read_file: 已启用（工作区相对路径只读，上限 256KiB）");
+    } else {
+        tracing::info!("   • read_file: 已关闭（未注册）");
+    }
+    if config.tools.list_dir.enabled {
+        tracing::info!("   • list_dir: 已启用（工作区列目录，默认不递归）");
+    } else {
+        tracing::info!("   • list_dir: 已关闭（未注册）");
+    }
     if config.heartbeat.enabled {
         tracing::info!(
             "   • Heartbeat: 已启用（间隔 {heartbeat_interval_secs} 秒，session={}, 文件 {}）",
@@ -2622,6 +2646,18 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
             "   • memory_write: ⚠️  {}",
             memory_write_status_line(&config)
         );
+    }
+
+    if config.tools.read_file.enabled {
+        println!("   • read_file: ✅ {}", read_file_status_line(&config));
+    } else {
+        println!("   • read_file: ⚠️  {}", read_file_status_line(&config));
+    }
+
+    if config.tools.list_dir.enabled {
+        println!("   • list_dir: ✅ {}", list_dir_status_line(&config));
+    } else {
+        println!("   • list_dir: ⚠️  {}", list_dir_status_line(&config));
     }
 
     if config.heartbeat.enabled {
@@ -4758,6 +4794,18 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   memory_write: ⚠️  {}", memory_write_status_line(&config));
     }
 
+    if config.tools.read_file.enabled {
+        println!("   read_file: ✅ {}", read_file_status_line(&config));
+    } else {
+        println!("   read_file: ⚠️  {}", read_file_status_line(&config));
+    }
+
+    if config.tools.list_dir.enabled {
+        println!("   list_dir: ✅ {}", list_dir_status_line(&config));
+    } else {
+        println!("   list_dir: ⚠️  {}", list_dir_status_line(&config));
+    }
+
     // 3. 检查提供商配置
     println!("\n🔌 提供商配置");
     println!("   类型: {}", config.provider.provider_type);
@@ -5174,8 +5222,9 @@ mod tests {
     };
     use jiaclaw::SESSION_SUMMARY_PREFIX;
     use jiaclaw_core::{
-        ChatMessage, ChatRequest, HeartbeatConfig, MemorySearchToolConfig, MemoryWriteToolConfig,
-        MessageRole, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+        ChatMessage, ChatRequest, HeartbeatConfig, ListDirToolConfig, MemorySearchToolConfig,
+        MemoryWriteToolConfig, MessageRole, ReadFileToolConfig, SessionConfig, ToolsConfig,
+        WebFetchToolConfig, WebSearchToolConfig,
     };
     use tower::ServiceExt;
 
@@ -7609,6 +7658,14 @@ mod tests {
                 .any(|t| t.name == "memory_write"),
             "应注册默认 memory_write 工具"
         );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "read_file"),
+            "应注册默认 read_file 工具"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "list_dir"),
+            "应注册默认 list_dir 工具"
+        );
 
         // 验证工具信息包含名称和描述
         for tool in &tools_response.tools {
@@ -7886,6 +7943,126 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_tools_endpoint_omits_read_file_when_disabled() {
+        let config = AgentConfig {
+            workspace_path: unique_workspace("jiaclaw-read-file-off"),
+            tools: ToolsConfig {
+                read_file: ReadFileToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            discord_public_key: None,
+            discord_bot_token: None,
+            discord_api_base: DISCORD_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tools_response: ToolsResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            tools_response.tools.iter().all(|t| t.name != "read_file"),
+            "enabled=false 时不应出现 read_file"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "list_dir"),
+            "关闭 read_file 不应影响 list_dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_endpoint_omits_list_dir_when_disabled() {
+        let config = AgentConfig {
+            workspace_path: unique_workspace("jiaclaw-list-dir-off"),
+            tools: ToolsConfig {
+                list_dir: ListDirToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            discord_public_key: None,
+            discord_bot_token: None,
+            discord_api_base: DISCORD_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tools_response: ToolsResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            tools_response.tools.iter().all(|t| t.name != "list_dir"),
+            "enabled=false 时不应出现 list_dir"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "read_file"),
+            "关闭 list_dir 不应影响 read_file"
+        );
+    }
+
     #[test]
     fn web_search_status_lines_do_not_print_api_key() {
         let config = AgentConfig {
@@ -7967,6 +8144,38 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(memory_write_status_line(&disabled).contains("已关闭"));
+    }
+
+    #[test]
+    fn read_file_status_line_reports_enabled_and_disabled() {
+        let enabled = AgentConfig::default();
+        assert!(read_file_status_line(&enabled).contains("已启用"));
+        assert!(read_file_status_line(&enabled).contains("256KiB"));
+
+        let disabled = AgentConfig {
+            tools: ToolsConfig {
+                read_file: ReadFileToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(read_file_status_line(&disabled).contains("已关闭"));
+    }
+
+    #[test]
+    fn list_dir_status_line_reports_enabled_and_disabled() {
+        let enabled = AgentConfig::default();
+        assert!(list_dir_status_line(&enabled).contains("已启用"));
+        assert!(list_dir_status_line(&enabled).contains("不递归"));
+
+        let disabled = AgentConfig {
+            tools: ToolsConfig {
+                list_dir: ListDirToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(list_dir_status_line(&disabled).contains("已关闭"));
     }
 
     #[test]

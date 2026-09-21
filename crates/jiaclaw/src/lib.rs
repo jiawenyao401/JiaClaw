@@ -11,15 +11,16 @@
 
 pub use jiaclaw_core::{
     AgentConfig, ChatMessage, ChatRequest, ChatResponse, HeartbeatConfig, HttpConfig,
-    IdentityConfig, JiaClawError, MemoryConfig, MemorySearchToolConfig, MemoryWriteToolConfig,
-    MessageRole, ProviderConfig, RunStatus, SessionConfig, ToolCall, ToolsConfig,
-    WebFetchToolConfig, WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-    DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS,
-    DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
-    DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
-    MEMORY_PROMPT_MAX_BYTES, MIN_MAX_TOOL_ITERATIONS,
+    IdentityConfig, JiaClawError, ListDirToolConfig, MemoryConfig, MemorySearchToolConfig,
+    MemoryWriteToolConfig, MessageRole, ProviderConfig, ReadFileToolConfig, RunStatus,
+    SessionConfig, ToolCall, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+    DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
+    DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
+    DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
+    MAX_SESSION_MESSAGES, MEMORY_PROMPT_MAX_BYTES, MIN_MAX_TOOL_ITERATIONS,
 };
 
+mod files;
 mod heartbeat;
 mod identity;
 mod memory;
@@ -29,6 +30,12 @@ mod skills;
 mod tools;
 mod workspace;
 
+pub use files::{
+    clamp_list_dir_max_entries, list_workspace_dir, parse_list_dir_args, parse_read_file_args,
+    read_workspace_file, DirEntryInfo, ListDirArgs, ListDirOutput, ReadFileArgs, ReadFileOutput,
+    WorkspaceListDirTool, WorkspaceReadFileTool, LIST_DIR_DEFAULT_MAX_ENTRIES,
+    LIST_DIR_MAX_ENTRIES, READ_FILE_MAX_BYTES,
+};
 pub use heartbeat::{inspect_heartbeat_file, load_heartbeat_message, resolve_heartbeat_path};
 pub use identity::{
     inspect_identity_file, load_identity_for_prompt, resolve_identity_path, write_identity,
@@ -146,6 +153,12 @@ impl JiaClawAgent {
                 &config.workspace_path,
                 config.memory.path.clone(),
             )));
+        }
+        if config.tools.read_file.enabled {
+            tools.register(Box::new(WorkspaceReadFileTool::new(&config.workspace_path)));
+        }
+        if config.tools.list_dir.enabled {
+            tools.register(Box::new(WorkspaceListDirTool::new(&config.workspace_path)));
         }
         tools.register(Box::new(IdentityWriteTool::soul(
             &config.workspace_path,
@@ -1388,6 +1401,148 @@ mod tests {
             .execute(&ToolCall {
                 tool_name: "memory_write".to_string(),
                 arguments: serde_json::json!({"content": "hello"}),
+                result: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("工具不存在"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_file_is_registered_by_default() {
+        let agent = JiaClawAgent::new(AgentConfig::default()).unwrap();
+        assert!(
+            agent.tools().get("read_file").is_some(),
+            "read_file should be in the default tool list"
+        );
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            prompt.contains("read_file"),
+            "system prompt should describe read_file"
+        );
+        assert!(prompt.contains("offset"), "{prompt}");
+    }
+
+    #[test]
+    fn read_file_is_not_registered_when_disabled() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                read_file: ReadFileToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        assert!(agent.tools().get("read_file").is_none());
+        assert!(agent.tools().get("list_dir").is_some());
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            !prompt.contains("### read_file"),
+            "disabled read_file must not appear in tool docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_execute_when_unregistered_returns_missing_tool() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                read_file: ReadFileToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let err = agent
+            .tools()
+            .execute(&ToolCall {
+                tool_name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "MEMORY.md"}),
+                result: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("工具不存在"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn list_dir_is_registered_by_default() {
+        let agent = JiaClawAgent::new(AgentConfig::default()).unwrap();
+        assert!(
+            agent.tools().get("list_dir").is_some(),
+            "list_dir should be in the default tool list"
+        );
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            prompt.contains("list_dir"),
+            "system prompt should describe list_dir"
+        );
+        assert!(prompt.contains("max_entries"), "{prompt}");
+    }
+
+    #[test]
+    fn list_dir_is_not_registered_when_disabled() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                list_dir: ListDirToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        assert!(agent.tools().get("list_dir").is_none());
+        assert!(agent.tools().get("read_file").is_some());
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            !prompt.contains("### list_dir"),
+            "disabled list_dir must not appear in tool docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_dir_execute_when_unregistered_returns_missing_tool() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                list_dir: ListDirToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let err = agent
+            .tools()
+            .execute(&ToolCall {
+                tool_name: "list_dir".to_string(),
+                arguments: serde_json::json!({"path": "."}),
                 result: None,
             })
             .await

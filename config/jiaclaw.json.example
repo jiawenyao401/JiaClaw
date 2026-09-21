@@ -75,6 +75,12 @@
       },
       "memory_write": {
         "enabled": true
+      },
+      "read_file": {
+        "enabled": true
+      },
+      "list_dir": {
+        "enabled": true
       }
     }
 }

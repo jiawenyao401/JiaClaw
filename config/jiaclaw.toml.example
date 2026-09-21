@@ -194,6 +194,18 @@ enabled = true
 # tmp + rename 原子写；忽略 path 参数，禁止穿越。enabled = false 不注册。不引入向量库或远程 sync。
 enabled = true
 
+[tools.read_file]
+# 可选工作区只读文件（默认启用并注册）。path 为工作区相对路径；可选 offset/limit 按行切片（1-indexed）。
+# 超过 256KiB 明确报错；二进制（NUL / 非 UTF-8）拒绝读取。禁止 .. / 绝对路径 / symlink 逃逸。
+# enabled = false 不注册。无 shell、不调用 LLM。
+enabled = true
+
+[tools.list_dir]
+# 可选工作区列目录（默认启用并注册）。path 默认 . ；可选 max_entries（默认 200，钳制 1..=1000）。
+# 默认不递归（recursive=false）。返回 name / type(file|dir) / 可选 size。禁止穿越。
+# enabled = false 不注册。无 shell、不调用 LLM。
+enabled = true
+
 [skills]
 # 启用的技能列表（示例）
 enabled = [
