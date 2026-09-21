@@ -5294,8 +5294,7 @@ mod tests {
         let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(spec["paths"].is_object());
         assert_eq!(
-            spec["paths"]["/api/chat"]["post"]["requestBody"]["content"]["application/json"]
-                ["schema"]["properties"]["stream"]["type"],
+            spec["components"]["schemas"]["ChatRequest"]["properties"]["stream"]["type"],
             "boolean"
         );
         assert!(
