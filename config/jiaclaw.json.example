@@ -35,6 +35,7 @@
       "persist": false,
       "persist_path": ".jiaclaw/sessions.json",
       "rate_limit_per_minute": null,
+      "max_body_bytes": 1048576,
       "session_ttl_secs": null,
       "metrics_public": true,
       "webhook_secret": null,

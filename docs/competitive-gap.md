@@ -88,6 +88,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - ✅ 会话导入：`jiaclaw session import <file> [--id ID] [--overwrite]`，JSONL 或 `{id?, messages}` JSON；已存在需 `--overwrite`；不调用 LLM
 - ✅ HTTP 服务已实现（GET /health, GET /metrics, POST /api/chat，可选 SSE, GET/POST /api/sessions, GET/DELETE /api/sessions/:id, GET /api/sessions/:id/export, POST /api/sessions/import, GET /api/tools, GET /api/skills, POST /api/skills/reload, GET /api/openapi.json）
 - ✅ **可选 HTTP 限流**（`[http] rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`，进程内全局；启用时受保护路径带 `X-RateLimit-Limit` / `Remaining` / `Reset`（Unix 纪元秒，配额补满时刻）；超限 429 + `Retry-After`（秒）；关闭不发送这些头；GET /health 与 GET /metrics 不限流；覆盖 `/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord`）
+- ✅ **可选 HTTP 请求体上限**（`[http] max_body_bytes` 默认 1048576 / 1MiB，`JIACLAW_MAX_BODY_BYTES` 正整数优先；超限 413 + JSON `error=payload_too_large`，仍带 `X-Request-Id`；GET /health 与 GET /metrics 不检查；与鉴权/限流/CORS 兼容；不做上传/multipart 存储）
 - ✅ **可选 Prometheus 指标**（`GET /metrics`，手写 Prometheus 0.0.4 文本；默认公开；`[http] metrics_public = false` / `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。HTTP 路由族计数、sessions_active、tool_calls、build_info；无 telemetry SDK）
 - ✅ **可选 JSON 结构化日志**（`[logging] format = "text"|"json"`，默认 `text` 与现有 tracing fmt 一致；`JIACLAW_LOG_FORMAT` / `JIACLAW_LOG_LEVEL` 优先，再回退 `RUST_LOG`。`json` 时每行一条 JSON：timestamp / level / target / fields / message，`request_id` 作为 tracing 字段。doctor / serve 启动打印生效 format，不打印 secret）
 - ✅ **请求追踪**（缺失则生成 UUID，响应回写 `X-Request-Id`；chat/webhook tracing 带 request_id）
@@ -416,7 +417,7 @@ triggers:
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
 | **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
 | **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
-| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/TTL/摘要压缩/工具超时/工具循环上限/Heartbeat/web_search/web_fetch/memory_search/memory_write/read_file/list_dir/write_file/metrics/JSON 日志/优雅退出** | P1 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/请求体上限/TTL/摘要压缩/工具超时/工具循环上限/Heartbeat/web_search/web_fetch/memory_search/memory_write/read_file/list_dir/write_file/metrics/JSON 日志/优雅退出** | P1 | - |
 | **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
 | **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
@@ -424,7 +425,7 @@ triggers:
 **JiaClaw 现状**:
 - ✅ Cargo 工作空间已配置
 - ✅ `jiaclaw init` 命令创建工作空间
-- ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、slack_signing_secret、slack_bot_token、discord_public_key、discord_bot_token、可选 `[http.cors]`、可选限流、可选 Session TTL、可选 metrics 公开开关）
+- ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、slack_signing_secret、slack_bot_token、discord_public_key、discord_bot_token、可选 `[http.cors]`、可选限流、可选请求体上限、可选 Session TTL、可选 metrics 公开开关）
 - ✅ 可选 JSON 结构化日志（`[logging] format` / `JIACLAW_LOG_FORMAT`，默认 text；`JIACLAW_LOG_LEVEL` 优先于 `RUST_LOG`）
 - ✅ 可选工具超时（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`）
 - ✅ 可配置工具循环上限（`[agent] max_tool_iterations` / `JIACLAW_MAX_TOOL_ITERATIONS`，默认 5，钳制 1–32）
@@ -435,15 +436,16 @@ triggers:
 - ✅ 可选 `read_file`（`[tools.read_file] enabled` 默认 true；工作区相对路径只读；256KiB 上限；按行 offset/limit；doctor 报告是否启用）
 - ✅ 可选 `list_dir`（`[tools.list_dir] enabled` 默认 true；工作区列目录，默认不递归；doctor 报告是否启用）
 - ✅ 可选 `write_file`（`[tools.write_file] enabled` 默认 true；工作区相对路径写入；overwrite/append；256KiB 上限；原子写；doctor 报告是否启用）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Metrics 是否公开、日志 format、Session TTL、优雅退出宽限期、Session 摘要压缩、工具超时、工具循环上限、web_search key 是否配置、web_fetch 是否启用、memory_search / memory_write / read_file / list_dir / write_file 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、请求体上限、Metrics 是否公开、日志 format、Session TTL、优雅退出宽限期、Session 摘要压缩、工具超时、工具循环上限、web_search key 是否配置、web_fetch 是否启用、memory_search / memory_write / read_file / list_dir / write_file 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
 - **P1 运维配置**: ✅ **已实现**
   - TOML 配置支持 `[http]` 段落
-  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_SLACK_SIGNING_SECRET`、`JIACLAW_SLACK_BOT_TOKEN`、`JIACLAW_DISCORD_PUBLIC_KEY`、`JIACLAW_DISCORD_BOT_TOKEN`、`JIACLAW_CORS_ENABLED`、`JIACLAW_CORS_ORIGINS`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_METRICS_REQUIRE_AUTH`、`JIACLAW_LOG_FORMAT`、`JIACLAW_LOG_LEVEL`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_SHUTDOWN_TIMEOUT_SECS`、`JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW`、`JIACLAW_TOOL_TIMEOUT_SECS`、`JIACLAW_MAX_TOOL_ITERATIONS`、`JIACLAW_HEARTBEAT_INTERVAL_SECS`、`JIACLAW_BRAVE_API_KEY` 优先）
+  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_SLACK_SIGNING_SECRET`、`JIACLAW_SLACK_BOT_TOKEN`、`JIACLAW_DISCORD_PUBLIC_KEY`、`JIACLAW_DISCORD_BOT_TOKEN`、`JIACLAW_CORS_ENABLED`、`JIACLAW_CORS_ORIGINS`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_MAX_BODY_BYTES`、`JIACLAW_METRICS_REQUIRE_AUTH`、`JIACLAW_LOG_FORMAT`、`JIACLAW_LOG_LEVEL`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_SHUTDOWN_TIMEOUT_SECS`、`JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW`、`JIACLAW_TOOL_TIMEOUT_SECS`、`JIACLAW_MAX_TOOL_ITERATIONS`、`JIACLAW_HEARTBEAT_INTERVAL_SECS`、`JIACLAW_BRAVE_API_KEY` 优先）
   - 可选 CORS（`[http.cors] enabled` 默认 `false` 不发送 CORS 头；`allowed_origins` 精确匹配，`*` 仅显式配置时；`JIACLAW_CORS_ENABLED` / `JIACLAW_CORS_ORIGINS` 可覆盖；OPTIONS preflight 不破坏鉴权/限流/`X-Request-Id`）
   - 可选进程内全局限流（`rate_limit_per_minute`，启用时 `X-RateLimit-*`；超限 429 + Retry-After；关闭无这些头）
+  - 可选 HTTP 请求体上限（`max_body_bytes` 默认 1MiB；超限 413 + `payload_too_large`；GET /health 与 GET /metrics 不检查）
   - 可选 Prometheus 文本指标（`GET /metrics`，默认公开；`metrics_public = false` / `JIACLAW_METRICS_REQUIRE_AUTH` 可要求 API 鉴权；不计入限流）
   - 可选 JSON 结构化日志（`[logging] format = "text"|"json"` 默认 text；`JIACLAW_LOG_FORMAT` / `JIACLAW_LOG_LEVEL` 优先；json 时每行一条 JSON，仍走 tracing；doctor / serve 打印生效 format）
   - 可选会话闲置 TTL（`session_ttl_secs`，过期清理内存 store；落盘开启时同步 save）
@@ -462,7 +464,7 @@ triggers:
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小
-  - HTTP 配置摘要（bind、日志 format、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 是否启用及允许来源、限流是否开启及数值、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write / read_file / list_dir / write_file 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
+  - HTTP 配置摘要（bind、日志 format、webhook / Telegram / Slack / Discord 鉴权状态、Telegram/Slack/Discord Bot Token 是否配置（不打印明文）、CORS 是否启用及允许来源、限流是否开启及数值、请求体上限字节数、Metrics 是否公开或需鉴权、Session TTL 是否开启及秒数、优雅退出宽限期、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、工具循环上限生效值、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、memory_search / memory_write / read_file / list_dir / write_file 是否启用、Heartbeat 是否开启及间隔/文件是否存在）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
@@ -477,6 +479,7 @@ triggers:
 | **工具白名单** | ✅ 配置化 | ⏳ 手动 | ✅ **StateKnot 原生** | P1 | 资源策略 |
 | **API Key 管理** | ⏳ 环境变量 | ⏳ 环境变量 | ✅ **配置 + 策略** | P1 | - |
 | **HTTP 限流** | ⏳ 部分 | ❌ 无 | ✅ **可选全局 + 配额响应头** | P1 | - |
+| **HTTP 请求体上限** | ⏳ 部分 | ⏳ 部分 | ✅ **可配置 max_body_bytes（默认 1MiB）** | P1 | - |
 | **Prometheus 指标** | ⏳ 部分 | ⏳ 部分 | ✅ **GET /metrics** | P1 | - |
 | **结构化日志** | ⏳ 部分 | ⏳ 部分 | ✅ **可选 JSON 行** | P1 | - |
 | **Docker 沙箱** | ✅ 可选 | ❌ 无 | ⏳ 计划中（M4） | P2 | - |
@@ -485,6 +488,7 @@ triggers:
 **JiaClaw 现状**:
 - ✅ StateKnot 提供租户隔离和资源策略框架
 - ✅ 可选 HTTP 全局限流（`rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`；启用时 `X-RateLimit-*`，429 另带 `Retry-After`）
+- ✅ 可选 HTTP 请求体上限（`max_body_bytes` / `JIACLAW_MAX_BODY_BYTES`，默认 1MiB；超限 413）
 - ✅ 可选 Prometheus 文本指标（`GET /metrics`，默认公开；可要求 API 鉴权）
 - ✅ 可选 JSON 结构化日志（`[logging] format` / `JIACLAW_LOG_FORMAT`，默认 text）
 - ✅ 可选每工具调用超时（`tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`）

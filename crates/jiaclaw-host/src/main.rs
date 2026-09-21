@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{
@@ -34,6 +34,9 @@ use jiaclaw_core::{
     LogFormat, LoggingConfig, MessageRole, ToolCall, DEFAULT_LOG_LEVEL, MAX_MAX_TOOL_ITERATIONS,
     MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
 };
+
+#[cfg(test)]
+use jiaclaw_core::DEFAULT_HTTP_MAX_BODY_BYTES;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
@@ -1605,6 +1608,69 @@ fn rate_limited_response(info: RateLimitInfo) -> Response {
     response
 }
 
+/// `GET /health` 与 `GET /metrics` 通常无 body，不检查请求体上限。
+fn is_body_limit_exempt_path(path: &str) -> bool {
+    path == "/health" || path == "/metrics"
+}
+
+fn request_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+fn payload_too_large_response() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({"error": "payload_too_large"})),
+    )
+        .into_response()
+}
+
+fn max_body_bytes_usize(limit: u64) -> usize {
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+/// 超限时在读取 body 之前返回 413 JSON，避免把超大请求缓冲进内存。
+async fn max_body_bytes_middleware(
+    State(limit): State<usize>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if is_body_limit_exempt_path(&path) {
+        return next.run(request).await;
+    }
+
+    if let Some(content_len) = request_content_length(request.headers()) {
+        if content_len > u64::try_from(limit).unwrap_or(u64::MAX) {
+            tracing::warn!(path, limit, "HTTP 请求体超过上限");
+            return payload_too_large_response();
+        }
+    }
+
+    next.run(request).await
+}
+
+/// 将 axum `DefaultBodyLimit` 产生的空 413 转成与限流一致的 JSON 错误体。
+async fn jsonify_payload_too_large(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if is_json {
+        response
+    } else {
+        payload_too_large_response()
+    }
+}
+
 /// 从请求头读取 `X-Request-Id`；缺失或为空则生成 UUID。
 fn resolve_request_id(headers: &HeaderMap) -> String {
     headers
@@ -1648,9 +1714,19 @@ fn build_router(state: AppState) -> Router {
     build_router_with_cors(state, None)
 }
 
+#[cfg(test)]
 fn build_router_with_cors(state: AppState, cors: Option<CorsLayer>) -> Router {
+    build_router_with_body_limit(state, cors, DEFAULT_HTTP_MAX_BODY_BYTES)
+}
+
+fn build_router_with_body_limit(
+    state: AppState,
+    cors: Option<CorsLayer>,
+    max_body_bytes: u64,
+) -> Router {
     let limiter = state.rate_limiter.clone();
     let metrics = state.metrics.clone();
+    let body_limit = max_body_bytes_usize(max_body_bytes);
     let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
@@ -1673,6 +1749,12 @@ fn build_router_with_cors(state: AppState, cors: Option<CorsLayer>) -> Router {
         .route("/hooks/telegram", post(hooks_telegram_handler))
         .route("/hooks/slack", post(hooks_slack_handler))
         .route("/hooks/discord", post(hooks_discord_handler))
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn_with_state(
+            body_limit,
+            max_body_bytes_middleware,
+        ))
+        .layer(middleware::from_fn(jsonify_payload_too_large))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
@@ -1682,7 +1764,7 @@ fn build_router_with_cors(state: AppState, cors: Option<CorsLayer>) -> Router {
         router = router.layer(layer);
     }
     router
-        // 外层：即使限流 429 / CORS preflight 也回写 X-Request-Id
+        // 外层：即使限流 429 / CORS preflight / 413 也回写 X-Request-Id
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
@@ -1778,6 +1860,14 @@ fn cors_origins_config_source() -> &'static str {
 fn rate_limit_config_source() -> &'static str {
     if std::env::var("JIACLAW_RATE_LIMIT_PER_MINUTE").is_ok() {
         "环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE"
+    } else {
+        "配置文件"
+    }
+}
+
+fn max_body_bytes_config_source() -> &'static str {
+    if std::env::var("JIACLAW_MAX_BODY_BYTES").is_ok() {
+        "环境变量 JIACLAW_MAX_BODY_BYTES"
     } else {
         "配置文件"
     }
@@ -2412,6 +2502,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     let session_ttl = session_ttl_secs.map(Duration::from_secs);
     let shutdown_timeout_secs = config.http.effective_shutdown_timeout_secs();
     let shutdown_timeout = Duration::from_secs(shutdown_timeout_secs);
+    let max_body_bytes = config.http.effective_max_body_bytes();
     let metrics_public = config.http.effective_metrics_public();
     let metrics_require_auth = !metrics_public;
 
@@ -2476,7 +2567,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
 
     // 构建路由（限流中间件不依赖 ConnectInfo，oneshot 测试不会 500）
     let shutdown_state = state.clone();
-    let app = build_router_with_cors(state, cors_layer);
+    let app = build_router_with_body_limit(state, cors_layer, max_body_bytes);
 
     // 绑定地址
     let listener = tokio::net::TcpListener::bind(&config.http.bind)
@@ -2532,6 +2623,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • HTTP 限流: 未启用");
     }
+    tracing::info!("   • HTTP 请求体上限: {max_body_bytes} 字节（超限 413；GET /health 与 GET /metrics 不检查）");
     if metrics_public {
         tracing::info!("   • Metrics: 公开（GET /metrics 无需 API Bearer，便于 scrape）");
     } else {
@@ -2714,6 +2806,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
             "   • HTTP 限流: ⚠️  未启用（/api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack、/hooks/discord 不限流）"
         );
     }
+
+    println!(
+        "   • HTTP 请求体上限: {max_body_bytes} 字节（超限 413，通过 {}；GET /health 与 GET /metrics 不检查）",
+        max_body_bytes_config_source()
+    );
 
     if metrics_public {
         println!("   • Metrics: ✅ 公开（GET /metrics 无需鉴权，不计入限流）");
@@ -5163,6 +5260,12 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_RATE_LIMIT_PER_MINUTE=60");
     }
 
+    let max_body_bytes = config.http.effective_max_body_bytes();
+    println!(
+        "   HTTP 请求体上限: {max_body_bytes} 字节（超限 413，通过 {}；GET /health 与 GET /metrics 不检查）",
+        max_body_bytes_config_source()
+    );
+
     let metrics_public = config.http.effective_metrics_public();
     if metrics_public {
         println!("   Metrics: ✅ 公开（GET /metrics 无需鉴权，不计入限流）");
@@ -5332,6 +5435,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
             "未启用".to_string()
         }
     );
+    println!("   • HTTP 请求体上限: {max_body_bytes} 字节");
     println!("   • CORS: {}", cors_status_line(&config.http.cors));
     println!(
         "   • Metrics: {}",
@@ -5441,6 +5545,47 @@ mod tests {
 
     fn create_test_app_with_session_ttl(session_ttl_secs: Option<u64>) -> Router {
         create_test_app_with_full(None, None, None, session_ttl_secs)
+    }
+
+    fn create_test_app_with_max_body_bytes(max_body_bytes: u64) -> Router {
+        create_test_app_with_max_body_options(None, None, max_body_bytes)
+    }
+
+    fn create_test_app_with_max_body_options(
+        api_token: Option<String>,
+        rate_limit_per_minute: Option<u32>,
+        max_body_bytes: u64,
+    ) -> Router {
+        let config = AgentConfig::default();
+        let metrics = Arc::new(Metrics::default());
+        let agent = attach_tool_metrics(
+            JiaClawAgent::new(config).expect("创建测试 agent 失败"),
+            &metrics,
+        );
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            discord_public_key: None,
+            discord_bot_token: None,
+            discord_api_base: DISCORD_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: rate_limit_per_minute.and_then(build_rate_limiter),
+            session_ttl: None,
+            metrics,
+            metrics_require_auth: false,
+        };
+        build_router_with_body_limit(state, None, max_body_bytes)
     }
 
     fn create_test_app_with_telegram_secret(telegram_secret: Option<String>) -> Router {
@@ -7498,6 +7643,25 @@ mod tests {
         );
         assert_eq!(jiaclaw_core::parse_positive_shutdown_timeout("0"), None);
         assert_eq!(jiaclaw_core::parse_positive_shutdown_timeout("abc"), None);
+    }
+
+    #[test]
+    fn default_max_body_bytes_parse_is_1mib() {
+        assert_eq!(
+            jiaclaw_core::resolve_max_body_bytes(0, None),
+            jiaclaw_core::DEFAULT_HTTP_MAX_BODY_BYTES
+        );
+        assert_eq!(
+            jiaclaw_core::resolve_max_body_bytes(1_048_576, None),
+            1_048_576
+        );
+        assert_eq!(
+            jiaclaw_core::parse_positive_max_body_bytes("1048576"),
+            Some(1_048_576)
+        );
+        assert_eq!(jiaclaw_core::parse_positive_max_body_bytes("0"), None);
+        assert_eq!(jiaclaw_core::parse_positive_max_body_bytes("abc"), None);
+        assert_eq!(DEFAULT_HTTP_MAX_BODY_BYTES, 1_048_576);
     }
 
     #[tokio::test]
@@ -11401,6 +11565,151 @@ mod tests {
         assert!(second.headers().get(header::RETRY_AFTER).is_some());
     }
 
+    fn small_chat_json() -> String {
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "hi".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        };
+        serde_json::to_string(&request).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_oversize_body_returns_413_json_and_request_id() {
+        let app = create_test_app_with_max_body_bytes(32);
+        let client_id = "too-large-1";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .header("X-Request-Id", client_id)
+                    .body(Body::from("x".repeat(33)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(request_id_header(&response), client_id);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn test_normal_body_within_limit_passes() {
+        let body = small_chat_json();
+        assert!(body.len() < 256);
+        let app = create_test_app_with_max_body_bytes(256);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .header("X-Request-Id", "within-limit")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_id_header(&response), "within-limit");
+    }
+
+    #[tokio::test]
+    async fn test_health_and_metrics_ignore_body_limit() {
+        let app = create_test_app_with_max_body_bytes(8);
+        for uri in ["/health", "/metrics"] {
+            let get = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("X-Request-Id", "probe-get")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(get.status(), StatusCode::OK, "{uri} GET 应保持 200");
+            assert_eq!(request_id_header(&get), "probe-get");
+
+            let oversized = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .header("X-Request-Id", "probe-body")
+                        .body(Body::from("x".repeat(64)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                oversized.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{uri} 不应因请求体上限返回 413"
+            );
+            assert_eq!(request_id_header(&oversized), "probe-body");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oversize_body_returns_413_before_auth() {
+        let app = create_test_app_with_max_body_options(Some("secret-token".to_string()), None, 16);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .header("X-Request-Id", "auth-too-large")
+                    .body(Body::from("x".repeat(64)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(request_id_header(&response), "auth-too-large");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn test_oversize_body_keeps_rate_limit_headers() {
+        let app = create_test_app_with_max_body_options(None, Some(30), 16);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .header("X-Request-Id", "rl-too-large")
+                    .body(Body::from("x".repeat(64)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(request_id_header(&response), "rl-too-large");
+        assert_rate_limit_headers(&response, 30, Some(29));
+    }
+
     #[tokio::test]
     async fn test_cors_disabled_has_no_allow_origin() {
         let app = create_test_app();
@@ -11685,6 +11994,12 @@ mod tests {
         assert!(limited.get("X-RateLimit-Remaining").is_some());
         assert!(limited.get("X-RateLimit-Reset").is_some());
         assert!(limited.get("Retry-After").is_some());
+        let too_large = &spec["components"]["responses"]["PayloadTooLarge"];
+        assert!(too_large["headers"].get("X-Request-Id").is_some());
+        assert_eq!(
+            too_large["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorBody"
+        );
         let description = spec["info"]["description"].as_str().unwrap_or("");
         assert!(
             description.contains("X-RateLimit-Limit"),
@@ -11693,6 +12008,18 @@ mod tests {
         assert!(
             description.contains("Unix"),
             "OpenAPI 描述应说明 X-RateLimit-Reset 为 Unix 秒"
+        );
+        assert!(
+            description.contains("max_body_bytes"),
+            "OpenAPI 描述应说明请求体上限"
+        );
+        assert!(
+            description.contains("413"),
+            "OpenAPI 描述应说明超限返回 413"
+        );
+        assert_eq!(
+            spec["paths"]["/api/chat"]["post"]["responses"]["413"]["$ref"],
+            "#/components/responses/PayloadTooLarge"
         );
     }
 

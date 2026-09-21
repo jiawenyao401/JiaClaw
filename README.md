@@ -64,6 +64,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - 启用时受保护路径带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`（Unix 纪元秒，配额补满时刻）
   - 超限返回 429 + `Retry-After`（秒）；关闭限流时不发送这些头。`GET /health` 与 `GET /metrics` 始终不限流
+- ✅ **可选 HTTP 请求体上限** - 防止超大 body 拖垮内存（对照生产 serve）
+  - 配置 `[http] max_body_bytes`（默认 **1048576 / 1MiB**）或环境变量 `JIACLAW_MAX_BODY_BYTES`（正整数优先；`0`/非法回退配置或默认）
+  - 超限返回 **413** Payload Too Large，JSON `{"error":"payload_too_large"}`，仍回写 `X-Request-Id`
+  - `GET /health` 与 `GET /metrics` 不检查该上限；与鉴权 / 限流 / CORS 兼容。**不做上传 / multipart 存储**
 - ✅ **可选 CORS** - 默认关闭（无 CORS 头）。本地浏览器前端可开 `[http.cors]`
   - `enabled` 默认 `false`；`JIACLAW_CORS_ENABLED` 覆盖。`allowed_origins` 精确匹配；`*` 仅在显式配置或 `JIACLAW_CORS_ORIGINS=*` 时
   - 默认方法 GET/POST/DELETE/OPTIONS；允许头 Authorization / Content-Type / X-Request-Id / Accept；暴露 `X-Request-Id` 与限流头（`X-RateLimit-*` / `Retry-After`）
@@ -276,6 +280,12 @@ persist_path = ".jiaclaw/sessions.json"
 # 启用时受保护路径带 X-RateLimit-Limit / Remaining / Reset（Unix 秒，配额补满时刻）；超限 429 + Retry-After（秒）。
 # 关闭时不发送这些头。
 # rate_limit_per_minute = 60
+
+# HTTP 请求体上限（可选，环境变量 JIACLAW_MAX_BODY_BYTES 优先）
+# 正整数：超过该字节数返回 413 Payload Too Large（JSON error=payload_too_large，仍带 X-Request-Id）
+# 未设置、0 或非法回退默认 1048576（1MiB）。GET /health 与 GET /metrics 不检查。
+# 不做上传 / multipart 存储。
+# max_body_bytes = 1048576
 
 # GET /metrics 是否公开（默认 true）。false 或 JIACLAW_METRICS_REQUIRE_AUTH=1 时与 /api/* 相同鉴权
 # metrics_public = true
@@ -619,6 +629,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`（Unix 纪元秒，表示剩余配额补满到 Limit 的时刻）；超限返回 `429` + `Retry-After`（秒）。未启用则不发送这些头。`GET /health` 与 `GET /metrics` 不限流
+- 可选 HTTP 请求体上限：`[http] max_body_bytes` 默认 **1048576（1MiB）**，`JIACLAW_MAX_BODY_BYTES` 正整数优先（`0`/非法回退）。超限返回 `413` + `{"error":"payload_too_large"}`，仍回写 `X-Request-Id`。`GET /health` 与 `GET /metrics` 不检查。不做上传 / multipart 存储
 - 可选 CORS：默认关闭、不发送 CORS 头。`[http.cors] enabled = true` 或 `JIACLAW_CORS_ENABLED=1` 后，匹配的 `Origin` 获得 `Access-Control-Allow-Origin`；`JIACLAW_CORS_ORIGINS` 逗号分隔覆盖 `allowed_origins`。`*` 仅在显式配置时允许所有来源。OPTIONS preflight 不要求 API Bearer，仍回写 `X-Request-Id`。未匹配 Origin 不回声
 - 可选 Prometheus 指标：`GET /metrics` 默认公开；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。进程内计数（HTTP 路由族、session 数、工具调用、build_info），不引入 telemetry SDK
 - 可选 JSON 结构化日志：默认 `[logging] format = "text"` 与当前人类可读 tracing 一致。`format = "json"` 或 `JIACLAW_LOG_FORMAT=json` 时每行一条 JSON（含 `timestamp` / `level` / `target` / `fields` / `message`，`request_id` 作为字段）。`JIACLAW_LOG_LEVEL` 优先于 `RUST_LOG`。doctor / serve 启动打印生效 format，不打印 secret
@@ -731,6 +742,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - When enabled, protected paths send `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` (Unix epoch seconds when remaining returns to Limit)
   - Over-limit returns 429 + `Retry-After` (seconds); headers are omitted when rate limiting is off. `GET /health` and `GET /metrics` are never limited
+- ✅ **Optional HTTP max request body** - reject oversized bodies before they exhaust memory
+  - Configure `[http] max_body_bytes` (default **1048576 / 1MiB**) or `JIACLAW_MAX_BODY_BYTES` (positive integer wins; `0`/invalid falls back to config or default)
+  - Over-limit returns **413** Payload Too Large with JSON `{"error":"payload_too_large"}` and still writes `X-Request-Id`
+  - `GET /health` and `GET /metrics` skip the check; compatible with auth / rate limiting / CORS. **No upload / multipart storage**
 - ✅ **Optional CORS** - off by default (no CORS headers). Enable `[http.cors]` for a local browser UI
   - `enabled` defaults to `false`; override with `JIACLAW_CORS_ENABLED`. `allowed_origins` is exact-match; `*` only when configured explicitly or `JIACLAW_CORS_ORIGINS=*`
   - Default methods GET/POST/DELETE/OPTIONS; allowed headers Authorization / Content-Type / X-Request-Id / Accept; expose `X-Request-Id` and rate-limit headers (`X-RateLimit-*` / `Retry-After`)
@@ -943,6 +958,12 @@ persist_path = ".jiaclaw/sessions.json"
 # When enabled, protected paths send X-RateLimit-Limit / Remaining / Reset (Unix seconds, when remaining returns to Limit); 429 adds Retry-After (seconds).
 # Headers are omitted when rate limiting is off.
 # rate_limit_per_minute = 60
+
+# Optional HTTP max request body (JIACLAW_MAX_BODY_BYTES env var takes priority)
+# Positive integer: over-limit returns 413 Payload Too Large (JSON error=payload_too_large, still writes X-Request-Id)
+# Unset, 0, or invalid falls back to 1048576 (1MiB). GET /health and GET /metrics skip the check.
+# No upload / multipart storage.
+# max_body_bytes = 1048576
 
 # Whether GET /metrics is public (default true). false or JIACLAW_METRICS_REQUIRE_AUTH=1 uses the same auth as /api/*
 # metrics_public = true
@@ -1278,6 +1299,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` send `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` (Unix epoch seconds when remaining returns to Limit); over-limit returns `429` + `Retry-After` (seconds). Headers are omitted when disabled. `GET /health` and `GET /metrics` are never limited
+- Optional HTTP max request body: `[http] max_body_bytes` defaults to **1048576 (1MiB)**; `JIACLAW_MAX_BODY_BYTES` (positive integer) wins (`0`/invalid falls back). Over-limit returns `413` + `{"error":"payload_too_large"}` and still writes `X-Request-Id`. `GET /health` and `GET /metrics` skip the check. No upload / multipart storage
 - Optional CORS: off by default (no CORS headers). `[http.cors] enabled = true` or `JIACLAW_CORS_ENABLED=1` echoes `Access-Control-Allow-Origin` for matching origins; `JIACLAW_CORS_ORIGINS` (comma-separated) overrides `allowed_origins`. `*` allows all only when configured explicitly. OPTIONS preflight does not require an API Bearer and still writes `X-Request-Id`. Unmatched origins are never echoed
 - Optional Prometheus metrics: `GET /metrics` is public by default; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`. In-process counters (HTTP route family, session gauge, tool calls, build_info); no telemetry SDK
 - Optional JSON structured logs: default `[logging] format = "text"` matches the current human-readable tracing fmt. `format = "json"` or `JIACLAW_LOG_FORMAT=json` emits one JSON object per line (`timestamp` / `level` / `target` / `fields` / `message`; `request_id` is a field). `JIACLAW_LOG_LEVEL` overrides `RUST_LOG`. doctor / serve startup prints the effective format and never prints secrets
