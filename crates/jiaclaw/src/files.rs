@@ -302,9 +302,8 @@ fn collect_dir_entries(
             continue;
         }
         let child_path = entry.path();
-        let meta = match entry.symlink_metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Ok(meta) = fs::symlink_metadata(&child_path) else {
+            continue;
         };
         children.push((name.into_owned(), child_path, meta));
     }
@@ -342,6 +341,7 @@ fn collect_dir_entries(
     Ok(truncated)
 }
 
+/// `read_file` 的 JSON 返回体。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileOutput {
     /// 调用方传入的工作区相对路径
@@ -363,6 +363,7 @@ pub struct ReadFileOutput {
     pub content: String,
 }
 
+/// 目录中的一条文件或子目录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntryInfo {
     /// 条目名称（递归时为相对所列目录的路径）
@@ -375,6 +376,7 @@ pub struct DirEntryInfo {
     pub size: Option<u64>,
 }
 
+/// `list_dir` 的 JSON 返回体。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListDirOutput {
     /// 所列目录的工作区相对路径

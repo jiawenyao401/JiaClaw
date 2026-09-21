@@ -1486,12 +1486,13 @@ mod tests {
         resolve_metrics_public, resolve_optional_secret, resolve_rate_limit_per_minute,
         resolve_session_keep_recent, resolve_session_summarize_on_overflow,
         resolve_session_ttl_secs, resolve_shutdown_timeout_secs, resolve_tool_timeout_secs,
-        AgentConfig, HeartbeatConfig, HttpConfig, HttpCorsConfig, MemorySearchToolConfig,
-        MemoryWriteToolConfig, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
-        DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-        DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
-        DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
-        MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
+        AgentConfig, HeartbeatConfig, HttpConfig, HttpCorsConfig, ListDirToolConfig,
+        MemorySearchToolConfig, MemoryWriteToolConfig, ReadFileToolConfig, SessionConfig,
+        ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
+        DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS,
+        DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
+        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
+        MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
