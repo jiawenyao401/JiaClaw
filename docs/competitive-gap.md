@@ -104,6 +104,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **短期记忆** | ✅ 会话历史 | ✅ 上下文窗口 | ✅ 基础（ChatRequest） | P0 | - |
 | **工作区 MEMORY.md** | ✅ 文件注入 | ✅ MEMORY.md 注入 | ✅ **每次 chat 注入 + memory_append** | P1 | - |
 | **工作区 SOUL.md / USER.md** | ✅ 人格与用户画像 | ✅ SOUL/USER 注入 | ✅ **每次 chat 注入 + soul_write/user_write** | P1 | - |
+| **工作区 HEARTBEAT.md** | ✅ 定时注入 | ⏳ 部分 | ✅ **serve 内可选定时 chat** | P2 | - |
 | **长期记忆（向量）** | ✅ 向量数据库 (ChromaDB/Pinecone) | ✅ 嵌入检索 | ⏳ 计划中（M3） | P1 | StateKnot 持久化层 |
 | **语义搜索** | ✅ 完整 | ✅ 完整 | ⏳ 计划中（M3） | P1 | 通过 MCP 或本地工具 |
 | **记忆编辑** | ✅ API 支持 | ⏳ 部分 | ⏳ 计划中（M3） | P2 | - |
@@ -126,6 +127,14 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - 工具 `soul_write` / `user_write`：`content` + 可选 `replace`（默认 true 覆盖）；只能写约定路径
   - `jiaclaw doctor` 报告 SOUL/USER 是否存在及大小；`jiaclaw soul show` / `jiaclaw user show`
   - 与 MEMORY 并存，互不覆盖
+- ✅ **工作区 `HEARTBEAT.md` 定时心跳**（对照 OpenClaw HEARTBEAT.md）
+  - 约定路径：`{workspace}/HEARTBEAT.md`，可用 `[heartbeat] path` 覆盖（默认 `HEARTBEAT.md`；缺省配置兼容）
+  - `[heartbeat] enabled = false` 默认关；`interval_secs` 默认 3600；`JIACLAW_HEARTBEAT_INTERVAL_SECS`（正整数）可覆盖间隔
+  - `session_id` 默认 `heartbeat`（固定会话）
+  - 仅 `jiaclaw serve` 进程内 tokio 后台任务；读取全文作为 user 消息复用现有 session/chat 路径；日志只打摘要
+  - 文件缺失或空：跳过本轮并 debug，不退出；路径安全复用 MEMORY resolve（禁穿越）
+  - `doctor` / serve 启动摘要显示是否启用、间隔、文件是否存在（不打印全文）
+  - **不**引入外部 cron；CLI `chat` 不跑心跳
 - ⏳ 向量检索式长期记忆仍待 M3
 - ✅ 时间旅行和 Fork 能力由 StateKnot Checkpoint 提供（待实现）
 
@@ -336,7 +345,7 @@ triggers:
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
 | **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
 | **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
-| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/TTL/工具超时** | P1 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/TTL/工具超时/Heartbeat** | P1 | - |
 | **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
 | **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
@@ -346,21 +355,22 @@ triggers:
 - ✅ `jiaclaw init` 命令创建工作空间
 - ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、cors_allow_origins、可选限流、可选 Session TTL）
 - ✅ 可选工具超时（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Session TTL、工具超时、MEMORY/SOUL/USER 文件）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Session TTL、工具超时、MEMORY/SOUL/USER/HEARTBEAT 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
 - **P1 运维配置**: ✅ **已实现**
   - TOML 配置支持 `[http]` 段落
-  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_TOOL_TIMEOUT_SECS` 优先）
+  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_TOOL_TIMEOUT_SECS`、`JIACLAW_HEARTBEAT_INTERVAL_SECS` 优先）
   - CORS 来源控制（空或 `["*"]` 保持 permissive，否则限制）
   - 可选进程内全局限流（`rate_limit_per_minute`，超限 429 + Retry-After）
   - 可选会话闲置 TTL（`session_ttl_secs`，过期清理内存 store；落盘开启时同步 save）
   - 可选每工具调用超时（`tool_timeout_secs`，超时写入 tool result 并继续 loop）
+  - 可选 HEARTBEAT.md 心跳（`[heartbeat] enabled`，仅 serve 进程内按间隔跑一轮 chat）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
-  - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER 是否存在及大小
-  - HTTP 配置摘要（bind、webhook / Telegram 鉴权状态、Telegram Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数、工具超时是否开启及秒数）
+  - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小
+  - HTTP 配置摘要（bind、webhook / Telegram 鉴权状态、Telegram Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数、工具超时是否开启及秒数、Heartbeat 是否开启及间隔/文件是否存在）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
@@ -399,7 +409,7 @@ triggers:
 
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
-| **定时触发** | ✅ APScheduler | ❌ 无 | ⏳ 计划中（M5） | P2 | - |
+| **定时触发** | ✅ HEARTBEAT.md / APScheduler | ❌ 无 | ✅ **可选 HEARTBEAT.md（serve 内）** | P2 | - |
 | **事件触发** | ✅ Webhook | ❌ 无 | ⏳ 计划中（M4） | P2 | AgentHost HTTP |
 | **任务队列** | ⏳ 简单 | ❌ 无 | ✅ **StateKnot 原生** | P1 | Fair Scheduler |
 | **并发控制** | ⏳ 简单 | ❌ 无 | ✅ **StateKnot 原生** | P1 | 调度器策略 |
@@ -407,11 +417,13 @@ triggers:
 
 **JiaClaw 现状**:
 - ✅ StateKnot 的 Fair Scheduler 支持任务队列和并发控制
-- ❌ 缺少定时触发和事件触发的上层封装
+- ✅ **可选 `HEARTBEAT.md` 定时心跳**（对照 OpenClaw）：仅挂在 `jiaclaw serve` 生命周期，tokio 间隔任务读取约定文件并跑一轮 chat；默认关闭；无外部 cron 守护进程
+- ⏳ 完整 cron 表达式 / 多任务调度仍待 M5
+- ✅ 事件触发已有 Webhook / Telegram 入站
 
 **目标方案**:
-- **P2 定时触发**: 添加 cron 配置，定时提交 Agent 运行
-- **P2 事件触发**: 通过 AgentHost HTTP API 接收 Webhook
+- **P2 定时触发**: ✅ **HEARTBEAT.md 已落地**；通用 cron 配置仍可后续扩展
+- **P2 事件触发**: ✅ Webhook / Telegram 入站已落地；更丰富的通道仍可通过 AgentHost HTTP 扩展
 
 **竞争优势**:
 - 公平调度器支持跨租户的资源公平分配
@@ -466,6 +478,7 @@ triggers:
 | 长期记忆（向量数据库） | M3 | - |
 | 工作区 MEMORY.md 注入 | ✅ 本切片 | - |
 | 工作区 SOUL.md / USER.md 注入 | ✅ 本切片 | - |
+| 工作区 HEARTBEAT.md 定时心跳 | ✅ 本切片 | - |
 
 ### P2 - 中优先级（Medium）
 | 功能 | 计划时间 |
@@ -474,7 +487,7 @@ triggers:
 | Discord/Slack 集成 | M4 |
 | 浏览器控制 | M3 |
 | Docker 沙箱 | M4 |
-| 定时任务 | M5 |
+| 定时任务 | M5（通用 cron）；HEARTBEAT.md ✅ 本切片 |
 | 多智能体协作 | M5 |
 
 ---

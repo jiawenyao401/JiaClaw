@@ -306,7 +306,10 @@ fn ensure_path_within_workspace(workspace: &Path, target: &Path) -> Result<(), J
     )))
 }
 
-fn ensure_existing_within_workspace(workspace: &Path, path: &Path) -> Result<(), JiaClawError> {
+pub(crate) fn ensure_existing_within_workspace(
+    workspace: &Path,
+    path: &Path,
+) -> Result<(), JiaClawError> {
     let ws = canonicalize_existing_or_clone(workspace);
     let canon = path.canonicalize().map_err(|e| {
         JiaClawError::ToolExecution(format!("无法解析文件 {}: {e}", path.display()))

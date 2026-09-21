@@ -37,5 +37,11 @@
     "identity": {
       "soul_path": "SOUL.md",
       "user_path": "USER.md"
+    },
+    "heartbeat": {
+      "enabled": false,
+      "interval_secs": 3600,
+      "path": "HEARTBEAT.md",
+      "session_id": "heartbeat"
     }
 }
