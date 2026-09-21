@@ -64,6 +64,9 @@ pub use workspace::Workspace;
 // use stateknot_core::{AgentExecutionConfig, AgentInstructions, BudgetLimits};
 // use stateknot_runtime::AgentBuilder;
 
+/// 工具执行计数钩子（`true` = ok，`false` = error）。
+pub type ToolMetricsHook = std::sync::Arc<dyn Fn(&str, bool) + Send + Sync>;
+
 /// `JiaClaw` Agent 包装器
 ///
 /// 当前实现状态：正在等待 `StateKnot` 稳定的公共 API。
@@ -73,6 +76,8 @@ pub struct JiaClawAgent {
     workspace: Workspace,
     skills: Vec<Skill>,
     tools: ToolRegistry,
+    /// 可选：每次真实 tool 执行后回调（serve 的 Prometheus 计数）。
+    tool_metrics: Option<ToolMetricsHook>,
     /// 测试专用：stub 每次都请求该工具，用于验证 tool loop 上限。
     #[cfg(test)]
     test_repeat_tool: Option<String>,
@@ -174,9 +179,23 @@ impl JiaClawAgent {
             workspace,
             skills,
             tools,
+            tool_metrics: None,
             #[cfg(test)]
             test_repeat_tool: None,
         })
+    }
+
+    /// 挂接工具执行计数钩子（HTTP `/metrics` 使用）。
+    #[must_use]
+    pub fn with_tool_metrics_hook(mut self, hook: ToolMetricsHook) -> Self {
+        self.tool_metrics = Some(hook);
+        self
+    }
+
+    fn observe_tool_call(&self, tool_name: &str, ok: bool) {
+        if let Some(hook) = &self.tool_metrics {
+            hook(tool_name, ok);
+        }
     }
 
     /// 获取 Agent 配置
@@ -543,12 +562,14 @@ impl JiaClawAgent {
         {
             Ok(result) => {
                 tool_call.result = Some(serde_json::json!(result.clone()));
+                self.observe_tool_call(&tool_call.tool_name, true);
                 let message = format!("工具 {} 执行成功:\n{}", tool_call.tool_name, result);
                 (tool_call, message)
             }
             Err(e) => {
                 let error_msg = format!("工具 {} 执行失败: {}", tool_call.tool_name, e);
                 tool_call.result = Some(serde_json::json!({"error": error_msg.clone()}));
+                self.observe_tool_call(&tool_call.tool_name, false);
                 (tool_call, error_msg)
             }
         }

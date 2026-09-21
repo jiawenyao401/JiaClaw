@@ -433,13 +433,39 @@ impl SessionConfig {
     }
 }
 
-/// 解析摘要压缩开关；无法识别时返回 `None`。
+/// 解析布尔开关（`1`/`true`/`yes`/`on` 与 `0`/`false`/`no`/`off`）；无法识别时返回 `None`。
 #[must_use]
-pub fn parse_session_summarize_on_overflow(raw: &str) -> Option<bool> {
+pub fn parse_boolish_flag(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+/// 解析摘要压缩开关；无法识别时返回 `None`。
+#[must_use]
+pub fn parse_session_summarize_on_overflow(raw: &str) -> Option<bool> {
+    parse_boolish_flag(raw)
+}
+
+/// 解析 `JIACLAW_METRICS_REQUIRE_AUTH`；无法识别时返回 `None`。
+#[must_use]
+pub fn parse_metrics_require_auth(raw: &str) -> Option<bool> {
+    parse_boolish_flag(raw)
+}
+
+/// 根据配置文件 `metrics_public` 与可选环境变量解析 `/metrics` 是否公开。
+///
+/// 环境变量 `JIACLAW_METRICS_REQUIRE_AUTH` 优先：`1`/`true` 表示要求鉴权（不公开），
+/// `0`/`false` 表示公开；未设置或无法解析时回退到配置值（默认公开）。
+#[must_use]
+pub fn resolve_metrics_public(configured_public: bool, env_require_auth: Option<&str>) -> bool {
+    match env_require_auth {
+        Some(raw) => parse_metrics_require_auth(raw)
+            .map(|require_auth| !require_auth)
+            .unwrap_or(configured_public),
+        None => configured_public,
     }
 }
 
@@ -652,6 +678,13 @@ pub struct HttpConfig {
     /// `None` 或非正整数表示不启用过期清理。
     #[serde(default)]
     pub session_ttl_secs: Option<u64>,
+
+    /// `GET /metrics` 是否无需 API Bearer（默认 `true`，便于 Prometheus scrape）。
+    ///
+    /// 设为 `false` 时与 `/api/*` 相同鉴权。环境变量 `JIACLAW_METRICS_REQUIRE_AUTH=1`
+    /// 优先，表示要求鉴权（即不公开）。
+    #[serde(default = "default_metrics_public")]
+    pub metrics_public: bool,
 }
 
 fn default_http_bind() -> String {
@@ -664,6 +697,10 @@ fn default_cors_allow_origins() -> Vec<String> {
 
 fn default_persist_path() -> String {
     ".jiaclaw/sessions.json".to_string()
+}
+
+fn default_metrics_public() -> bool {
+    true
 }
 
 impl Default for HttpConfig {
@@ -683,6 +720,7 @@ impl Default for HttpConfig {
             persist_path: default_persist_path(),
             rate_limit_per_minute: None,
             session_ttl_secs: None,
+            metrics_public: default_metrics_public(),
         }
     }
 }
@@ -810,6 +848,20 @@ impl HttpConfig {
         resolve_session_ttl_secs(
             self.session_ttl_secs,
             std::env::var("JIACLAW_SESSION_TTL_SECS").ok().as_deref(),
+        )
+    }
+
+    /// 解析 `GET /metrics` 是否公开（无需 API Bearer）。
+    ///
+    /// 默认公开。`[http] metrics_public = false` 或环境变量
+    /// `JIACLAW_METRICS_REQUIRE_AUTH=1/true` 时与 `/api/*` 相同鉴权。
+    #[must_use]
+    pub fn effective_metrics_public(&self) -> bool {
+        resolve_metrics_public(
+            self.metrics_public,
+            std::env::var("JIACLAW_METRICS_REQUIRE_AUTH")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -1113,17 +1165,17 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_positive_heartbeat_interval, parse_positive_max_tool_iterations,
-        parse_positive_rate_limit, parse_positive_session_ttl, parse_positive_tool_timeout,
-        parse_session_summarize_on_overflow, resolve_heartbeat_interval_secs,
-        resolve_max_tool_iterations, resolve_optional_secret, resolve_rate_limit_per_minute,
-        resolve_session_keep_recent, resolve_session_summarize_on_overflow,
-        resolve_session_ttl_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
-        HttpConfig, MemorySearchToolConfig, SessionConfig, ToolsConfig, WebFetchToolConfig,
-        WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
-        DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
-        DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
-        MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
+        parse_boolish_flag, parse_metrics_require_auth, parse_positive_heartbeat_interval,
+        parse_positive_max_tool_iterations, parse_positive_rate_limit, parse_positive_session_ttl,
+        parse_positive_tool_timeout, parse_session_summarize_on_overflow,
+        resolve_heartbeat_interval_secs, resolve_max_tool_iterations, resolve_metrics_public,
+        resolve_optional_secret, resolve_rate_limit_per_minute, resolve_session_keep_recent,
+        resolve_session_summarize_on_overflow, resolve_session_ttl_secs, resolve_tool_timeout_secs,
+        AgentConfig, HeartbeatConfig, HttpConfig, MemorySearchToolConfig, SessionConfig,
+        ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
+        DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MAX_TOOL_ITERATIONS,
+        DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
+        MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -1139,6 +1191,12 @@ mod tests {
     fn http_config_session_ttl_defaults_to_none() {
         assert_eq!(HttpConfig::default().session_ttl_secs, None);
         assert_eq!(HttpConfig::default().effective_session_ttl_secs(), None);
+    }
+
+    #[test]
+    fn http_config_metrics_public_defaults_to_true() {
+        assert!(HttpConfig::default().metrics_public);
+        assert!(HttpConfig::default().effective_metrics_public());
     }
 
     #[test]
@@ -1315,6 +1373,7 @@ session_ttl_secs = 3600
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.http.rate_limit_per_minute, Some(60));
         assert_eq!(config.http.session_ttl_secs, Some(3600));
+        assert!(config.http.metrics_public);
         assert_eq!(config.http.api_token, None);
         assert_eq!(config.http.webhook_secret, None);
         assert_eq!(config.http.telegram_secret, None);
@@ -1762,6 +1821,46 @@ session_id = "nightly"
         assert!(!resolve_session_summarize_on_overflow(false, None));
         assert!(resolve_session_summarize_on_overflow(true, None));
         assert!(resolve_session_summarize_on_overflow(true, Some("bogus")));
+    }
+
+    #[test]
+    fn parse_metrics_require_auth_accepts_boolish_values() {
+        assert_eq!(parse_metrics_require_auth("1"), Some(true));
+        assert_eq!(parse_metrics_require_auth("true"), Some(true));
+        assert_eq!(parse_metrics_require_auth(" YES "), Some(true));
+        assert_eq!(parse_metrics_require_auth("0"), Some(false));
+        assert_eq!(parse_metrics_require_auth("off"), Some(false));
+        assert_eq!(parse_metrics_require_auth(""), None);
+        assert_eq!(parse_boolish_flag("on"), Some(true));
+    }
+
+    #[test]
+    fn resolve_metrics_public_env_can_force_auth() {
+        assert!(!resolve_metrics_public(true, Some("1")));
+        assert!(!resolve_metrics_public(true, Some("true")));
+        assert!(resolve_metrics_public(false, Some("0")));
+        assert!(resolve_metrics_public(true, Some("nope")));
+        assert!(resolve_metrics_public(true, None));
+        assert!(!resolve_metrics_public(false, None));
+        assert!(!resolve_metrics_public(false, Some("bogus")));
+    }
+
+    #[test]
+    fn http_config_parses_metrics_public_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:9090"
+metrics_public = false
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.http.metrics_public);
+        assert!(!config.http.effective_metrics_public());
     }
 
     #[test]
