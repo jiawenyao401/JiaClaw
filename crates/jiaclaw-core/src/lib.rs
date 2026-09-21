@@ -192,6 +192,12 @@ pub struct HttpConfig {
     /// Session 持久化文件路径（相对于 `workspace_path`）
     #[serde(default = "default_persist_path")]
     pub persist_path: String,
+
+    /// 每分钟全局限流（可选，环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE` 优先）
+    ///
+    /// `None` 或非正整数表示不限流。
+    #[serde(default)]
+    pub rate_limit_per_minute: Option<u32>,
 }
 
 fn default_http_bind() -> String {
@@ -215,7 +221,44 @@ impl Default for HttpConfig {
             cors_allow_origins: default_cors_allow_origins(),
             persist: false,
             persist_path: default_persist_path(),
+            rate_limit_per_minute: None,
         }
+    }
+}
+
+/// 解析正整数限流值；`0` 或无法解析时视为不限流。
+#[must_use]
+pub fn parse_positive_rate_limit(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok().filter(|&n| n > 0)
+}
+
+/// 根据配置文件值与可选环境变量解析每分钟限流。
+///
+/// 环境变量优先；仅正整数生效。
+#[must_use]
+pub fn resolve_rate_limit_per_minute(
+    configured: Option<u32>,
+    env_value: Option<&str>,
+) -> Option<u32> {
+    match env_value {
+        Some(raw) => parse_positive_rate_limit(raw),
+        None => configured.filter(|&n| n > 0),
+    }
+}
+
+impl HttpConfig {
+    /// 解析生效的每分钟请求上限。
+    ///
+    /// 环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE` 优先于配置文件。
+    /// 仅正整数生效；未设置、`0` 或无法解析表示不限流。
+    #[must_use]
+    pub fn effective_rate_limit_per_minute(&self) -> Option<u32> {
+        resolve_rate_limit_per_minute(
+            self.rate_limit_per_minute,
+            std::env::var("JIACLAW_RATE_LIMIT_PER_MINUTE")
+                .ok()
+                .as_deref(),
+        )
     }
 }
 
@@ -323,7 +366,7 @@ impl AgentConfig {
 
         let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
-        
+
         // 如果顶层有 provider 或 http 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
@@ -331,7 +374,7 @@ impl AgentConfig {
         if let Some(http) = config_file.http {
             config_file.agent.http = http;
         }
-        
+
         Ok(config_file.agent)
     }
 
@@ -363,7 +406,7 @@ impl AgentConfig {
 
         let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
-        
+
         // 如果顶层有 provider 或 http 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
@@ -371,7 +414,84 @@ impl AgentConfig {
         if let Some(http) = config_file.http {
             config_file.agent.http = http;
         }
-        
+
         Ok(config_file.agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_positive_rate_limit, resolve_rate_limit_per_minute, AgentConfig, HttpConfig,
+    };
+
+    #[test]
+    fn http_config_rate_limit_defaults_to_none() {
+        assert_eq!(HttpConfig::default().rate_limit_per_minute, None);
+        assert_eq!(
+            HttpConfig::default().effective_rate_limit_per_minute(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_positive_rate_limit_accepts_only_positive_integers() {
+        assert_eq!(parse_positive_rate_limit("60"), Some(60));
+        assert_eq!(parse_positive_rate_limit(" 1 "), Some(1));
+        assert_eq!(parse_positive_rate_limit("0"), None);
+        assert_eq!(parse_positive_rate_limit(""), None);
+        assert_eq!(parse_positive_rate_limit("abc"), None);
+        assert_eq!(parse_positive_rate_limit("-1"), None);
+    }
+
+    #[test]
+    fn resolve_rate_limit_env_overrides_config() {
+        assert_eq!(
+            resolve_rate_limit_per_minute(Some(30), Some("120")),
+            Some(120)
+        );
+        assert_eq!(resolve_rate_limit_per_minute(Some(30), Some("0")), None);
+        assert_eq!(resolve_rate_limit_per_minute(Some(30), Some("nope")), None);
+        assert_eq!(resolve_rate_limit_per_minute(Some(30), None), Some(30));
+        assert_eq!(resolve_rate_limit_per_minute(Some(0), None), None);
+        assert_eq!(resolve_rate_limit_per_minute(None, None), None);
+    }
+
+    #[test]
+    fn http_config_parses_rate_limit_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:9090"
+rate_limit_per_minute = 60
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.http.bind, "127.0.0.1:9090");
+        assert_eq!(config.http.rate_limit_per_minute, Some(60));
+        assert_eq!(config.http.api_token, None);
+        assert_eq!(config.http.webhook_secret, None);
+    }
+
+    #[test]
+    fn http_config_parses_missing_rate_limit_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "http": {
+                "bind": "0.0.0.0:8080"
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert_eq!(config.http.bind, "0.0.0.0:8080");
+        assert_eq!(config.http.rate_limit_per_minute, None);
     }
 }

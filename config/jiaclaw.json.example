@@ -18,5 +18,12 @@
   },
   "logging": {
     "level": "info"
+  },
+  "http": {
+    "bind": "127.0.0.1:8080",
+    "cors_allow_origins": ["*"],
+    "persist": false,
+    "persist_path": ".jiaclaw/sessions.json",
+    "rate_limit_per_minute": null
   }
 }

@@ -2,7 +2,7 @@
 
 > 对比分析 JiaClaw 相对于 OpenClaw 和 Hermes Agent 的能力差距、优势和路线图
 
-**更新时间**: 2026-09-20  
+**更新时间**: 2026-09-21  
 **状态**: 开发中 (Pre-Alpha)
 
 ---
@@ -52,7 +52,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | 维度 | OpenClaw | Hermes Agent | JiaClaw | 优先级 | StateKnot 关联 |
 |------|----------|--------------|---------|--------|---------------|
 | **CLI 界面** | ✅ 完整 | ✅ 完整 | ✅ **完整（REPL+参数）** | P1 | - |
-| **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ✅ **基础（axum）** | P1 | - |
+| **HTTP REST API** | ✅ FastAPI | ✅ Flask/FastAPI | ✅ **基础（axum + 可选限流）** | P1 | - |
 | **Session（内存）** | ✅ 支持 | ⏳ 部分 | ✅ **已实现** | P1 | - |
 | **Session（落盘）** | ✅ 支持 | ⏳ 部分 | ✅ **可选落盘** | P1 | - |
 | **工具列表 API** | ✅ 支持 | ⏳ 部分 | ✅ **GET /api/tools** | P1 | - |
@@ -70,6 +70,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
   - ✅ 技能开关：`--skill <name>` 可重复使用，`--no-auto-skill` 禁用自动激活
   - ✅ 会话管理：`--session <id>` 续聊支持
 - ✅ HTTP 服务已实现（GET /health, POST /api/chat, GET /api/tools, GET /api/skills）
+- ✅ **可选 HTTP 限流**（`[http] rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`，进程内全局，超限 429 + Retry-After；GET /health 不限流）
 - ✅ Session 内存支持（可选 `session_id` 实现多轮对话历史，自动截断超长历史）
 - ✅ **Session 可选落盘**（`[http] persist = true`，进程重启后可恢复历史，原子写入，自动处理损坏文件）
 - ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
@@ -301,7 +302,7 @@ triggers:
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
 | **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
 | **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
-| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook** | P1 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流** | P1 | - |
 | **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
 | **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
@@ -309,19 +310,20 @@ triggers:
 **JiaClaw 现状**:
 - ✅ Cargo 工作空间已配置
 - ✅ `jiaclaw init` 命令创建工作空间
-- ✅ HTTP 配置支持（bind、webhook_secret、cors_allow_origins）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置）
+- ✅ HTTP 配置支持（bind、webhook_secret、cors_allow_origins、可选限流）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态）
 - ⏳ 文档持续改进中
 
 **目标方案**:
 - **P1 运维配置**: ✅ **已实现**
   - TOML 配置支持 `[http]` 段落
-  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET` 优先）
+  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_RATE_LIMIT_PER_MINUTE` 优先）
   - CORS 来源控制（空或 `["*"]` 保持 permissive，否则限制）
+  - 可选进程内全局限流（`rate_limit_per_minute`，超限 429 + Retry-After）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量
-  - HTTP 配置摘要（bind、webhook 鉴权状态、CORS 模式）
+  - HTTP 配置摘要（bind、webhook 鉴权状态、CORS 模式、限流是否开启及数值）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
@@ -335,12 +337,14 @@ triggers:
 | **资源限制** | ⏳ 简单 | ❌ 无 | ✅ **StateKnot 原生** | P1 | 资源策略 |
 | **工具白名单** | ✅ 配置化 | ⏳ 手动 | ✅ **StateKnot 原生** | P1 | 资源策略 |
 | **API Key 管理** | ⏳ 环境变量 | ⏳ 环境变量 | ✅ **配置 + 策略** | P1 | - |
+| **HTTP 限流** | ⏳ 部分 | ❌ 无 | ✅ **可选全局** | P1 | - |
 | **Docker 沙箱** | ✅ 可选 | ❌ 无 | ⏳ 计划中（M4） | P2 | - |
 | **网络隔离** | ❌ 无 | ❌ 无 | ✅ **StateKnot 策略** | P2 | 资源策略 |
 
 **JiaClaw 现状**:
 - ✅ StateKnot 提供租户隔离和资源策略框架
-- ❌ JiaClaw 尚未配置具体策略
+- ✅ 可选 HTTP 全局限流（`rate_limit_per_minute` / `JIACLAW_RATE_LIMIT_PER_MINUTE`）
+- ❌ JiaClaw 尚未配置具体租户策略
 
 **目标方案**:
 - **P1 租户隔离**: 在配置中指定 `tenant_id`，隔离不同用户的运行
