@@ -65,6 +65,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 超限返回 429 + `Retry-After`；`GET /health` 始终不限流
 - ✅ **请求追踪** - 所有 HTTP 响应回写 `X-Request-Id`（请求未带则生成 UUID）
 - ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
+- ✅ **工作区 MEMORY.md** - 跨会话长期记忆注入系统提示
+  - 默认 `{workspace}/MEMORY.md`，可用 `[memory] path` 覆盖
+  - 每次 `chat` 重读；过大截断（32KiB）并 warn
+  - 本地工具 `memory_append` 追加/覆盖；`jiaclaw doctor` / `jiaclaw memory show`
 
 ### 待实现
 
@@ -137,6 +141,10 @@ persist_path = ".jiaclaw/sessions.json"
 # 正整数：对 /api/* 与 /hooks/inbound 做进程内全局限流（次/分钟）
 # 未设置或 0：不限流。GET /health 始终不限流；超限返回 429 + Retry-After。
 # rate_limit_per_minute = 60
+
+[memory]
+# 工作区长期记忆（相对于 workspace，默认 MEMORY.md；缺省本段即可）
+path = "MEMORY.md"
 ```
 
 或使用环境变量：
@@ -158,6 +166,9 @@ cargo run --bin jiaclaw -- init
 
 # 检查配置和环境
 cargo run --bin jiaclaw -- doctor
+
+# 查看工作区长期记忆（MEMORY.md）
+cargo run --bin jiaclaw -- memory show
 
 # 列出已发现的技能
 cargo run --bin jiaclaw -- skills
@@ -272,6 +283,7 @@ JiaClaw/
 │   ├── architecture.md
 │   ├── stateknot-gaps.md
 │   └── roadmap.md
+├── examples/             # 示例工作空间（含空 MEMORY.md 说明）
 ├── Cargo.toml            # 工作空间清单
 └── README.md
 ```
@@ -347,6 +359,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Over-limit returns 429 + `Retry-After`; `GET /health` is never limited
 - ✅ **Request tracing** - every HTTP response writes `X-Request-Id` (generated UUID if missing)
 - ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
+- ✅ **Workspace MEMORY.md** - cross-session facts injected into the system prompt
+  - Default `{workspace}/MEMORY.md`, overridable via `[memory] path`
+  - Re-read on every `chat`; truncate at 32KiB with a warning
+  - Local tool `memory_append`; `jiaclaw doctor` / `jiaclaw memory show`
 
 #### Pending
 
@@ -419,6 +435,10 @@ persist_path = ".jiaclaw/sessions.json"
 # Positive integer: process-wide limit for /api/* and /hooks/inbound (requests/minute)
 # Unset or 0: disabled. GET /health is never limited; over-limit returns 429 + Retry-After.
 # rate_limit_per_minute = 60
+
+[memory]
+# Workspace long-term memory (relative to workspace, default MEMORY.md)
+path = "MEMORY.md"
 ```
 
 Or use environment variable:
@@ -440,6 +460,9 @@ cargo run --bin jiaclaw -- init
 
 # Check configuration and environment
 cargo run --bin jiaclaw -- doctor
+
+# Show workspace long-term memory (MEMORY.md)
+cargo run --bin jiaclaw -- memory show
 
 # Run single chat (requires API key)
 export JIACLAW_API_KEY=brk_live_...

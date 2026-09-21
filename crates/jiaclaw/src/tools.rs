@@ -250,7 +250,7 @@ impl FileReadTool {
         let canonical_workspace = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
-        
+
         Self {
             workspace_path: canonical_workspace,
         }
@@ -333,7 +333,7 @@ impl FileWriteTool {
         let canonical_workspace = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
-        
+
         Self {
             workspace_path: canonical_workspace,
         }
@@ -388,11 +388,13 @@ impl Tool for FileWriteTool {
 
         // 规范化父目录路径（如果存在）进行安全检查
         let canonical_parent = if parent.exists() {
-            parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
+            parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf())
         } else {
             parent.to_path_buf()
         };
-        
+
         if !canonical_parent.starts_with(&self.workspace_path) {
             return Err(JiaClawError::ToolExecution(format!(
                 "安全错误: 文件 {relative_path} 在工作空间外部"
@@ -657,7 +659,7 @@ impl FileListTool {
         let canonical_workspace = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
-        
+
         Self {
             workspace_path: canonical_workspace,
         }
@@ -788,7 +790,7 @@ impl FileDeleteTool {
         let canonical_workspace = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
-        
+
         Self {
             workspace_path: canonical_workspace,
         }
@@ -853,9 +855,7 @@ impl Tool for FileDeleteTool {
         std::fs::remove_file(&canonical_path)
             .map_err(|e| JiaClawError::ToolExecution(format!("无法删除文件: {e}")))?;
 
-        Ok(format!(
-            "✅ 文件已删除: {relative_path}\n大小: {size} 字节"
-        ))
+        Ok(format!("✅ 文件已删除: {relative_path}\n大小: {size} 字节"))
     }
 }
 
@@ -872,7 +872,7 @@ impl FileCopyTool {
         let canonical_workspace = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
-        
+
         Self {
             workspace_path: canonical_workspace,
         }
@@ -938,11 +938,13 @@ impl Tool for FileCopyTool {
 
         // 规范化父目录路径（如果存在）进行安全检查
         let canonical_dest_parent = if dest_parent.exists() {
-            dest_parent.canonicalize().unwrap_or_else(|_| dest_parent.to_path_buf())
+            dest_parent
+                .canonicalize()
+                .unwrap_or_else(|_| dest_parent.to_path_buf())
         } else {
             dest_parent.to_path_buf()
         };
-        
+
         if !canonical_dest_parent.starts_with(&self.workspace_path) {
             return Err(JiaClawError::ToolExecution(format!(
                 "安全错误: 目标路径 {dest_rel} 在工作空间外部"

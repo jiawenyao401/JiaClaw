@@ -205,9 +205,13 @@ Add any relevant background information that helps JiaClaw understand your needs
     }
 
     fn default_memory_content() -> &'static str {
-        r"# Long-term Memory
+        r"# Long-term Memory / 长期记忆
 
-This file stores important context and information from past conversations.
+此文件在每次对话开始时注入系统提示（内容原样）。可手动编辑，或让 Agent 调用 `memory_append` 追加跨会话稳定事实。
+
+- 只记录可复用的事实（偏好、约定、长期项目），不要写临时任务状态。
+- 默认路径：`{workspace}/MEMORY.md`（可通过配置 `[memory] path` 覆盖）。
+- 文件过大（超过 32KiB）时截断注入，并在日志中发出警告。
 
 ## Key Facts
 
@@ -226,10 +230,6 @@ This file stores important context and information from past conversations.
 
 - [Preference 1]
 - [Preference 2]
-
----
-
-*Note: This file can be manually edited or will be updated automatically when StateKnot persistence is enabled.*
 "
     }
 

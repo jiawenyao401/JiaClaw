@@ -131,7 +131,8 @@
   
 - **Workspace** - 工作空间管理
   - 加载和管理 `AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`
-  - 注入工作空间内容到系统提示
+  - 每次对话重读 `MEMORY.md`（或 `[memory] path`）并注入系统提示；过大截断
+  - 工具 `memory_append` 只能写约定记忆路径（禁止穿越）
 
 #### 3. `jiaclaw-host` - 可执行宿主
 
@@ -140,6 +141,8 @@
 - **CLI 接口**
   - `jiaclaw serve` - 启动 HTTP 服务
   - `jiaclaw chat <message>` - 单次聊天
+  - `jiaclaw doctor` - 配置诊断（含 MEMORY 是否存在及大小）
+  - `jiaclaw memory show` - 显示工作区长期记忆
   - `jiaclaw version` - 版本信息
 
 - **HTTP 服务**（计划）

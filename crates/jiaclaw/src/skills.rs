@@ -85,7 +85,7 @@ impl Skill {
     /// 返回 `(frontmatter, content_without_frontmatter)`
     fn parse_frontmatter(content: &str) -> Result<(SkillFrontmatter, String), JiaClawError> {
         let trimmed = content.trim_start();
-        
+
         if !trimmed.starts_with("---") {
             return Ok((
                 SkillFrontmatter {
@@ -98,16 +98,16 @@ impl Skill {
         }
 
         let after_first_delimiter = &trimmed[3..];
-        
+
         if let Some(end_pos) = after_first_delimiter.find("\n---") {
             let yaml_content = &after_first_delimiter[..end_pos];
             let remaining_content = &after_first_delimiter[end_pos + 4..];
-            
-            let frontmatter: SkillFrontmatter = serde_yaml::from_str(yaml_content)
-                .map_err(|e| {
+
+            let frontmatter: SkillFrontmatter =
+                serde_yaml::from_str(yaml_content).map_err(|e| {
                     JiaClawError::Configuration(format!("无法解析 YAML frontmatter: {e}"))
                 })?;
-            
+
             Ok((frontmatter, remaining_content.trim().to_string()))
         } else {
             Ok((
@@ -247,7 +247,11 @@ impl SkillDiscovery {
     /// 根据用户消息自动查找应该激活的技能
     ///
     /// 返回所有触发器匹配的技能名称列表
-    pub fn auto_trigger_skills(&self, user_message: &str, discovered_skills: &[Skill]) -> Vec<String> {
+    pub fn auto_trigger_skills(
+        &self,
+        user_message: &str,
+        discovered_skills: &[Skill],
+    ) -> Vec<String> {
         if !self.auto_trigger_enabled {
             return Vec::new();
         }
@@ -264,11 +268,7 @@ impl SkillDiscovery {
                 let trigger_lower = trigger.to_lowercase();
                 if message_lower.contains(&trigger_lower) {
                     triggered.push(skill.name.clone());
-                    tracing::debug!(
-                        "技能 '{}' 由触发词 '{}' 自动激活",
-                        skill.name,
-                        trigger
-                    );
+                    tracing::debug!("技能 '{}' 由触发词 '{}' 自动激活", skill.name, trigger);
                     break;
                 }
             }
