@@ -1,0 +1,445 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "JiaClaw HTTP API",
+    "version": "0.1.0",
+    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。"
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "当前 JiaClaw 进程"
+    }
+  ],
+  "tags": [
+    { "name": "health", "description": "健康检查" },
+    { "name": "chat", "description": "聊天与会话" },
+    { "name": "catalog", "description": "工具与技能目录" },
+    { "name": "hooks", "description": "Webhook 入站" },
+    { "name": "discovery", "description": "API 发现" }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["health"],
+        "summary": "健康检查",
+        "operationId": "getHealth",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "服务可用",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chat": {
+      "post": {
+        "tags": ["chat"],
+        "summary": "发送聊天消息",
+        "operationId": "postChat",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChatRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "聊天响应",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ChatResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/sessions": {
+      "post": {
+        "tags": ["chat"],
+        "summary": "创建会话",
+        "operationId": "createSession",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "responses": {
+          "200": {
+            "description": "新会话 ID",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateSessionResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/sessions/{id}": {
+      "delete": {
+        "tags": ["chat"],
+        "summary": "删除会话",
+        "operationId": "deleteSession",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除结果（不存在时 success=false）",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeleteSessionResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/tools": {
+      "get": {
+        "tags": ["catalog"],
+        "summary": "列出已注册工具",
+        "operationId": "listTools",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "responses": {
+          "200": {
+            "description": "工具列表",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ToolsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/skills": {
+      "get": {
+        "tags": ["catalog"],
+        "summary": "列出已发现技能",
+        "operationId": "listSkills",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "responses": {
+          "200": {
+            "description": "技能列表",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SkillsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "tags": ["discovery"],
+        "summary": "OpenAPI 3 文档草图",
+        "operationId": "getOpenApi",
+        "description": "鉴权与 GET /api/tools 一致：未配置 API token 时可匿名访问；已启用 token 时需 Bearer 或 X-Api-Token。",
+        "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3 JSON",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/hooks/inbound": {
+      "post": {
+        "tags": ["hooks"],
+        "summary": "Webhook 入站",
+        "operationId": "inboundWebhook",
+        "security": [{ "webhookSecret": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InboundWebhookRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "入站处理结果",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/InboundWebhookResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Webhook secret 不匹配",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WebhookUnauthorized" }
+              }
+            }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API token。未配置 token 时不需要。"
+      },
+      "apiToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Token",
+        "description": "Bearer 的替代头。未配置 token 时不需要。"
+      },
+      "webhookSecret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Webhook-Secret",
+        "description": "Webhook 密钥。未配置 secret 时不需要。"
+      }
+    },
+    "headers": {
+      "XRequestId": {
+        "description": "请求追踪 ID。请求未携带时由服务端生成 UUID。",
+        "schema": { "type": "string" }
+      },
+      "RetryAfter": {
+        "description": "限流后建议等待秒数",
+        "schema": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "API token 缺失或不匹配",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorBody" }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "超过进程内全局限流（429）。JSON `error` 为 `rate_limit_exceeded`。",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/XRequestId" },
+          "Retry-After": { "$ref": "#/components/headers/RetryAfter" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RateLimitError" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status", "agent_name", "version"],
+        "properties": {
+          "status": { "type": "string", "example": "ok" },
+          "agent_name": { "type": "string" },
+          "version": { "type": "string" }
+        }
+      },
+      "ChatMessage": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": { "type": "string", "enum": ["user", "assistant", "system"] },
+          "content": { "type": "string" }
+        }
+      },
+      "ChatRequest": {
+        "type": "object",
+        "required": ["messages"],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ChatMessage" }
+          },
+          "enabled_tools": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "enabled_skills": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "auto_skills": { "type": "boolean", "default": true },
+          "session_id": { "type": "string", "nullable": true }
+        }
+      },
+      "ToolCall": {
+        "type": "object",
+        "properties": {
+          "tool_name": { "type": "string" },
+          "arguments": {},
+          "result": {}
+        }
+      },
+      "ChatResponse": {
+        "type": "object",
+        "properties": {
+          "message": { "$ref": "#/components/schemas/ChatMessage" },
+          "tool_calls": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ToolCall" }
+          },
+          "status": {
+            "type": "string",
+            "enum": ["running", "completed", "failed", "requires_human_input"]
+          },
+          "session_id": { "type": "string", "nullable": true }
+        }
+      },
+      "CreateSessionResponse": {
+        "type": "object",
+        "properties": {
+          "session_id": { "type": "string" }
+        }
+      },
+      "DeleteSessionResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" }
+        }
+      },
+      "ToolInfo": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      },
+      "ToolsResponse": {
+        "type": "object",
+        "properties": {
+          "tools": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ToolInfo" }
+          }
+        }
+      },
+      "SkillInfo": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "path": { "type": "string" }
+        }
+      },
+      "SkillsResponse": {
+        "type": "object",
+        "properties": {
+          "skills": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SkillInfo" }
+          }
+        }
+      },
+      "InboundWebhookRequest": {
+        "type": "object",
+        "required": ["chat_id", "text"],
+        "properties": {
+          "channel": { "type": "string", "default": "webhook" },
+          "chat_id": { "type": "string" },
+          "text": { "type": "string" },
+          "username": { "type": "string" }
+        }
+      },
+      "InboundWebhookResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "session_id": { "type": "string" },
+          "reply": { "type": "string" },
+          "message": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "WebhookUnauthorized": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "example": false },
+          "error": { "type": "string", "example": "unauthorized" }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" }
+        }
+      },
+      "RateLimitError": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string", "example": "rate_limit_exceeded" }
+        }
+      }
+    }
+  }
+}
