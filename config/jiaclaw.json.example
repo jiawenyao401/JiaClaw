@@ -28,6 +28,7 @@
       "persist_path": ".jiaclaw/sessions.json",
       "rate_limit_per_minute": null,
       "session_ttl_secs": null,
+      "metrics_public": true,
       "webhook_secret": null,
       "telegram_secret": null,
       "telegram_bot_token": null,

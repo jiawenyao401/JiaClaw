@@ -46,6 +46,9 @@ use std::{
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 
+mod metrics;
+use metrics::{classify_http_path, Metrics, PROMETHEUS_CONTENT_TYPE};
+
 /// 进程内全局（非按 IP）速率限制器，oneshot 测试无需 `ConnectInfo`。
 type GlobalRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
@@ -394,6 +397,8 @@ struct AppState {
     persist_path: Arc<PathBuf>,
     rate_limiter: Option<Arc<GlobalRateLimiter>>,
     session_ttl: Option<Duration>,
+    metrics: Arc<Metrics>,
+    metrics_require_auth: bool,
 }
 
 /// 健康检查响应
@@ -1388,18 +1393,6 @@ fn is_rate_limited_path(path: &str) -> bool {
         || path == "/hooks/discord"
 }
 
-fn rate_limited_response(retry_after_secs: u64) -> Response {
-    let mut response = (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(json!({"error": "rate_limit_exceeded"})),
-    )
-        .into_response();
-    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-        response.headers_mut().insert(header::RETRY_AFTER, value);
-    }
-    response
-}
-
 /// 全局限流中间件：返回 `Response`，不依赖 `ConnectInfo`，也不使用 `Err(StatusCode)`。
 async fn rate_limit_middleware(
     State(limiter): State<Option<Arc<GlobalRateLimiter>>>,
@@ -1424,6 +1417,31 @@ async fn rate_limit_middleware(
             rate_limited_response(retry_after_secs)
         }
     }
+}
+
+/// HTTP 请求计数：在 handler / 限流 429 之后按路由族累加。
+async fn metrics_middleware(
+    State(metrics): State<Arc<Metrics>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let family = classify_http_path(request.uri().path());
+    let method = request.method().clone();
+    let response = next.run(request).await;
+    metrics.record_http(family, method.as_str(), response.status().as_u16());
+    response
+}
+
+fn rate_limited_response(retry_after_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": "rate_limit_exceeded"})),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// 从请求头读取 `X-Request-Id`；缺失或为空则生成 UUID。
@@ -1466,8 +1484,10 @@ async fn request_id_middleware(mut request: Request, next: Next) -> Response {
 
 fn build_router(state: AppState) -> Router {
     let limiter = state.rate_limiter.clone();
+    let metrics = state.metrics.clone();
     Router::new()
         .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/api/chat", post(chat_handler))
         .route(
             "/api/sessions",
@@ -1488,6 +1508,7 @@ fn build_router(state: AppState) -> Router {
             limiter,
             rate_limit_middleware,
         ))
+        .layer(middleware::from_fn_with_state(metrics, metrics_middleware))
         // 外层：即使限流 429 也回写 X-Request-Id
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
@@ -1496,6 +1517,14 @@ fn build_router(state: AppState) -> Router {
 fn rate_limit_config_source() -> &'static str {
     if std::env::var("JIACLAW_RATE_LIMIT_PER_MINUTE").is_ok() {
         "环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE"
+    } else {
+        "配置文件"
+    }
+}
+
+fn metrics_auth_config_source() -> &'static str {
+    if std::env::var("JIACLAW_METRICS_REQUIRE_AUTH").is_ok() {
+        "环境变量 JIACLAW_METRICS_REQUIRE_AUTH"
     } else {
         "配置文件"
     }
@@ -1862,8 +1891,12 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("正在启动 JiaClaw Agent 服务");
     tracing::info!("使用 Agent 配置: {}", config.name);
 
-    // 创建 agent
-    let agent = JiaClawAgent::new(config.clone()).context("创建 JiaClawAgent 失败")?;
+    // 创建 agent 与进程内指标（工具钩子在 Arc 包装前挂上）
+    let metrics = Arc::new(Metrics::default());
+    let agent = attach_tool_metrics(
+        JiaClawAgent::new(config.clone()).context("创建 JiaClawAgent 失败")?,
+        &metrics,
+    );
 
     // 读取 API token（环境变量优先于配置文件）
     let api_token = std::env::var("JIACLAW_API_TOKEN")
@@ -1896,6 +1929,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     // 读取会话闲置 TTL（环境变量优先于配置文件）
     let session_ttl_secs = config.http.effective_session_ttl_secs();
     let session_ttl = session_ttl_secs.map(Duration::from_secs);
+    let metrics_public = config.http.effective_metrics_public();
+    let metrics_require_auth = !metrics_public;
 
     // 解析持久化路径
     let persist_path = if config.http.persist_path.starts_with('/') {
@@ -1931,6 +1966,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         persist_path: Arc::new(persist_path),
         rate_limiter,
         session_ttl,
+        metrics,
+        metrics_require_auth,
     };
 
     if state.session_ttl.is_some() {
@@ -1986,6 +2023,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     // 启动日志
     tracing::info!("✅ HTTP 服务已启动于 http://{}", config.http.bind);
     tracing::info!("   • GET    /health              - 健康检查");
+    tracing::info!("   • GET    /metrics             - Prometheus 文本指标");
     tracing::info!("   • POST   /api/chat            - 聊天端点（可选 SSE）");
     tracing::info!("   • GET    /api/sessions        - 列出会话");
     tracing::info!("   • POST   /api/sessions        - 创建会话");
@@ -2018,10 +2056,18 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • X-Request-Id                - 请求无该头则生成 UUID 并回写");
     if let Some(limit) = rate_limit_per_minute {
         tracing::info!(
-            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack、/hooks/discord；GET /health 不限流）"
+            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack、/hooks/discord；GET /health 与 GET /metrics 不限流）"
         );
     } else {
         tracing::info!("   • HTTP 限流: 未启用");
+    }
+    if metrics_public {
+        tracing::info!("   • Metrics: 公开（GET /metrics 无需 API Bearer，便于 scrape）");
+    } else {
+        tracing::info!(
+            "   • Metrics: 需 API 鉴权（与 /api/* 相同，通过 {}）",
+            metrics_auth_config_source()
+        );
     }
     if let Some(ttl) = session_ttl_secs {
         tracing::info!("   • Session TTL: 已启用（闲置 {ttl} 秒后过期）");
@@ -2173,6 +2219,15 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         );
     }
 
+    if metrics_public {
+        println!("   • Metrics: ✅ 公开（GET /metrics 无需鉴权，不计入限流）");
+    } else {
+        println!(
+            "   • Metrics: 🔒 需 API 鉴权（与 /api/* 相同，通过 {}，不计入限流）",
+            metrics_auth_config_source()
+        );
+    }
+
     if let Some(ttl) = session_ttl_secs {
         println!(
             "   • Session TTL: ✅ 已启用（闲置 {ttl} 秒，通过 {}）",
@@ -2266,6 +2321,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     }
 
     println!("\n💡 试试：curl http://{}/health", config.http.bind);
+    println!("         curl http://{}/metrics", config.http.bind);
     println!("按 Ctrl+C 停止服务\n");
 
     // 启动服务器
@@ -2304,6 +2360,13 @@ fn check_api_auth(state: &AppState, headers: &HeaderMap) -> bool {
     false
 }
 
+fn attach_tool_metrics(agent: JiaClawAgent, metrics: &Arc<Metrics>) -> JiaClawAgent {
+    let metrics = Arc::clone(metrics);
+    agent.with_tool_metrics_hook(Arc::new(move |tool, ok| {
+        metrics.record_tool_call(tool, ok);
+    }))
+}
+
 /// 健康检查处理器
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let response = HealthResponse {
@@ -2312,6 +2375,36 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     Json(response)
+}
+
+/// Prometheus 文本指标。默认公开；`metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。
+async fn metrics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    if state.metrics_require_auth && !check_api_auth(&state, &headers) {
+        tracing::warn!(
+            request_id = request_id_log_value(&headers),
+            "Metrics 鉴权失败: token 不匹配或缺失"
+        );
+        return Err(AppError::Unauthorized);
+    }
+
+    let sessions_active = state
+        .sessions
+        .lock()
+        .map(|guard| u64::try_from(guard.len()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let body = state
+        .metrics
+        .render(sessions_active, env!("CARGO_PKG_VERSION"));
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(PROMETHEUS_CONTENT_TYPE),
+        )],
+        body,
+    ))
 }
 
 /// `OpenAPI` 3 草图。鉴权与 `/api/tools` 一致：有 token 则需要鉴权。
@@ -4046,6 +4139,19 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_RATE_LIMIT_PER_MINUTE=60");
     }
 
+    let metrics_public = config.http.effective_metrics_public();
+    if metrics_public {
+        println!("   Metrics: ✅ 公开（GET /metrics 无需鉴权，不计入限流）");
+    } else {
+        println!(
+            "   Metrics: 🔒 需 API 鉴权（与 /api/* 相同，通过 {}，不计入限流）",
+            metrics_auth_config_source()
+        );
+        println!(
+            "   💡 默认公开以便 scrape；生产若暴露公网可设 [http] metrics_public = false 或 JIACLAW_METRICS_REQUIRE_AUTH=1"
+        );
+    }
+
     let session_ttl_secs = config.http.effective_session_ttl_secs();
     if let Some(ttl) = session_ttl_secs {
         println!(
@@ -4185,6 +4291,14 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         }
     );
     println!(
+        "   • Metrics: {}",
+        if metrics_public {
+            "公开（无需鉴权，不限流）"
+        } else {
+            "需 API 鉴权（不限流）"
+        }
+    );
+    println!(
         "   • Session TTL: {}",
         if let Some(ttl) = session_ttl_secs {
             format!("已启用（闲置 {ttl} 秒）")
@@ -4305,6 +4419,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
 
         build_router(state)
@@ -4391,6 +4507,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
         build_router(state)
     }
@@ -4433,6 +4551,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
         build_router(state)
     }
@@ -4460,6 +4580,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
         build_router(state)
     }
@@ -4552,6 +4674,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
         build_router(state)
     }
@@ -4629,8 +4753,35 @@ mod tests {
         rate_limit_per_minute: Option<u32>,
         session_ttl_secs: Option<u64>,
     ) -> Router {
+        create_test_app_with_metrics(
+            api_token,
+            webhook_secret,
+            rate_limit_per_minute,
+            session_ttl_secs,
+            false,
+        )
+    }
+
+    fn create_test_app_with_metrics_auth(
+        api_token: Option<String>,
+        metrics_require_auth: bool,
+    ) -> Router {
+        create_test_app_with_metrics(api_token, None, None, None, metrics_require_auth)
+    }
+
+    fn create_test_app_with_metrics(
+        api_token: Option<String>,
+        webhook_secret: Option<String>,
+        rate_limit_per_minute: Option<u32>,
+        session_ttl_secs: Option<u64>,
+        metrics_require_auth: bool,
+    ) -> Router {
         let config = AgentConfig::default();
-        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
+        let metrics = Arc::new(Metrics::default());
+        let agent = attach_tool_metrics(
+            JiaClawAgent::new(config).expect("创建测试 agent 失败"),
+            &metrics,
+        );
         let persist_path =
             std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
         let state = AppState {
@@ -4651,6 +4802,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: rate_limit_per_minute.and_then(build_rate_limiter),
             session_ttl: session_ttl_secs.map(Duration::from_secs),
+            metrics,
+            metrics_require_auth,
         };
 
         build_router(state)
@@ -4678,6 +4831,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         }
     }
 
@@ -5425,6 +5580,8 @@ mod tests {
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
             session_ttl: Some(Duration::from_secs(1)),
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
 
         {
@@ -5476,6 +5633,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         }
     }
 
@@ -5672,6 +5831,8 @@ mod tests {
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
         let app = build_router(state);
 
@@ -5983,6 +6144,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
         let app = build_router(state);
 
@@ -6040,6 +6203,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
         let app = build_router(state);
 
@@ -6098,6 +6263,8 @@ mod tests {
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
         let app = build_router(state);
 
@@ -7719,6 +7886,8 @@ mod tests {
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
             session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
         };
 
         let session_id = "test-session".to_string();
@@ -8387,8 +8556,209 @@ mod tests {
         assert!(is_rate_limited_path("/hooks/slack"));
         assert!(is_rate_limited_path("/hooks/discord"));
         assert!(!is_rate_limited_path("/health"));
+        assert!(!is_rate_limited_path("/metrics"));
         assert!(!is_rate_limited_path("/"));
         assert!(!is_rate_limited_path("/api"));
+    }
+
+    async fn body_text(response: axum::http::Response<Body>) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).expect("response body utf-8")
+    }
+
+    async fn get_metrics(app: &Router) -> (StatusCode, String, Option<String>) {
+        get_metrics_with_headers(app, &[]).await
+    }
+
+    async fn get_metrics_with_headers(
+        app: &Router,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, String, Option<String>) {
+        let mut builder = Request::builder().uri("/metrics");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
+        let body = body_text(response).await;
+        (status, body, content_type)
+    }
+
+    #[tokio::test]
+    async fn test_metrics_counts_http_requests_and_sessions() {
+        let app = create_test_app();
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let (status, body, content_type) = get_metrics(&app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some(PROMETHEUS_CONTENT_TYPE));
+        assert!(body.contains(
+            "jiaclaw_http_requests_total{path=\"health\",method=\"GET\",status=\"200\"} 2"
+        ));
+        assert!(body.contains(
+            "jiaclaw_http_requests_total{path=\"other\",method=\"POST\",status=\"200\"} 1"
+        ));
+        assert!(body.contains("jiaclaw_sessions_active 1"));
+        assert!(body.contains(&format!(
+            "jiaclaw_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(
+            !body.contains("path=\"metrics\""),
+            "当次 scrape 不应计入自身"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_records_tool_calls() {
+        let app = create_test_app();
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "列出工作空间".to_string(),
+            }],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (status, body, _) = get_metrics(&app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(
+            "jiaclaw_http_requests_total{path=\"api_chat\",method=\"POST\",status=\"200\"} 1"
+        ));
+        assert!(body.contains("jiaclaw_tool_calls_total{tool=\"workspace_list\",result=\"ok\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_public_even_when_api_token_set() {
+        let app = create_test_app_with_auth(Some("test-token-123".to_string()), None);
+        let (status, body, content_type) = get_metrics(&app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some(PROMETHEUS_CONTENT_TYPE));
+        assert!(body.contains("jiaclaw_build_info"));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_requires_auth_when_configured() {
+        let app = create_test_app_with_metrics_auth(Some("test-token-123".to_string()), true);
+
+        let (status, body, _) = get_metrics(&app).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("Unauthorized"));
+
+        let (status, body, content_type) =
+            get_metrics_with_headers(&app, &[("authorization", "Bearer test-token-123")]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some(PROMETHEUS_CONTENT_TYPE));
+        assert!(body.contains("jiaclaw_build_info"));
+
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_is_not_rate_limited() {
+        let app = create_test_app_with_rate_limit(1);
+
+        let limited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::OK);
+
+        let limited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        for _ in 0..3 {
+            let (status, _, _) = get_metrics(&app).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
     }
 
     fn request_id_header(response: &axum::http::Response<Body>) -> String {
@@ -8535,6 +8905,7 @@ mod tests {
         let paths = spec["paths"].as_object().expect("应包含 paths");
         for required in [
             "/health",
+            "/metrics",
             "/api/chat",
             "/api/sessions",
             "/api/sessions/{id}",

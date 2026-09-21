@@ -62,7 +62,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 自动处理文件损坏情况
 - ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*`、`/hooks/inbound`、`/hooks/telegram`、`/hooks/slack` 与 `/hooks/discord`
   - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
-  - 超限返回 429 + `Retry-After`；`GET /health` 始终不限流
+  - 超限返回 429 + `Retry-After`；`GET /health` 与 `GET /metrics` 始终不限流
+- ✅ **可选 GET /metrics** - 进程内 Prometheus 文本（不引入 telemetry SDK）
+  - 默认无需 API Bearer（便于 scrape）；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权
+  - 计数：`jiaclaw_http_requests_total{path,method,status}`（路由族）、`jiaclaw_sessions_active`、`jiaclaw_tool_calls_total{tool,result}`、`jiaclaw_build_info{version}`
 - ✅ **可选 Session TTL** - 闲置超时自动清理内存会话（长时间 `serve` 防堆积）
   - 配置 `session_ttl_secs` 或环境变量 `JIACLAW_SESSION_TTL_SECS`（正整数才启用；`0`/非法=关闭）
   - create/chat/get/list 触达刷新；过期后 list 不返回，GET/DELETE 与不存在一致（404）
@@ -223,8 +226,11 @@ persist_path = ".jiaclaw/sessions.json"
 
 # HTTP 限流（可选，环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE 优先）
 # 正整数：对 /api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack、/hooks/discord 做进程内全局限流（次/分钟）
-# 未设置或 0：不限流。GET /health 始终不限流；超限返回 429 + Retry-After。
+# 未设置或 0：不限流。GET /health 与 GET /metrics 始终不限流；超限返回 429 + Retry-After。
 # rate_limit_per_minute = 60
+
+# GET /metrics 是否公开（默认 true）。false 或 JIACLAW_METRICS_REQUIRE_AUTH=1 时与 /api/* 相同鉴权
+# metrics_public = true
 
 # Session 闲置 TTL（可选，环境变量 JIACLAW_SESSION_TTL_SECS 优先）
 # 正整数：闲置超过该秒数后从内存 store 删除（落盘开启时同步 save）
@@ -286,6 +292,8 @@ enabled = true
 export JIACLAW_API_KEY=brk_live_your_key_here
 # 可选：HTTP 限流（次/分钟，优先于配置文件）
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
+# 可选：GET /metrics 要求与 /api/* 相同鉴权（优先于 [http] metrics_public）
+# export JIACLAW_METRICS_REQUIRE_AUTH=1
 # 可选：Session 闲置 TTL（秒，优先于配置文件）
 # export JIACLAW_SESSION_TTL_SECS=3600
 # 可选：接近消息上限时摘要压缩（1/true 强制开启，优先于 [session] summarize_on_overflow）
@@ -372,6 +380,9 @@ cargo run --bin jiaclaw -- chat
 curl -D - http://127.0.0.1:8080/health
 # 响应含 X-Request-Id；也可自行传入：
 # curl -D - -H "X-Request-Id: my-trace-id" http://127.0.0.1:8080/health
+
+# Prometheus 文本指标（默认无需 Bearer；metrics_public=false 或 JIACLAW_METRICS_REQUIRE_AUTH=1 时需鉴权）
+curl -D - http://127.0.0.1:8080/metrics
 
 # OpenAPI 3 草图（未配置 API token 时可匿名访问；已启用 token 时需 Bearer，与 /api/tools 一致）
 curl http://127.0.0.1:8080/api/openapi.json
@@ -490,7 +501,8 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 使用 Brokerrouter 需要有效的虚拟密钥（`brk_live_...`）
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
-- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
+- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 超限返回 `429` + `Retry-After`；`GET /health` 与 `GET /metrics` 不限流
+- 可选 Prometheus 指标：`GET /metrics` 默认公开；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。进程内计数（HTTP 路由族、session 数、工具调用、build_info），不引入 telemetry SDK
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET 为 404
 - 可选 Session 摘要压缩：设置 `[session] summarize_on_overflow = true` 或 `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` 后，接近上限时把旧消息折叠为一条 `[session-summary]` system 消息并保留最近 `keep_recent`（默认 10）条；未开启则仍硬截断。摘要失败会 warn 并回退截断，chat 不失败
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
@@ -592,7 +604,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Automatic handling of corrupted files
 - ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord`
   - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
-  - Over-limit returns 429 + `Retry-After`; `GET /health` is never limited
+  - Over-limit returns 429 + `Retry-After`; `GET /health` and `GET /metrics` are never limited
+- ✅ **Optional GET /metrics** - in-process Prometheus text (no telemetry SDK)
+  - Public by default for scraping; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`
+  - Series: `jiaclaw_http_requests_total{path,method,status}` (route family), `jiaclaw_sessions_active`, `jiaclaw_tool_calls_total{tool,result}`, `jiaclaw_build_info{version}`
 - ✅ **Optional Session TTL** - idle sessions are expired to avoid unbounded memory growth during long `serve`
   - Configure `session_ttl_secs` or `JIACLAW_SESSION_TTL_SECS` (positive integer enables; `0`/invalid disables)
   - create/chat/get/list refresh last access; expired ids are omitted from list and GET/DELETE match not-found (404)
@@ -753,8 +768,11 @@ persist_path = ".jiaclaw/sessions.json"
 
 # Optional HTTP rate limit (JIACLAW_RATE_LIMIT_PER_MINUTE env var takes priority)
 # Positive integer: process-wide limit for /api/* and /hooks/inbound, /hooks/telegram, /hooks/slack, /hooks/discord (requests/minute)
-# Unset or 0: disabled. GET /health is never limited; over-limit returns 429 + Retry-After.
+# Unset or 0: disabled. GET /health and GET /metrics are never limited; over-limit returns 429 + Retry-After.
 # rate_limit_per_minute = 60
+
+# Whether GET /metrics is public (default true). false or JIACLAW_METRICS_REQUIRE_AUTH=1 uses the same auth as /api/*
+# metrics_public = true
 
 # Optional session idle TTL (JIACLAW_SESSION_TTL_SECS env var takes priority)
 # Positive integer: expire idle sessions after this many seconds (saved to disk when persist is on)
@@ -815,6 +833,8 @@ Or use environment variable:
 export JIACLAW_API_KEY=brk_live_your_key_here
 # Optional: HTTP rate limit (requests/minute, overrides config file)
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
+# Optional: require /api/* auth for GET /metrics (overrides [http] metrics_public)
+# export JIACLAW_METRICS_REQUIRE_AUTH=1
 # Optional: session idle TTL in seconds (overrides config file)
 # export JIACLAW_SESSION_TTL_SECS=3600
 # Optional: summarize older session messages near the cap (1/true force-enables)
@@ -895,6 +915,9 @@ cargo run --bin jiaclaw -- chat
 curl -D - http://127.0.0.1:8080/health
 # Response includes X-Request-Id; you may also send your own:
 # curl -D - -H "X-Request-Id: my-trace-id" http://127.0.0.1:8080/health
+
+# Prometheus text metrics (public by default; auth required when metrics_public=false or JIACLAW_METRICS_REQUIRE_AUTH=1)
+curl -D - http://127.0.0.1:8080/metrics
 
 # OpenAPI 3 sketch (anonymous when no API token; Bearer required when token is enabled, same as /api/tools)
 curl http://127.0.0.1:8080/api/openapi.json
@@ -1007,7 +1030,8 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Brokerrouter requires a valid virtual key (`brk_live_...`)
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
-- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
+- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` return `429` + `Retry-After` when exceeded; `GET /health` and `GET /metrics` are never limited
+- Optional Prometheus metrics: `GET /metrics` is public by default; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`. In-process counters (HTTP route family, session gauge, tool calls, build_info); no telemetry SDK
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET of an expired id returns 404
 - Optional session summary compression: set `[session] summarize_on_overflow = true` or `JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1` to fold older messages into one `[session-summary]` system message while keeping the latest `keep_recent` (default 10); unset keeps hard truncation. Summary failure warns and falls back; chat still succeeds
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
