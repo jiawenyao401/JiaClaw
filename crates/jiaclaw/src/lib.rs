@@ -10,11 +10,11 @@
 //! - 持久化运行（支持重启后恢复）
 
 pub use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, DeleteFileToolConfig, GrepToolConfig,
-    HeartbeatConfig, HttpConfig, IdentityConfig, JiaClawError, ListDirToolConfig, MemoryConfig,
-    MemorySearchToolConfig, MemoryWriteToolConfig, MessageRole, ProviderConfig, ReadFileToolConfig,
-    RunStatus, SessionConfig, StrReplaceToolConfig, ToolCall, ToolsConfig, WebFetchToolConfig,
-    WebSearchToolConfig, WriteFileToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, DeleteFileToolConfig, GlobToolConfig,
+    GrepToolConfig, HeartbeatConfig, HttpConfig, IdentityConfig, JiaClawError, ListDirToolConfig,
+    MemoryConfig, MemorySearchToolConfig, MemoryWriteToolConfig, MessageRole, ProviderConfig,
+    ReadFileToolConfig, RunStatus, SessionConfig, StrReplaceToolConfig, ToolCall, ToolsConfig,
+    WebFetchToolConfig, WebSearchToolConfig, WriteFileToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
     DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_MAX_BODY_BYTES,
     DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
     DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
@@ -32,14 +32,16 @@ mod tools;
 mod workspace;
 
 pub use files::{
-    clamp_grep_max_matches, clamp_list_dir_max_entries, delete_workspace_regular_file,
-    glob_matches, grep_workspace, list_workspace_dir, parse_delete_file_args, parse_grep_args,
+    clamp_glob_max_results, clamp_grep_max_matches, clamp_list_dir_max_entries,
+    delete_workspace_regular_file, glob_matches, glob_workspace, grep_workspace,
+    list_workspace_dir, parse_delete_file_args, parse_glob_args, parse_grep_args,
     parse_list_dir_args, parse_read_file_args, parse_str_replace_args, parse_write_file_args,
     read_workspace_file, str_replace_workspace_file, write_workspace_regular_file, DeleteFileArgs,
-    DeleteFileOutput, DirEntryInfo, GrepArgs, GrepMatch, GrepOutput, ListDirArgs, ListDirOutput,
-    ReadFileArgs, ReadFileOutput, StrReplaceArgs, StrReplaceOutput, WorkspaceDeleteFileTool,
-    WorkspaceGrepTool, WorkspaceListDirTool, WorkspaceReadFileTool, WorkspaceStrReplaceTool,
-    WorkspaceWriteFileTool, WriteFileArgs, WriteFileMode, WriteFileOutput,
+    DeleteFileOutput, DirEntryInfo, GlobArgs, GlobOutput, GrepArgs, GrepMatch, GrepOutput,
+    ListDirArgs, ListDirOutput, ReadFileArgs, ReadFileOutput, StrReplaceArgs, StrReplaceOutput,
+    WorkspaceDeleteFileTool, WorkspaceGlobTool, WorkspaceGrepTool, WorkspaceListDirTool,
+    WorkspaceReadFileTool, WorkspaceStrReplaceTool, WorkspaceWriteFileTool, WriteFileArgs,
+    WriteFileMode, WriteFileOutput, GLOB_DEFAULT_MAX_RESULTS, GLOB_MAX_RESULTS,
     GREP_DEFAULT_MAX_MATCHES, GREP_FILE_MAX_BYTES, GREP_MAX_MATCHES, LIST_DIR_DEFAULT_MAX_ENTRIES,
     LIST_DIR_MAX_ENTRIES, READ_FILE_MAX_BYTES, STR_REPLACE_MAX_BYTES, WRITE_FILE_MAX_BYTES,
 };
@@ -184,6 +186,9 @@ impl JiaClawAgent {
         }
         if config.tools.grep.enabled {
             tools.register(Box::new(WorkspaceGrepTool::new(&config.workspace_path)));
+        }
+        if config.tools.glob.enabled {
+            tools.register(Box::new(WorkspaceGlobTool::new(&config.workspace_path)));
         }
         tools.register(Box::new(IdentityWriteTool::soul(
             &config.workspace_path,
@@ -1870,6 +1875,81 @@ mod tests {
             .execute(&ToolCall {
                 tool_name: "grep".to_string(),
                 arguments: serde_json::json!({"pattern": "foo"}),
+                result: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("工具不存在"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn glob_is_registered_by_default() {
+        let agent = JiaClawAgent::new(AgentConfig::default()).unwrap();
+        assert!(
+            agent.tools().get("glob").is_some(),
+            "glob should be in the default tool list"
+        );
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            prompt.contains("glob"),
+            "system prompt should describe glob"
+        );
+        assert!(
+            prompt.contains("glob 模式") || prompt.contains("**/*"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn glob_is_not_registered_when_disabled() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                glob: GlobToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        assert!(agent.tools().get("glob").is_none());
+        assert!(agent.tools().get("grep").is_some());
+        assert!(agent.tools().get("read_file").is_some());
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            !prompt.contains("### glob"),
+            "disabled glob must not appear in tool docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_execute_when_unregistered_returns_missing_tool() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                glob: GlobToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let err = agent
+            .tools()
+            .execute(&ToolCall {
+                tool_name: "glob".to_string(),
+                arguments: serde_json::json!({"pattern": "**/*.rs"}),
                 result: None,
             })
             .await

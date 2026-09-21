@@ -1,7 +1,7 @@
 // Copyright 2026 JiaClaw contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` / `grep`。
+//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` / `grep` / `glob`。
 //!
 //! 路径解析复用 [`crate::memory::resolve_workspace_relative_path`]（禁 `..`、绝对路径、symlink 逃逸）。
 //! 不调用 LLM，不执行 shell。
@@ -48,6 +48,18 @@ pub const GREP_PATTERN_MAX_BYTES: usize = 512;
 
 /// `grep` `glob` 模式最大字节数
 pub const GREP_GLOB_MAX_BYTES: usize = 128;
+
+/// `glob` 的 `max_results` 缺省值
+pub const GLOB_DEFAULT_MAX_RESULTS: usize = 100;
+
+/// `glob` 的 `max_results` 上限（含）
+pub const GLOB_MAX_RESULTS: usize = 500;
+
+/// `glob` 一次扫描的最大常规文件数（含 pattern 未命中的文件）
+pub const GLOB_MAX_FILES_SCANNED: usize = 2000;
+
+/// `glob` `pattern` 最大字节数
+pub const GLOB_PATTERN_MAX_BYTES: usize = 256;
 
 /// `list_dir` 的 `max_entries` 缺省值
 pub const LIST_DIR_DEFAULT_MAX_ENTRIES: usize = 200;
@@ -165,6 +177,17 @@ pub struct GrepArgs {
     pub max_matches: usize,
 }
 
+/// 解析后的 `glob` 参数。`pattern` 为 glob 模式（如 `**/*.rs`），不是正则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobArgs {
+    /// glob 模式（必填，非空）
+    pub pattern: String,
+    /// 工作区相对搜索根（缺省 `.`）
+    pub path: String,
+    /// 最多返回的文件路径数（钳制 1..=500）
+    pub max_results: usize,
+}
+
 /// 将 `max_entries` 钳制到 `1..=1000`。
 #[must_use]
 pub fn clamp_list_dir_max_entries(raw: u64) -> usize {
@@ -179,6 +202,14 @@ pub fn clamp_grep_max_matches(raw: u64) -> usize {
     usize::try_from(raw)
         .unwrap_or(GREP_MAX_MATCHES)
         .clamp(1, GREP_MAX_MATCHES)
+}
+
+/// 将 `max_results` 钳制到 `1..=500`。
+#[must_use]
+pub fn clamp_glob_max_results(raw: u64) -> usize {
+    usize::try_from(raw)
+        .unwrap_or(GLOB_MAX_RESULTS)
+        .clamp(1, GLOB_MAX_RESULTS)
 }
 
 fn parse_positive_usize(value: &Value, name: &str) -> Result<usize, JiaClawError> {
@@ -519,6 +550,80 @@ pub fn parse_grep_args(args: &Value) -> Result<GrepArgs, JiaClawError> {
         glob,
         case_insensitive,
         max_matches,
+    })
+}
+
+/// 解析 `glob` 参数：必填 `pattern`（glob 模式）；可选 `path`（默认 `.`）、`max_results`（默认 100）。
+///
+/// # Errors
+///
+/// `pattern` 缺失/为空/过长，`path` 不是字符串，或 `max_results` 不是整数时返回错误。
+pub fn parse_glob_args(args: &Value) -> Result<GlobArgs, JiaClawError> {
+    let pattern = match args.get("pattern") {
+        Some(Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(JiaClawError::ToolExecution(
+                    "参数 'pattern' 不能为空".to_string(),
+                ));
+            }
+            trimmed.to_string()
+        }
+        None | Some(Value::Null) => {
+            return Err(JiaClawError::ToolExecution(
+                "缺少参数 'pattern'（glob 模式，如 **/*.rs）".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'pattern' 必须是字符串".to_string(),
+            ));
+        }
+    };
+    if pattern.len() > GLOB_PATTERN_MAX_BYTES {
+        return Err(JiaClawError::ToolExecution(format!(
+            "参数 'pattern' 超过上限 {GLOB_PATTERN_MAX_BYTES} 字节"
+        )));
+    }
+
+    let path = match args.get("path") {
+        None | Some(Value::Null) => ".".to_string(),
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                JiaClawError::ToolExecution(
+                    "参数 'path' 必须是字符串（工作区相对搜索根，默认 .）".to_string(),
+                )
+            })?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                ".".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+    };
+
+    let max_results = match args.get("max_results") {
+        None | Some(Value::Null) => GLOB_DEFAULT_MAX_RESULTS,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()));
+            match raw {
+                Some(n) => clamp_glob_max_results(n),
+                None => {
+                    return Err(JiaClawError::ToolExecution(
+                        "参数 'max_results' 必须是整数（将钳制到 1..=500）".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+
+    Ok(GlobArgs {
+        pattern,
+        path,
+        max_results,
     })
 }
 
@@ -1211,6 +1316,143 @@ pub fn grep_workspace(
     })
 }
 
+fn glob_one_regular_file(rel_path: &str, pattern: &str, out: &mut Vec<String>) -> bool {
+    if !glob_matches(pattern, rel_path) {
+        return false;
+    }
+    if out.len() >= GLOB_MAX_RESULTS {
+        return true;
+    }
+    out.push(rel_path.to_string());
+    false
+}
+
+fn walk_glob_dir(
+    dir: &Path,
+    rel_prefix: &str,
+    pattern: &str,
+    files_scanned: &mut usize,
+    out: &mut Vec<String>,
+) -> Result<bool, JiaClawError> {
+    if *files_scanned >= GLOB_MAX_FILES_SCANNED {
+        return Ok(true);
+    }
+
+    let mut children: Vec<(String, PathBuf, fs::Metadata)> = Vec::new();
+    let iter = fs::read_dir(dir)
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法读取目录 {}: {e}", dir.display())))?;
+    for entry in iter {
+        let entry =
+            entry.map_err(|e| JiaClawError::ToolExecution(format!("无法读取目录条目: {e}")))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "." || name == ".." || name == ".git" {
+            continue;
+        }
+        let child_path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&child_path) else {
+            continue;
+        };
+        children.push((name.into_owned(), child_path, meta));
+    }
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut truncated = false;
+    for (name, child_path, meta) in children {
+        if *files_scanned >= GLOB_MAX_FILES_SCANNED {
+            truncated = true;
+            break;
+        }
+        let rel_name = join_rel(rel_prefix, &name);
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if walk_glob_dir(&child_path, &rel_name, pattern, files_scanned, out)? {
+                truncated = true;
+                break;
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        *files_scanned += 1;
+        if glob_one_regular_file(&rel_name, pattern, out) {
+            truncated = true;
+            break;
+        }
+    }
+    Ok(truncated)
+}
+
+/// 按 glob 模式列出工作区内匹配的**常规文件**路径（不含目录）。
+///
+/// `path` 可为相对目录或文件（默认 `.`）。目录默认递归；不跟随 symlink。
+/// 结果按路径排序；超过 `max_results` 或扫描上限时截断并设置 `truncated`。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、symlink 逃逸、目标不存在，或无法读取搜索根时返回错误。
+pub fn glob_workspace(workspace: &Path, args: &GlobArgs) -> Result<GlobOutput, JiaClawError> {
+    let path = resolve_workspace_relative_path(workspace, &args.path)?;
+    if !path.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不存在: {}",
+            args.path
+        )));
+    }
+    ensure_existing_within_workspace(workspace, &path)?;
+
+    let canon = path
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析路径 {}: {e}", args.path)))?;
+    let ws = canonicalize_existing_or_clone(workspace);
+    if !canon.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 路径 {} 指向工作空间外部",
+            args.path
+        )));
+    }
+
+    let mut matches = Vec::new();
+    let mut files_scanned = 0;
+    let scan_truncated = if canon.is_file() {
+        let rel = workspace_rel_display(&ws, &canon);
+        glob_one_regular_file(&rel, &args.pattern, &mut matches)
+    } else if canon.is_dir() {
+        let rel = workspace_rel_display(&ws, &canon);
+        walk_glob_dir(
+            &canon,
+            &rel,
+            &args.pattern,
+            &mut files_scanned,
+            &mut matches,
+        )?
+    } else {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不是文件或目录: {}",
+            args.path
+        )));
+    };
+
+    matches.sort();
+    let truncated = scan_truncated || matches.len() > args.max_results;
+    if matches.len() > args.max_results {
+        matches.truncate(args.max_results);
+    }
+
+    Ok(GlobOutput {
+        pattern: args.pattern.clone(),
+        path: args.path.clone(),
+        max_results: args.max_results,
+        truncated,
+        match_count: matches.len(),
+        matches,
+    })
+}
+
 fn slice_lines(content: &str, offset: usize, limit: Option<usize>) -> (String, usize, usize, bool) {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -1504,6 +1746,23 @@ pub struct GrepOutput {
     pub match_count: usize,
     /// 匹配列表
     pub matches: Vec<GrepMatch>,
+}
+
+/// `glob` 的 JSON 返回体。只含常规文件路径（不含目录）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobOutput {
+    /// glob 模式
+    pub pattern: String,
+    /// 调用方传入的工作区相对搜索根
+    pub path: String,
+    /// 生效的结果上限
+    pub max_results: usize,
+    /// 是否因 `max_results` 或扫描文件数上限截断
+    pub truncated: bool,
+    /// 本次返回的路径条数
+    pub match_count: usize,
+    /// 工作区相对路径（已排序）
+    pub matches: Vec<String>,
 }
 
 /// `read_file` 工具：读取工作区相对路径下的文本文件（路径沙箱，不调用 LLM）。
@@ -1913,6 +2172,63 @@ impl Tool for WorkspaceGrepTool {
         let output = grep_workspace(&self.workspace_path, &parsed, self.file_max_bytes)?;
         serde_json::to_string_pretty(&output)
             .map_err(|e| JiaClawError::ToolExecution(format!("序列化搜索结果失败: {e}")))
+    }
+}
+
+/// `glob` 工具：按 glob 模式列出工作区内匹配的常规文件（路径沙箱，不调用 LLM）。
+pub struct WorkspaceGlobTool {
+    workspace_path: PathBuf,
+}
+
+impl WorkspaceGlobTool {
+    /// 创建工具。
+    #[must_use]
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WorkspaceGlobTool {
+    fn name(&self) -> &str {
+        "glob"
+    }
+
+    fn description(&self) -> &str {
+        "按 glob 模式列出工作区内匹配的常规文件路径（不含目录）。pattern 必填（如 **/*.rs、src/**/*.toml）；可选 path（相对搜索根，默认 .）、max_results（默认 100，钳制 1..=500）。结果按路径排序；超限截断并注明 truncated。禁止 .. / 绝对路径 / symlink 逃逸。不跟随 symlink。不执行 shell，不调用 LLM。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "glob 模式（必填，如 **/*.rs；不含 / 时匹配文件名）"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "相对搜索根（相对于工作区根，默认 .）",
+                    "default": "."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "最多返回的文件路径数（默认 100，钳制 1..=500）",
+                    "default": 100
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let parsed = parse_glob_args(&args)?;
+        let output = glob_workspace(&self.workspace_path, &parsed)?;
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化 glob 结果失败: {e}")))
     }
 }
 
@@ -3027,6 +3343,280 @@ mod tests {
             .execute(serde_json::json!({
                 "pattern": "x",
                 "path": "no-such.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不存在"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn clamp_glob_max_results_bounds() {
+        assert_eq!(clamp_glob_max_results(0), 1);
+        assert_eq!(clamp_glob_max_results(100), 100);
+        assert_eq!(clamp_glob_max_results(500), 500);
+        assert_eq!(clamp_glob_max_results(501), 500);
+    }
+
+    #[test]
+    fn parse_glob_args_requires_pattern_and_defaults() {
+        let err = parse_glob_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pattern"), "{err}");
+
+        let err = parse_glob_args(&serde_json::json!({"pattern": ""}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pattern"), "{err}");
+
+        let err = parse_glob_args(&serde_json::json!({"pattern": "   "}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pattern"), "{err}");
+
+        let parsed = parse_glob_args(&serde_json::json!({"pattern": "**/*.rs"})).unwrap();
+        assert_eq!(parsed.pattern, "**/*.rs");
+        assert_eq!(parsed.path, ".");
+        assert_eq!(parsed.max_results, GLOB_DEFAULT_MAX_RESULTS);
+
+        let parsed = parse_glob_args(&serde_json::json!({
+            "pattern": " src/**/*.toml ",
+            "path": " crates ",
+            "max_results": 0
+        }))
+        .unwrap();
+        assert_eq!(parsed.pattern, "src/**/*.toml");
+        assert_eq!(parsed.path, "crates");
+        assert_eq!(parsed.max_results, 1);
+
+        let parsed = parse_glob_args(&serde_json::json!({
+            "pattern": "*.md",
+            "max_results": 9999
+        }))
+        .unwrap();
+        assert_eq!(parsed.max_results, GLOB_MAX_RESULTS);
+
+        let err = parse_glob_args(&serde_json::json!({
+            "pattern": "*.rs",
+            "max_results": "many"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_results"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn glob_lists_files_sorted_and_skips_directories() {
+        let ws = unique_temp("jiaclaw_glob_ok");
+        fs::write(ws.join("MEMORY.md"), "mem").unwrap();
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::write(ws.join("src").join("lib.rs"), "fn x() {}").unwrap();
+        fs::write(ws.join("src").join("main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(ws.join("src").join("nested")).unwrap();
+        fs::write(ws.join("src").join("nested").join("mod.rs"), "").unwrap();
+        fs::write(ws.join("Cargo.toml"), "[package]").unwrap();
+        let tool = WorkspaceGlobTool::new(&ws);
+        assert_eq!(tool.name(), "glob");
+
+        let result = tool
+            .execute(serde_json::json!({"pattern": "**/*.rs"}))
+            .await
+            .unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.match_count, 3);
+        assert!(!parsed.truncated);
+        assert_eq!(
+            parsed.matches,
+            vec![
+                "src/lib.rs".to_string(),
+                "src/main.rs".to_string(),
+                "src/nested/mod.rs".to_string()
+            ]
+        );
+
+        let toml = tool
+            .execute(serde_json::json!({"pattern": "src/**/*.toml"}))
+            .await
+            .unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&toml).unwrap();
+        assert_eq!(parsed.match_count, 0);
+
+        let by_name = tool
+            .execute(serde_json::json!({"pattern": "*.md"}))
+            .await
+            .unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&by_name).unwrap();
+        assert_eq!(parsed.matches, vec!["MEMORY.md".to_string()]);
+        assert!(
+            parsed.matches.iter().all(|p| !p.ends_with('/')),
+            "不得返回目录: {parsed:?}"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn glob_respects_path_and_truncates_max_results() {
+        let ws = unique_temp("jiaclaw_glob_filters");
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::create_dir_all(ws.join("notes")).unwrap();
+        fs::write(ws.join("src").join("a.rs"), "a").unwrap();
+        fs::write(ws.join("src").join("b.rs"), "b").unwrap();
+        fs::write(ws.join("notes").join("c.rs"), "c").unwrap();
+        let tool = WorkspaceGlobTool::new(&ws);
+
+        let scoped = tool
+            .execute(serde_json::json!({
+                "pattern": "*.rs",
+                "path": "src"
+            }))
+            .await
+            .unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&scoped).unwrap();
+        assert_eq!(parsed.match_count, 2);
+        assert_eq!(
+            parsed.matches,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+
+        let limited = tool
+            .execute(serde_json::json!({
+                "pattern": "**/*.rs",
+                "max_results": 1
+            }))
+            .await
+            .unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&limited).unwrap();
+        assert_eq!(parsed.match_count, 1);
+        assert!(parsed.truncated);
+        assert_eq!(parsed.matches[0], "notes/c.rs");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn glob_single_file_and_filename_pattern() {
+        let ws = unique_temp("jiaclaw_glob_file");
+        fs::write(ws.join("notes.md"), "x").unwrap();
+        fs::write(ws.join("skip.rs"), "y").unwrap();
+        let tool = WorkspaceGlobTool::new(&ws);
+
+        let hit = tool
+            .execute(serde_json::json!({
+                "pattern": "*.md",
+                "path": "notes.md"
+            }))
+            .await
+            .unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&hit).unwrap();
+        assert_eq!(parsed.matches, vec!["notes.md".to_string()]);
+
+        let miss = tool
+            .execute(serde_json::json!({
+                "pattern": "*.rs",
+                "path": "notes.md"
+            }))
+            .await
+            .unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&miss).unwrap();
+        assert_eq!(parsed.match_count, 0);
+        assert!(parsed.matches.is_empty());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn glob_rejects_traversal_and_absolute() {
+        let ws = unique_temp("jiaclaw_glob_trav");
+        fs::write(ws.join("ok.md"), "inside").unwrap();
+        let tool = WorkspaceGlobTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({
+                "pattern": "*.md",
+                "path": "../secret.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+
+        let err = tool
+            .execute(serde_json::json!({
+                "pattern": "*",
+                "path": "/etc"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_rejects_symlink_escape_and_skips_symlink_files() {
+        let ws = unique_temp("jiaclaw_glob_symlink");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_glob_outside_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret-outside").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("leak.md")).unwrap();
+        fs::write(ws.join("ok.md"), "inside").unwrap();
+
+        let tool = WorkspaceGlobTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "*.md",
+                "path": "leak.md"
+            }))
+            .await;
+        assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("安全") || err.contains("工作空间"), "{err}");
+
+        let tree = tool
+            .execute(serde_json::json!({"pattern": "*.md"}))
+            .await
+            .unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&tree).unwrap();
+        assert_eq!(parsed.matches, vec!["ok.md".to_string()]);
+        assert!(
+            parsed.matches.iter().all(|p| p != "leak.md"),
+            "不得跟随逃逸 symlink 文件: {parsed:?}"
+        );
+
+        let outside_dir = ws.parent().unwrap().join(format!(
+            "jiaclaw_glob_outside_dir_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("secret.txt"), "nope").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, ws.join("escape")).unwrap();
+        let dir_result = tool
+            .execute(serde_json::json!({
+                "pattern": "**/*",
+                "path": "escape"
+            }))
+            .await;
+        assert!(
+            dir_result.is_err(),
+            "symlink 目录逃逸应被拒绝: {dir_result:?}"
+        );
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn glob_missing_path_is_explicit_error() {
+        let ws = unique_temp("jiaclaw_glob_missing");
+        let tool = WorkspaceGlobTool::new(&ws);
+        let err = tool
+            .execute(serde_json::json!({
+                "pattern": "*.md",
+                "path": "no-such"
             }))
             .await
             .unwrap_err()
