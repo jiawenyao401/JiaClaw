@@ -38,6 +38,9 @@ type GlobalRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 /// 请求追踪头。大小写不敏感，响应回写同名头。
 const X_REQUEST_ID: &str = "x-request-id";
 
+/// Telegram Bot API webhook `secret_token` 请求头（官方名称，大小写不敏感）。
+const X_TELEGRAM_BOT_API_SECRET_TOKEN: &str = "X-Telegram-Bot-Api-Secret-Token";
+
 /// 手写 `OpenAPI` 3 草图（不引入代码生成）。
 const OPENAPI_JSON: &str = include_str!("openapi.json");
 
@@ -297,6 +300,7 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
     api_token: Option<String>,
     webhook_secret: Option<String>,
+    telegram_secret: Option<String>,
     persist_enabled: bool,
     persist_path: Arc<PathBuf>,
     rate_limiter: Option<Arc<GlobalRateLimiter>>,
@@ -326,12 +330,77 @@ fn default_channel() -> String {
     "webhook".to_string()
 }
 
+/// Telegram Bot API `Update` 的最小子集（手写 serde，不引入 Bot SDK）。
+#[derive(Debug, Deserialize)]
+struct TelegramUpdate {
+    #[serde(default)]
+    message: Option<TelegramMessage>,
+    #[serde(default)]
+    edited_message: Option<TelegramMessage>,
+}
+
+/// Telegram `Message` 最小子集：只要 `chat.id` 与可选 `text`。
+#[derive(Debug, Deserialize)]
+struct TelegramMessage {
+    chat: TelegramChat,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// Telegram `Chat` 最小子集。
+#[derive(Debug, Deserialize)]
+struct TelegramChat {
+    id: TelegramChatId,
+}
+
+/// Bot API 的 `chat.id` 一般为整数，测试/代理也可能给字符串。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TelegramChatId {
+    Int(i64),
+    Str(String),
+}
+
+impl std::fmt::Display for TelegramChatId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int(id) => write!(f, "{id}"),
+            Self::Str(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// 从 Update 取出可入站的 `(chat.id, text)`；无文本则 `None`。
+fn telegram_inbound_text(update: &TelegramUpdate) -> Option<(String, String)> {
+    let msg = update.message.as_ref().or(update.edited_message.as_ref())?;
+    let text = msg
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some((msg.chat.id.to_string(), text.to_string()))
+}
+
+/// Telegram 入站响应：有文本时同步回传 assistant 文本，便于长轮询调试。
+#[derive(Debug, Serialize, Deserialize)]
+struct TelegramInboundResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
 fn build_rate_limiter(per_minute: u32) -> Option<Arc<GlobalRateLimiter>> {
     NonZeroU32::new(per_minute).map(|nz| Arc::new(RateLimiter::direct(Quota::per_minute(nz))))
 }
 
 fn is_rate_limited_path(path: &str) -> bool {
-    path.starts_with("/api/") || path == "/hooks/inbound"
+    path.starts_with("/api/") || path == "/hooks/inbound" || path == "/hooks/telegram"
 }
 
 fn rate_limited_response(retry_after_secs: u64) -> Response {
@@ -427,6 +496,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/skills", get(skills_handler))
         .route("/api/openapi.json", get(openapi_handler))
         .route("/hooks/inbound", post(hooks_inbound_handler))
+        .route("/hooks/telegram", post(hooks_telegram_handler))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
@@ -573,6 +643,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         .ok()
         .or(config.http.webhook_secret.clone());
 
+    // 读取 Telegram secret token（环境变量优先于配置文件）
+    let telegram_secret = std::env::var("JIACLAW_TELEGRAM_SECRET")
+        .ok()
+        .or(config.http.telegram_secret.clone());
+
     // 读取限流配置（环境变量优先于配置文件）
     let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
     let rate_limiter = rate_limit_per_minute.and_then(build_rate_limiter);
@@ -602,6 +677,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         sessions: Arc::new(Mutex::new(sessions)),
         api_token: api_token.clone(),
         webhook_secret: webhook_secret.clone(),
+        telegram_secret: telegram_secret.clone(),
         persist_enabled: config.http.persist,
         persist_path: Arc::new(persist_path),
         rate_limiter,
@@ -655,10 +731,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • GET    /api/skills          - 列出已发现技能");
     tracing::info!("   • GET    /api/openapi.json    - OpenAPI 3 草图");
     tracing::info!("   • POST   /hooks/inbound       - Webhook 入站端点");
+    tracing::info!("   • POST   /hooks/telegram      - Telegram Bot 入站端点");
     tracing::info!("   • X-Request-Id                - 请求无该头则生成 UUID 并回写");
     if let Some(limit) = rate_limit_per_minute {
         tracing::info!(
-            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound；GET /health 不限流）"
+            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound、/hooks/telegram；GET /health 不限流）"
         );
     } else {
         tracing::info!("   • HTTP 限流: 未启用");
@@ -704,13 +781,26 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         println!("   • Webhook 鉴权: ⚠️  未启用（任何请求都可访问 /hooks/inbound）");
     }
 
+    if telegram_secret.is_some() {
+        println!(
+            "   • Telegram 鉴权: ✅ 已启用（通过 {}）",
+            if std::env::var("JIACLAW_TELEGRAM_SECRET").is_ok() {
+                "环境变量 JIACLAW_TELEGRAM_SECRET"
+            } else {
+                "配置文件"
+            }
+        );
+    } else {
+        println!("   • Telegram 鉴权: ⚠️  未启用（任何请求都可访问 /hooks/telegram）");
+    }
+
     if let Some(limit) = rate_limit_per_minute {
         println!(
             "   • HTTP 限流: ✅ 已启用（{limit} 次/分钟，通过 {}）",
             rate_limit_config_source()
         );
     } else {
-        println!("   • HTTP 限流: ⚠️  未启用（/api/* 与 /hooks/inbound 不限流）");
+        println!("   • HTTP 限流: ⚠️  未启用（/api/* 与 /hooks/inbound、/hooks/telegram 不限流）");
     }
 
     if let Some(ttl) = session_ttl_secs {
@@ -1194,71 +1284,51 @@ async fn skills_handler(
     Ok(Json(SkillsResponse { skills }))
 }
 
-/// Webhook 入站处理器
-#[allow(clippy::too_many_lines)]
-async fn hooks_inbound_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<InboundWebhookRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let request_id = request_id_log_value(&headers).to_string();
+fn unauthorized_hook_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"ok": false, "error": "unauthorized"})),
+    )
+        .into_response()
+}
 
+/// 将用户文本写入指定 session 并跑一轮 agent chat（`/hooks/inbound` 与 `/hooks/telegram` 共用）。
+async fn run_session_user_chat(
+    state: &AppState,
+    session_id: &str,
+    user_text: &str,
+    request_id: &str,
+    channel_label: &str,
+) -> Result<String, AppError> {
     tracing::info!(
         request_id = %request_id,
-        "收到 webhook 入站请求: channel={}, chat_id={}, username={:?}",
-        body.channel,
-        body.chat_id,
-        body.username
+        "使用 {channel_label} session_id: {session_id}"
     );
 
-    // 鉴权检查
-    if let Some(expected) = state.webhook_secret.as_deref() {
-        let provided = headers
-            .get("X-Webhook-Secret")
-            .and_then(|v| v.to_str().ok());
-        if provided != Some(expected) {
-            tracing::warn!(request_id = %request_id, "Webhook 鉴权失败: secret 不匹配");
-            return Ok((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"ok": false, "error": "unauthorized"})),
-            )
-                .into_response());
-        }
-    }
+    purge_expired_sessions(state);
 
-    // 生成 session_id
-    let session_id = format!("webhook:{}", body.chat_id);
-    tracing::info!(request_id = %request_id, "使用 session_id: {}", session_id);
-
-    purge_expired_sessions(&state);
-
-    // 构建聊天请求
     let mut request = ChatRequest {
         messages: vec![ChatMessage {
             role: MessageRole::User,
-            content: body.text.clone(),
+            content: user_text.to_string(),
         }],
         enabled_tools: vec![],
         enabled_skills: vec![],
         auto_skills: true,
-        session_id: Some(session_id.clone()),
+        session_id: Some(session_id.to_string()),
     };
 
-    // 从 session 中获取历史消息
     {
         let sessions = state.sessions.lock().unwrap();
-        if let Some(history) = sessions.get(&session_id) {
+        if let Some(history) = sessions.get(session_id) {
             let mut all_messages = history.messages.clone();
             all_messages.extend(request.messages.clone());
 
-            // 检查消息数上限
             if all_messages.len() > MAX_SESSION_MESSAGES {
                 tracing::info!(
                     request_id = %request_id,
-                    "Webhook session {} 消息数 {} 超过上限 {}，开始截断",
-                    session_id,
-                    all_messages.len(),
-                    MAX_SESSION_MESSAGES
+                    "{channel_label} session {session_id} 消息数 {} 超过上限 {MAX_SESSION_MESSAGES}，开始截断",
+                    all_messages.len()
                 );
 
                 let system_messages: Vec<_> = all_messages
@@ -1291,56 +1361,135 @@ async fn hooks_inbound_handler(
             request.messages = all_messages;
             tracing::info!(
                 request_id = %request_id,
-                "使用 webhook session {}, 合并后消息数: {}",
-                session_id,
+                "使用 {channel_label} session {session_id}, 合并后消息数: {}",
                 request.messages.len()
             );
         } else {
-            tracing::info!(request_id = %request_id, "创建新 webhook session: {}", session_id);
+            tracing::info!(
+                request_id = %request_id,
+                "创建新 {channel_label} session: {session_id}"
+            );
         }
     }
 
-    // 调用 agent
     let response = state
         .agent
         .chat(&request)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // 更新 session 历史
     {
         let mut sessions = state.sessions.lock().unwrap();
         let mut messages = request.messages.clone();
         messages.push(response.message.clone());
         let message_count = messages.len();
-        sessions.insert(session_id.clone(), SessionRecord::new(messages));
+        sessions.insert(session_id.to_string(), SessionRecord::new(messages));
         tracing::info!(
             request_id = %request_id,
-            "更新 webhook session {}, 当前消息数: {}",
-            session_id,
-            message_count
+            "更新 {channel_label} session {session_id}, 当前消息数: {message_count}"
         );
 
-        persist_session_map(&state, &sessions);
+        persist_session_map(state, &sessions);
     }
 
     tracing::info!(
         request_id = %request_id,
-        "Webhook 聊天响应生成，状态: {:?}, 工具调用数: {}",
+        "{channel_label} 聊天响应生成，状态: {:?}, 工具调用数: {}",
         response.status,
         response.tool_calls.len()
     );
 
-    // 构建响应
+    Ok(response.message.content)
+}
+
+/// Webhook 入站处理器
+async fn hooks_inbound_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InboundWebhookRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let request_id = request_id_log_value(&headers).to_string();
+
+    tracing::info!(
+        request_id = %request_id,
+        "收到 webhook 入站请求: channel={}, chat_id={}, username={:?}",
+        body.channel,
+        body.chat_id,
+        body.username
+    );
+
+    if let Some(expected) = state.webhook_secret.as_deref() {
+        let provided = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok());
+        if provided != Some(expected) {
+            tracing::warn!(request_id = %request_id, "Webhook 鉴权失败: secret 不匹配");
+            return Ok(unauthorized_hook_response());
+        }
+    }
+
+    let session_id = format!("webhook:{}", body.chat_id);
+    let reply =
+        run_session_user_chat(&state, &session_id, &body.text, &request_id, "webhook").await?;
+
     let webhook_response = InboundWebhookResponse {
         ok: true,
-        session_id: session_id.clone(),
-        reply: Some(response.message.content.clone()),
-        message: Some(response.message.content),
+        session_id,
+        reply: Some(reply.clone()),
+        message: Some(reply),
         error: None,
     };
 
     Ok((StatusCode::OK, Json(webhook_response)).into_response())
+}
+
+/// Telegram Bot 入站：把 Update 映射到现有 session/chat 路径。
+async fn hooks_telegram_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(update): Json<TelegramUpdate>,
+) -> Result<impl IntoResponse, AppError> {
+    let request_id = request_id_log_value(&headers).to_string();
+
+    tracing::info!(request_id = %request_id, "收到 Telegram 入站 Update");
+
+    if let Some(expected) = state.telegram_secret.as_deref() {
+        let provided = headers
+            .get(X_TELEGRAM_BOT_API_SECRET_TOKEN)
+            .and_then(|v| v.to_str().ok());
+        if provided != Some(expected) {
+            tracing::warn!(
+                request_id = %request_id,
+                "Telegram 鉴权失败: secret token 不匹配"
+            );
+            return Ok(unauthorized_hook_response());
+        }
+    }
+
+    let Some((chat_id, text)) = telegram_inbound_text(&update) else {
+        tracing::info!(request_id = %request_id, "跳过无文本的 Telegram update");
+        let skipped = TelegramInboundResponse {
+            ok: true,
+            reply: None,
+            session_id: None,
+            skipped: Some(true),
+            reason: Some("no text in update".to_string()),
+        };
+        return Ok((StatusCode::OK, Json(skipped)).into_response());
+    };
+
+    let session_id = format!("telegram:{chat_id}");
+    let reply = run_session_user_chat(&state, &session_id, &text, &request_id, "telegram").await?;
+
+    let body = TelegramInboundResponse {
+        ok: true,
+        reply: Some(reply),
+        session_id: Some(session_id),
+        skipped: None,
+        reason: None,
+    };
+
+    Ok((StatusCode::OK, Json(body)).into_response())
 }
 
 /// 应用错误类型
@@ -2093,6 +2242,25 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_WEBHOOK_SECRET=your-secret");
     }
 
+    // 检查 Telegram secret token（环境变量优先）
+    let telegram_secret = std::env::var("JIACLAW_TELEGRAM_SECRET")
+        .ok()
+        .or(config.http.telegram_secret.clone());
+
+    if telegram_secret.is_some() {
+        println!(
+            "   Telegram 鉴权: ✅ 已启用（通过 {}）",
+            if std::env::var("JIACLAW_TELEGRAM_SECRET").is_ok() {
+                "环境变量 JIACLAW_TELEGRAM_SECRET"
+            } else {
+                "配置文件"
+            }
+        );
+    } else {
+        println!("   Telegram 鉴权: ⚠️  未启用");
+        println!("   💡 设置环境变量: export JIACLAW_TELEGRAM_SECRET=your-secret-token");
+    }
+
     let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
     if let Some(limit) = rate_limit_per_minute {
         println!(
@@ -2151,6 +2319,14 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!(
         "   • Webhook 鉴权: {}",
         if webhook_secret.is_some() {
+            "已启用"
+        } else {
+            "未启用"
+        }
+    );
+    println!(
+        "   • Telegram 鉴权: {}",
+        if telegram_secret.is_some() {
             "已启用"
         } else {
             "未启用"
@@ -2239,6 +2415,26 @@ mod tests {
         create_test_app_with_full(None, None, None, session_ttl_secs)
     }
 
+    fn create_test_app_with_telegram_secret(telegram_secret: Option<String>) -> Router {
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret,
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+        };
+
+        build_router(state)
+    }
+
     fn create_test_app_with_full(
         api_token: Option<String>,
         webhook_secret: Option<String>,
@@ -2254,6 +2450,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             api_token,
             webhook_secret,
+            telegram_secret: None,
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: rate_limit_per_minute.and_then(build_rate_limiter),
@@ -2980,6 +3177,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             api_token: None,
             webhook_secret: None,
+            telegram_secret: None,
             persist_enabled: true,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
@@ -3030,6 +3228,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(mem_map)),
             api_token: None,
             webhook_secret: None,
+            telegram_secret: None,
             persist_enabled: true,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
@@ -3068,6 +3267,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             api_token: None,
             webhook_secret: None,
+            telegram_secret: None,
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
@@ -3422,6 +3622,304 @@ mod tests {
         assert_eq!(webhook_response2.session_id, "webhook:persistent-chat");
     }
 
+    fn telegram_text_update(chat_id: i64, text: &str) -> String {
+        serde_json::json!({
+            "update_id": 1001,
+            "message": {
+                "message_id": 10,
+                "chat": { "id": chat_id, "type": "private" },
+                "text": text
+            }
+        })
+        .to_string()
+    }
+
+    async fn post_telegram(
+        app: &Router,
+        body: String,
+        secret: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/hooks/telegram")
+            .header("content-type", "application/json");
+        if let Some(token) = secret {
+            builder = builder.header(X_TELEGRAM_BOT_API_SECRET_TOKEN, token);
+        }
+        app.clone()
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn test_telegram_inbound_text_from_message_and_edited() {
+        let message_update: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "chat": { "id": 4242 },
+                "text": "  hello  "
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            telegram_inbound_text(&message_update),
+            Some(("4242".to_string(), "hello".to_string()))
+        );
+
+        let edited: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 2,
+            "edited_message": {
+                "message_id": 2,
+                "chat": { "id": -100_123 },
+                "text": "edited"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            telegram_inbound_text(&edited),
+            Some(("-100123".to_string(), "edited".to_string()))
+        );
+
+        let no_text: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 3,
+                "chat": { "id": 1 },
+                "photo": []
+            }
+        }))
+        .unwrap();
+        assert_eq!(telegram_inbound_text(&no_text), None);
+
+        let string_id: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 4,
+            "message": {
+                "chat": { "id": "abc" },
+                "text": "hi"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            telegram_inbound_text(&string_id),
+            Some(("abc".to_string(), "hi".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_telegram_inbound_creates_and_reuses_session() {
+        let app = create_test_app();
+        let client_id = "tg-req-create";
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/telegram")
+                    .header("content-type", "application/json")
+                    .header("X-Request-Id", client_id)
+                    .body(Body::from(telegram_text_update(4242, "你好 Telegram")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(request_id_header(&first), client_id);
+
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tg: TelegramInboundResponse = serde_json::from_slice(&body).unwrap();
+        assert!(tg.ok);
+        assert!(tg.skipped.is_none());
+        assert_eq!(tg.session_id.as_deref(), Some("telegram:4242"));
+        assert!(tg.reply.as_ref().is_some_and(|r| !r.is_empty()));
+
+        let got = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/telegram:4242")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        let session_body = axum::body::to_bytes(got.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let session: GetSessionResponse = serde_json::from_slice(&session_body).unwrap();
+        let first_count = session.messages.len();
+        assert!(first_count >= 2, "应包含 user + assistant");
+
+        let second = post_telegram(&app, telegram_text_update(4242, "第二句"), None).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let body2 = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tg2: TelegramInboundResponse = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(tg2.session_id.as_deref(), Some("telegram:4242"));
+
+        let got2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/telegram:4242")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session_body2 = axum::body::to_bytes(got2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let session2: GetSessionResponse = serde_json::from_slice(&session_body2).unwrap();
+        assert!(
+            session2.messages.len() > first_count,
+            "复用 session 时应追加消息"
+        );
+
+        let inbound_still_works = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "channel": "webhook",
+                            "chat_id": "user123",
+                            "text": "inbound 仍可用"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbound_still_works.status(), StatusCode::OK);
+        let inbound_body = axum::body::to_bytes(inbound_still_works.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let inbound: InboundWebhookResponse = serde_json::from_slice(&inbound_body).unwrap();
+        assert!(inbound.ok);
+        assert_eq!(inbound.session_id, "webhook:user123");
+    }
+
+    #[tokio::test]
+    async fn test_telegram_skips_update_without_text() {
+        let app = create_test_app();
+        let body = serde_json::json!({
+            "update_id": 99,
+            "message": {
+                "message_id": 1,
+                "chat": { "id": 777, "type": "private" },
+                "photo": [{ "file_id": "aaa" }]
+            }
+        })
+        .to_string();
+
+        let response = post_telegram(&app, body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!request_id_header(&response).is_empty());
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tg: TelegramInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(tg.ok);
+        assert_eq!(tg.skipped, Some(true));
+        assert_eq!(tg.reason.as_deref(), Some("no text in update"));
+        assert!(tg.reply.is_none());
+
+        let missing = http_get_session_status(&app, "telegram:777").await;
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_telegram_edited_message_text() {
+        let app = create_test_app();
+        let body = serde_json::json!({
+            "update_id": 12,
+            "edited_message": {
+                "message_id": 3,
+                "chat": { "id": 888 },
+                "text": "编辑后的文本"
+            }
+        })
+        .to_string();
+
+        let response = post_telegram(&app, body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tg: TelegramInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(tg.ok);
+        assert_eq!(tg.session_id.as_deref(), Some("telegram:888"));
+        assert!(tg.reply.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_telegram_secret_missing_header() {
+        let app = create_test_app_with_telegram_secret(Some("tg-secret".to_string()));
+        let response = post_telegram(&app, telegram_text_update(1, "hi"), None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(err["ok"], false);
+        assert_eq!(err["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn test_telegram_secret_wrong_token() {
+        let app = create_test_app_with_telegram_secret(Some("tg-secret".to_string()));
+        let response = post_telegram(&app, telegram_text_update(1, "hi"), Some("wrong")).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_telegram_secret_correct() {
+        let app = create_test_app_with_telegram_secret(Some("tg-secret".to_string()));
+        let response = post_telegram(&app, telegram_text_update(55, "ok"), Some("tg-secret")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tg: TelegramInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(tg.ok);
+        assert_eq!(tg.session_id.as_deref(), Some("telegram:55"));
+    }
+
+    #[tokio::test]
+    async fn test_telegram_secret_does_not_affect_inbound() {
+        let app = create_test_app_with_telegram_secret(Some("tg-secret".to_string()));
+        let inbound = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "chat_id": "still-open",
+                            "text": "webhook 不走 telegram secret"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbound.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_session_persistence_disabled() {
         let config = AgentConfig::default();
@@ -3434,6 +3932,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             api_token: None,
             webhook_secret: None,
+            telegram_secret: None,
             persist_enabled: false,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
@@ -4052,6 +4551,20 @@ mod tests {
         assert!(second.headers().get(header::RETRY_AFTER).is_some());
     }
 
+    #[tokio::test]
+    async fn test_hooks_telegram_is_rate_limited() {
+        let app = create_test_app_with_rate_limit(1);
+        let body = telegram_text_update(9, "限流");
+
+        let first = post_telegram(&app, body.clone(), None).await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = post_telegram(&app, body, None).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(second.headers().get(header::RETRY_AFTER).is_some());
+        assert!(!request_id_header(&second).is_empty());
+    }
+
     #[test]
     fn test_is_rate_limited_path() {
         assert!(is_rate_limited_path("/api/chat"));
@@ -4060,6 +4573,7 @@ mod tests {
         assert!(is_rate_limited_path("/api/sessions/abc"));
         assert!(is_rate_limited_path("/api/openapi.json"));
         assert!(is_rate_limited_path("/hooks/inbound"));
+        assert!(is_rate_limited_path("/hooks/telegram"));
         assert!(!is_rate_limited_path("/health"));
         assert!(!is_rate_limited_path("/"));
         assert!(!is_rate_limited_path("/api"));
@@ -4215,6 +4729,7 @@ mod tests {
             "/api/tools",
             "/api/skills",
             "/hooks/inbound",
+            "/hooks/telegram",
         ] {
             assert!(
                 paths.contains_key(required),

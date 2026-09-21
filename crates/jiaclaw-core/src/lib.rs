@@ -256,6 +256,12 @@ pub struct HttpConfig {
     #[serde(default)]
     pub webhook_secret: Option<String>,
 
+    /// Telegram Bot webhook secret token（可选，环境变量 `JIACLAW_TELEGRAM_SECRET` 优先）
+    ///
+    /// 对应 Telegram `setWebhook` 的 `secret_token`，校验头 `X-Telegram-Bot-Api-Secret-Token`。
+    #[serde(default)]
+    pub telegram_secret: Option<String>,
+
     /// CORS 允许的来源列表（空或 `["*"]` 表示允许所有来源）
     #[serde(default = "default_cors_allow_origins")]
     pub cors_allow_origins: Vec<String>,
@@ -299,6 +305,7 @@ impl Default for HttpConfig {
             bind: default_http_bind(),
             api_token: None,
             webhook_secret: None,
+            telegram_secret: None,
             cors_allow_origins: default_cors_allow_origins(),
             persist: false,
             persist_path: default_persist_path(),
@@ -694,7 +701,34 @@ session_ttl_secs = 3600
         assert_eq!(config.http.session_ttl_secs, Some(3600));
         assert_eq!(config.http.api_token, None);
         assert_eq!(config.http.webhook_secret, None);
+        assert_eq!(config.http.telegram_secret, None);
         assert_eq!(config.tool_timeout_secs, None);
+    }
+
+    #[test]
+    fn http_config_telegram_secret_defaults_to_none() {
+        assert_eq!(HttpConfig::default().telegram_secret, None);
+    }
+
+    #[test]
+    fn http_config_parses_telegram_secret_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:8080"
+telegram_secret = "tg-secret-token"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(
+            config.http.telegram_secret.as_deref(),
+            Some("tg-secret-token")
+        );
+        assert_eq!(config.http.webhook_secret, None);
     }
 
     #[test]

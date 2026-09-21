@@ -60,7 +60,7 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 可配置的持久化开关
   - 原子写入保证数据安全
   - 自动处理文件损坏情况
-- ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*` 与 `/hooks/inbound`
+- ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*`、`/hooks/inbound` 与 `/hooks/telegram`
   - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - 超限返回 429 + `Retry-After`；`GET /health` 始终不限流
 - ✅ **可选 Session TTL** - 闲置超时自动清理内存会话（长时间 `serve` 防堆积）
@@ -69,7 +69,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **可选工具超时** - 单次 `shell_exec` / `http_get` 等不会无限卡住 tool loop
   - 配置 `[agent] tool_timeout_secs` 或环境变量 `JIACLAW_TOOL_TIMEOUT_SECS`（正整数才启用；`0`/非法=关闭）
   - 超时把 `Tool timed out after Ns` 写入 tool result，不 panic，继续循环
-- ✅ **请求追踪** - 所有 HTTP 响应回写 `X-Request-Id`（请求未带则生成 UUID）
+- ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
+  - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
+  - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
+  - 同步回传 `{ ok: true, reply }` 便于长轮询调试；本切片不主动 `sendMessage` 出站
 - ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
 - ✅ **Session 查询 API** - `GET /api/sessions` 列表、`GET /api/sessions/:id` 读取历史（不存在 404）
 - ✅ **工作区 MEMORY.md** - 跨会话长期记忆注入系统提示
@@ -139,6 +142,10 @@ bind = "127.0.0.1:8080"
 # Webhook 鉴权密钥（可选，环境变量 JIACLAW_WEBHOOK_SECRET 优先）
 # webhook_secret = "your-secret-here"
 
+# Telegram Bot secret token（可选，环境变量 JIACLAW_TELEGRAM_SECRET 优先）
+# 若设置，/hooks/telegram 校验 X-Telegram-Bot-Api-Secret-Token；未设置则开放（开发友好）
+# telegram_secret = "your-telegram-secret-token"
+
 # CORS 允许的来源列表（空或 ["*"] 表示允许所有来源）
 cors_allow_origins = ["*"]
 # 或限制特定来源：
@@ -149,7 +156,7 @@ persist = true  # 启用 session 持久化
 persist_path = ".jiaclaw/sessions.json"
 
 # HTTP 限流（可选，环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE 优先）
-# 正整数：对 /api/* 与 /hooks/inbound 做进程内全局限流（次/分钟）
+# 正整数：对 /api/* 与 /hooks/inbound、/hooks/telegram 做进程内全局限流（次/分钟）
 # 未设置或 0：不限流。GET /health 始终不限流；超限返回 429 + Retry-After。
 # rate_limit_per_minute = 60
 
@@ -304,18 +311,31 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
   -H "Content-Type: application/json" \
   -H "X-Webhook-Secret: my_secret_key" \
   -d '{"channel": "webhook", "chat_id": "user456", "text": "认证的消息", "username": "alice"}'
+
+# Telegram Bot 入站（样例 Update；同步回传 assistant 文本，便于长轮询调试）
+curl -X POST http://127.0.0.1:8080/hooks/telegram \
+  -H "Content-Type: application/json" \
+  -d '{"update_id": 1, "message": {"message_id": 10, "chat": {"id": 4242, "type": "private"}, "text": "你好 Telegram"}}'
+
+# Telegram 入站（配置 secret token 后校验官方头）
+export JIACLAW_TELEGRAM_SECRET=my_tg_secret
+curl -X POST http://127.0.0.1:8080/hooks/telegram \
+  -H "Content-Type: application/json" \
+  -H "X-Telegram-Bot-Api-Secret-Token: my_tg_secret" \
+  -d '{"update_id": 2, "edited_message": {"message_id": 11, "chat": {"id": 4242}, "text": "编辑后的消息"}}'
 ```
 
 **注意**：
 - 使用 Brokerrouter 需要有效的虚拟密钥（`brk_live_...`）
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
-- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
+- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET 为 404
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
 - Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
+- Telegram Bot 入站：`POST /hooks/telegram` 解析 Bot API Update（`message.text` / `edited_message.text`），会话键 `telegram:{chat.id}`；无文本返回 200 + 跳过说明。可选 `JIACLAW_TELEGRAM_SECRET`。本切片不同步调用 Bot `sendMessage` 出站（可后续加）
 
 ## 项目结构
 
@@ -400,7 +420,7 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Configurable persistence toggle
   - Atomic writes for data safety
   - Automatic handling of corrupted files
-- ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*` and `/hooks/inbound`
+- ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*`, `/hooks/inbound`, and `/hooks/telegram`
   - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - Over-limit returns 429 + `Retry-After`; `GET /health` is never limited
 - ✅ **Optional Session TTL** - idle sessions are expired to avoid unbounded memory growth during long `serve`
@@ -409,7 +429,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Optional tool timeout** - a long `shell_exec` / `http_get` cannot stall the whole tool loop
   - Configure `[agent] tool_timeout_secs` or `JIACLAW_TOOL_TIMEOUT_SECS` (positive integer enables; `0`/invalid disables)
   - Timeout writes `Tool timed out after Ns` into the tool result, does not panic, and continues the loop
-- ✅ **Request tracing** - every HTTP response writes `X-Request-Id` (generated UUID if missing)
+- ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
+  - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
+  - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
+  - Sync JSON `{ ok: true, reply }` for long-poll debugging; this slice does not call `sendMessage` outbound
 - ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
 - ✅ **Session query API** - `GET /api/sessions` list, `GET /api/sessions/:id` history (404 if missing)
 - ✅ **Workspace MEMORY.md** - cross-session facts injected into the system prompt
@@ -479,6 +502,10 @@ bind = "127.0.0.1:8080"
 # Webhook authentication secret (optional, JIACLAW_WEBHOOK_SECRET env var takes priority)
 # webhook_secret = "your-secret-here"
 
+# Telegram Bot secret token (optional, JIACLAW_TELEGRAM_SECRET env var takes priority)
+# When set, /hooks/telegram checks X-Telegram-Bot-Api-Secret-Token; unset stays open (dev-friendly)
+# telegram_secret = "your-telegram-secret-token"
+
 # CORS allowed origins (empty or ["*"] allows all origins)
 cors_allow_origins = ["*"]
 # Or restrict to specific origins:
@@ -489,7 +516,7 @@ persist = true  # Enable session persistence
 persist_path = ".jiaclaw/sessions.json"
 
 # Optional HTTP rate limit (JIACLAW_RATE_LIMIT_PER_MINUTE env var takes priority)
-# Positive integer: process-wide limit for /api/* and /hooks/inbound (requests/minute)
+# Positive integer: process-wide limit for /api/* and /hooks/inbound, /hooks/telegram (requests/minute)
 # Unset or 0: disabled. GET /health is never limited; over-limit returns 429 + Retry-After.
 # rate_limit_per_minute = 60
 
@@ -632,18 +659,31 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
   -H "Content-Type: application/json" \
   -H "X-Webhook-Secret: my_secret_key" \
   -d '{"channel": "webhook", "chat_id": "user456", "text": "Authenticated message", "username": "alice"}'
+
+# Telegram Bot inbound (sample Update; sync assistant text for long-poll debugging)
+curl -X POST http://127.0.0.1:8080/hooks/telegram \
+  -H "Content-Type: application/json" \
+  -d '{"update_id": 1, "message": {"message_id": 10, "chat": {"id": 4242, "type": "private"}, "text": "Hello Telegram"}}'
+
+# Telegram inbound with official secret token header
+export JIACLAW_TELEGRAM_SECRET=my_tg_secret
+curl -X POST http://127.0.0.1:8080/hooks/telegram \
+  -H "Content-Type: application/json" \
+  -H "X-Telegram-Bot-Api-Secret-Token: my_tg_secret" \
+  -d '{"update_id": 2, "edited_message": {"message_id": 11, "chat": {"id": 4242}, "text": "Edited message"}}'
 ```
 
 **Note**:
 - Brokerrouter requires a valid virtual key (`brk_live_...`)
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
-- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*` and `/hooks/inbound` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
+- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, and `/hooks/telegram` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET of an expired id returns 404
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
 - Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)
+- Telegram Bot inbound: `POST /hooks/telegram` parses Bot API Updates (`message.text` / `edited_message.text`) into session `telegram:{chat.id}`; updates without text return 200 + a skip reason. Optional `JIACLAW_TELEGRAM_SECRET`. This slice does not call Bot `sendMessage` outbound (follow-up)
 
 ### Documentation
 

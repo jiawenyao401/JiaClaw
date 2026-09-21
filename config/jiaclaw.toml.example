@@ -53,6 +53,11 @@ bind = "127.0.0.1:8080"
 # 如果设置，/hooks/inbound 端点将验证 X-Webhook-Secret 请求头
 # webhook_secret = "your-secret-here"
 
+# Telegram Bot webhook secret token（可选，环境变量 JIACLAW_TELEGRAM_SECRET 优先）
+# 如果设置，/hooks/telegram 校验头 X-Telegram-Bot-Api-Secret-Token（Telegram 官方 secret token）
+# 未设置则与本地 webhook 一样开放（开发友好）
+# telegram_secret = "your-telegram-secret-token"
+
 # CORS 允许的来源列表
 # 空列表或 ["*"] 表示允许所有来源（默认）
 # 设置特定来源以增强安全性（例如：["https://example.com", "https://app.example.com"]）
@@ -69,7 +74,7 @@ persist = false
 persist_path = ".jiaclaw/sessions.json"
 
 # HTTP 限流（可选，环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE 优先）
-# 正整数：对 /api/* 与 /hooks/inbound 做进程内全局限流（次/分钟）
+# 正整数：对 /api/* 与 /hooks/inbound、/hooks/telegram 做进程内全局限流（次/分钟）
 # 未设置或 0：不限流。GET /health 始终不限流。
 # 超限返回 429 并带 Retry-After。
 # rate_limit_per_minute = 60
