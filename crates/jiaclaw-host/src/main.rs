@@ -1072,6 +1072,17 @@ fn web_search_status_lines(config: &AgentConfig) -> Vec<String> {
     }
 }
 
+fn web_fetch_status_line(config: &AgentConfig) -> String {
+    if !config.tools.web_fetch.enabled {
+        return "已关闭（[tools.web_fetch] enabled = false，未注册）".to_string();
+    }
+    if config.tools.web_fetch.allow_private {
+        "已启用（allow_private = true，允许 localhost/私网）".to_string()
+    } else {
+        "已启用（默认拒绝 localhost/私网）".to_string()
+    }
+}
+
 fn session_summarize_status_line(config: &AgentConfig) -> String {
     if config.session.effective_summarize_on_overflow() {
         format!(
@@ -1513,6 +1524,15 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • web_search: 已关闭（未注册）");
     }
+    if config.tools.web_fetch.enabled {
+        if config.tools.web_fetch.allow_private {
+            tracing::info!("   • web_fetch: 已启用（allow_private = true，允许 localhost/私网）");
+        } else {
+            tracing::info!("   • web_fetch: 已启用（默认拒绝 localhost/私网）");
+        }
+    } else {
+        tracing::info!("   • web_fetch: 已关闭（未注册）");
+    }
     if config.heartbeat.enabled {
         tracing::info!(
             "   • Heartbeat: 已启用（间隔 {heartbeat_interval_secs} 秒，session={}, 文件 {}）",
@@ -1645,6 +1665,16 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         }
     } else {
         println!("   • web_search: ⚠️  已关闭（[tools.web_search] enabled = false）");
+    }
+
+    if config.tools.web_fetch.enabled {
+        if config.tools.web_fetch.allow_private {
+            println!("   • web_fetch: ✅ 已启用（allow_private = true，允许 localhost/私网）");
+        } else {
+            println!("   • web_fetch: ✅ 已启用（默认拒绝 localhost/私网）");
+        }
+    } else {
+        println!("   • web_fetch: ⚠️  已关闭（[tools.web_fetch] enabled = false）");
     }
 
     if config.heartbeat.enabled {
@@ -3172,6 +3202,12 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         }
     }
 
+    if config.tools.web_fetch.enabled {
+        println!("   web_fetch: ✅ {}", web_fetch_status_line(&config));
+    } else {
+        println!("   web_fetch: ⚠️  {}", web_fetch_status_line(&config));
+    }
+
     // 3. 检查提供商配置
     println!("\n🔌 提供商配置");
     println!("   类型: {}", config.provider.provider_type);
@@ -3504,7 +3540,7 @@ mod tests {
     use jiaclaw::SESSION_SUMMARY_PREFIX;
     use jiaclaw_core::{
         ChatMessage, ChatRequest, HeartbeatConfig, MessageRole, SessionConfig, ToolsConfig,
-        WebSearchToolConfig,
+        WebFetchToolConfig, WebSearchToolConfig,
     };
     use tower::ServiceExt;
 
@@ -5062,6 +5098,10 @@ mod tests {
             tools_response.tools.iter().any(|t| t.name == "web_search"),
             "应注册默认 web_search 工具"
         );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "web_fetch"),
+            "应注册默认 web_fetch 工具"
+        );
 
         // 验证工具信息包含名称和描述
         for tool in &tools_response.tools {
@@ -5079,6 +5119,7 @@ mod tests {
                     enabled: false,
                     brave_api_key: None,
                 },
+                ..ToolsConfig::default()
             },
             ..AgentConfig::default()
         };
@@ -5123,6 +5164,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_tools_endpoint_omits_web_fetch_when_disabled() {
+        let config = AgentConfig {
+            workspace_path: unique_workspace("jiaclaw-web-fetch-off"),
+            tools: ToolsConfig {
+                web_fetch: WebFetchToolConfig {
+                    enabled: false,
+                    allow_private: false,
+                },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tools_response: ToolsResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            tools_response.tools.iter().all(|t| t.name != "web_fetch"),
+            "enabled=false 时不应出现 web_fetch"
+        );
+        assert!(
+            tools_response.tools.iter().any(|t| t.name == "web_search"),
+            "关闭 web_fetch 不应影响 web_search"
+        );
+    }
+
     #[test]
     fn web_search_status_lines_do_not_print_api_key() {
         let config = AgentConfig {
@@ -5131,6 +5230,7 @@ mod tests {
                     enabled: true,
                     brave_api_key: Some("BSA-super-secret-key".to_string()),
                 },
+                ..ToolsConfig::default()
             },
             ..AgentConfig::default()
         };
@@ -5140,6 +5240,37 @@ mod tests {
             "doctor must not print api key: {joined}"
         );
         assert!(joined.contains("已配置"), "{joined}");
+    }
+
+    #[test]
+    fn web_fetch_status_line_reports_enabled_and_private_policy() {
+        let enabled = AgentConfig::default();
+        assert!(web_fetch_status_line(&enabled).contains("已启用"));
+        assert!(web_fetch_status_line(&enabled).contains("拒绝"));
+
+        let disabled = AgentConfig {
+            tools: ToolsConfig {
+                web_fetch: WebFetchToolConfig {
+                    enabled: false,
+                    allow_private: false,
+                },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(web_fetch_status_line(&disabled).contains("已关闭"));
+
+        let allow_private = AgentConfig {
+            tools: ToolsConfig {
+                web_fetch: WebFetchToolConfig {
+                    enabled: true,
+                    allow_private: true,
+                },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(web_fetch_status_line(&allow_private).contains("allow_private"));
     }
 
     #[tokio::test]

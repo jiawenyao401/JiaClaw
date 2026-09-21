@@ -223,7 +223,7 @@ triggers:
 | **Shell 命令** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
 | **文件读写** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | [#95](https://github.com/StateKnot/StateKnot/issues/95) 本地工具 |
 | **浏览器控制** | ✅ Selenium/Playwright | ⏳ 部分 | ⏳ 计划中（M3） | P2 | MCP Browser Tool |
-| **网页抓取** | ✅ BeautifulSoup | ✅ 完整 | ✅ **已实现（HTTP）** | P1 | Rust reqwest + MCP |
+| **网页抓取** | ✅ BeautifulSoup | ✅ 完整 | ✅ **可选 web_fetch（去标签文本）** | P1 | 轻量 HTML 剥离，无头浏览器不做 |
 | **API 调用** | ✅ requests | ✅ httpx | ✅ **已实现（HTTP）** | P1 | Rust reqwest + MCP |
 | **JSON 处理** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | - |
 | **日期时间** | ✅ 完整 | ✅ 完整 | ✅ **已实现** | P1 | - |
@@ -237,6 +237,11 @@ triggers:
   - 有 `JIACLAW_BRAVE_API_KEY` 或 `[tools.web_search] brave_api_key` 时调用 Brave Search API（HTTP 超时 10s，并遵守 `tool_timeout_secs`）
   - 无 key 时工具返回友好错误（不访问网络）；`enabled = false` 不注册
   - `GET /api/tools` 与 system prompt 只列出已注册工具；`jiaclaw doctor` 提示是否配置 key，**不打印明文**
+- ✅ **可选 web_fetch**（默认注册；`url` 必填且仅 http/https，`max_chars` 默认 8000、钳制 500..=50000）
+  - GET 页面；HTML 去掉 script/style 与标签后返回纯文本（含最终 URL / 标题）；超长注明 `[truncated]`
+  - 默认拒绝 localhost / 私网 / 链路本地；`[tools.web_fetch] allow_private = true` 可放开
+  - 最多 5 次重定向，HTTP 总体超时约 15s，并遵守 `tool_timeout_secs`；User-Agent 标明 JiaClaw
+  - `enabled = false` 不注册；`GET /api/tools` / system prompt / doctor 与 web_search 并列
 - ✅ **可选每工具调用超时**（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`，正整数启用；`0`/非法=关闭）
   - 对每次 `Tool::execute` 用 `tokio::time::timeout` 包裹；超时写入 `Tool timed out after Ns` 到 tool result，不 panic，继续 loop
   - 未配置时行为不变（不限制）
@@ -357,7 +362,7 @@ triggers:
 | **依赖管理** | Poetry/pip | pip | Cargo | P0 | - |
 | **初始化向导** | ✅ `openclaw init` | ⏳ 手动 | ✅ `jiaclaw init` | P1 | - |
 | **配置文件** | YAML/TOML | JSON/YAML | ✅ TOML/JSON | P0 | - |
-| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/TTL/摘要压缩/工具超时/Heartbeat/web_search** | P1 | - |
+| **运维配置** | ⏳ 基础 | ⏳ 基础 | ✅ **HTTP/CORS/Webhook/限流/TTL/摘要压缩/工具超时/Heartbeat/web_search/web_fetch** | P1 | - |
 | **开发模式** | ✅ 简单 | ✅ 简单 | ✅ `doctor` 诊断 | P1 | - |
 | **Docker 镜像** | ✅ 官方 | ⏳ 社区 | ⏳ 计划中（M4） | P1 | - |
 | **文档质量** | ✅ 优秀 | ⏳ 中等 | ✅ 持续改进 | P1 | - |
@@ -368,7 +373,8 @@ triggers:
 - ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、slack_signing_secret、slack_bot_token、cors_allow_origins、可选限流、可选 Session TTL）
 - ✅ 可选工具超时（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`）
 - ✅ 可选 `web_search`（`[tools.web_search] enabled` / `brave_api_key`，`JIACLAW_BRAVE_API_KEY` 优先；doctor 不打印 key）
-- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Session TTL、Session 摘要压缩、工具超时、web_search key 是否配置、MEMORY/SOUL/USER/HEARTBEAT 文件）
+- ✅ 可选 `web_fetch`（`[tools.web_fetch] enabled` / `allow_private`；默认拒绝私网；doctor 报告是否启用）
+- ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Session TTL、Session 摘要压缩、工具超时、web_search key 是否配置、web_fetch 是否启用、MEMORY/SOUL/USER/HEARTBEAT 文件）
 - ⏳ 文档持续改进中
 
 **目标方案**:
@@ -382,10 +388,11 @@ triggers:
   - 可选每工具调用超时（`tool_timeout_secs`，超时写入 tool result 并继续 loop）
   - 可选 HEARTBEAT.md 心跳（`[heartbeat] enabled`，仅 serve 进程内按间隔跑一轮 chat）
   - 可选 web_search（`[tools.web_search]`，Brave Search；无 key 友好错误；doctor 不打印 key）
+  - 可选 web_fetch（`[tools.web_fetch]`，HTML 去标签；默认拒绝私网；最多 5 次重定向 / ~15s）
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小
-  - HTTP 配置摘要（bind、webhook / Telegram / Slack 鉴权状态、Telegram/Slack Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、web_search 是否启用及 Brave key 是否配置（不打印明文）、Heartbeat 是否开启及间隔/文件是否存在）
+  - HTTP 配置摘要（bind、webhook / Telegram / Slack 鉴权状态、Telegram/Slack Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数、Session 摘要压缩是否开启及 keep_recent、工具超时是否开启及秒数、web_search 是否启用及 Brave key 是否配置（不打印明文）、web_fetch 是否启用及是否允许私网、Heartbeat 是否开启及间隔/文件是否存在）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 

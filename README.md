@@ -78,6 +78,11 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 有 key 时调用 Brave Search API（HTTP 超时 10s，并遵守 `tool_timeout_secs`）；无 key 时工具返回友好错误（不访问网络）
   - `enabled = false` 时不注册；`GET /api/tools` / system prompt 只列出已注册工具
   - `jiaclaw doctor` 提示是否配置了 key，**不打印明文**
+- ✅ **可选 web_fetch** - 默认注册的网页抓取工具（`url` 必填且仅 http/https，`max_chars` 默认 8000、钳制 500..=50000）
+  - 配置 `[tools.web_fetch] enabled`（默认 `true`）与 `allow_private`（默认 `false`，拒绝 localhost/私网）
+  - GET 页面；HTML 会去掉 script/style 与标签，返回纯文本（含最终 URL / 标题）；超长注明 `[truncated]`
+  - 最多跟随 5 次重定向，HTTP 总体超时约 15s，并遵守 `tool_timeout_secs`；User-Agent 标明 JiaClaw
+  - `enabled = false` 时不注册；`GET /api/tools` / system prompt 只列出已注册工具
 - ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
   - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
@@ -235,6 +240,12 @@ user_path = "USER.md"
 # 申请: https://brave.com/search/api/
 enabled = true
 # brave_api_key = "BSA..."
+
+[tools.web_fetch]
+# 可选网页抓取（默认启用并注册）。GET 页面，HTML 去标签为可读文本。
+# 默认拒绝 localhost / 私网；内网调试可设 allow_private = true。
+enabled = true
+# allow_private = false
 ```
 
 或使用环境变量：
@@ -440,6 +451,7 @@ export JIACLAW_SLACK_BOT_TOKEN=xoxb-your-bot-token
 - Slack Events API 入站：`POST /hooks/slack` 处理 `url_verification`（回传 `{ challenge }`）与 `event_callback`（仅 `message` 且 `subtype` 为空）；会话键 `slack:{team_id}:{channel}`（无 team 则为 `slack:{channel}`）。可选 `JIACLAW_SLACK_SIGNING_SECRET`（官方 v0 HMAC-SHA256，先取 raw body）。配置 `JIACLAW_SLACK_BOT_TOKEN` 后会调用 `chat.postMessage` 出站；出站失败仍 200 + 原 `reply`。在 Slack 应用的 Event Subscriptions 把 Request URL 指到公网 `https://…/hooks/slack`
 - 可选 HEARTBEAT.md：`[heartbeat] enabled = true` 后仅 `jiaclaw serve` 按间隔读取约定文件全文并跑一轮 chat（固定 session，默认 `heartbeat`）。`JIACLAW_HEARTBEAT_INTERVAL_SECS` 可覆盖间隔。文件缺失/空则跳过；CLI `chat` 不跑心跳
 - 可选 web_search：默认注册。设置 `JIACLAW_BRAVE_API_KEY` 或 `[tools.web_search] brave_api_key` 后调用 Brave Search；未配置 key 时返回友好错误。`enabled = false` 不注册。doctor 不打印 key
+- 可选 web_fetch：默认注册。GET `http`/`https` URL，HTML 转为可读文本；默认拒绝 localhost/私网（`[tools.web_fetch] allow_private = true` 可放开）。`enabled = false` 不注册
 
 ## 项目结构
 
@@ -542,6 +554,11 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - With a key, calls Brave Search (10s HTTP timeout, still honors `tool_timeout_secs`); without a key, the tool returns a friendly error and does not hit the network
   - `enabled = false` skips registration; `GET /api/tools` and the system prompt only list registered tools
   - `jiaclaw doctor` reports whether a key is set and **never prints the secret**
+- ✅ **Optional web_fetch** - registered by default (`url` required, http/https only; `max_chars` defaults to 8000, clamped to 500..=50000)
+  - Configure `[tools.web_fetch] enabled` (default `true`) and `allow_private` (default `false`, blocks localhost/private ranges)
+  - GET the page; HTML is stripped of script/style/tags into plain text (final URL / title included); oversize results note `[truncated]`
+  - Follows at most 5 redirects, ~15s HTTP timeout, still honors `tool_timeout_secs`; User-Agent identifies JiaClaw
+  - `enabled = false` skips registration; `GET /api/tools` and the system prompt only list registered tools
 - ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
   - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
   - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
@@ -698,6 +715,12 @@ user_path = "USER.md"
 # Get a key: https://brave.com/search/api/
 enabled = true
 # brave_api_key = "BSA..."
+
+[tools.web_fetch]
+# Optional page fetch (registered by default). GET a URL and convert HTML to readable text.
+# Localhost / private ranges are blocked by default; set allow_private = true for intranet use.
+enabled = true
+# allow_private = false
 ```
 
 Or use environment variable:
@@ -891,6 +914,7 @@ export JIACLAW_SLACK_BOT_TOKEN=xoxb-your-bot-token
 - Slack Events API inbound: `POST /hooks/slack` handles `url_verification` (echo `{ challenge }`) and `event_callback` (plain `message` with empty `subtype` only); session key `slack:{team_id}:{channel}` (or `slack:{channel}` if team is missing). Optional `JIACLAW_SLACK_SIGNING_SECRET` (official v0 HMAC-SHA256 over the raw body). With `JIACLAW_SLACK_BOT_TOKEN`, replies are also sent via `chat.postMessage`; outbound failure still returns 200 + the original `reply`. Point the Slack app Event Subscriptions Request URL at the public `https://…/hooks/slack`
 - Optional HEARTBEAT.md: with `[heartbeat] enabled = true`, only `jiaclaw serve` reads the file on an interval and runs one chat turn (fixed session, default `heartbeat`). `JIACLAW_HEARTBEAT_INTERVAL_SECS` overrides the interval. Missing/empty files skip the tick; CLI `chat` does not run heartbeats
 - Optional web_search: registered by default. Set `JIACLAW_BRAVE_API_KEY` or `[tools.web_search] brave_api_key` to call Brave Search; without a key the tool returns a friendly error. `enabled = false` skips registration. Doctor never prints the key
+- Optional web_fetch: registered by default. GET `http`/`https` URLs and convert HTML to readable text; localhost/private ranges are blocked unless `[tools.web_fetch] allow_private = true`. `enabled = false` skips registration
 
 ### Documentation
 
