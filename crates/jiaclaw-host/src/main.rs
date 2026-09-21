@@ -41,6 +41,15 @@ const X_REQUEST_ID: &str = "x-request-id";
 /// Telegram Bot API webhook `secret_token` 请求头（官方名称，大小写不敏感）。
 const X_TELEGRAM_BOT_API_SECRET_TOKEN: &str = "X-Telegram-Bot-Api-Secret-Token";
 
+/// Telegram Bot API 默认根路径（不含 `/bot{token}`）。
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
+/// Telegram `sendMessage` 文本上限（字符）。
+const TELEGRAM_MAX_TEXT_LEN: usize = 4096;
+
+/// Telegram 出站 HTTP 超时（秒）。
+const TELEGRAM_SEND_TIMEOUT_SECS: u64 = 10;
+
 /// 手写 `OpenAPI` 3 草图（不引入代码生成）。
 const OPENAPI_JSON: &str = include_str!("openapi.json");
 
@@ -301,6 +310,8 @@ struct AppState {
     api_token: Option<String>,
     webhook_secret: Option<String>,
     telegram_secret: Option<String>,
+    telegram_bot_token: Option<String>,
+    telegram_api_base: String,
     persist_enabled: bool,
     persist_path: Arc<PathBuf>,
     rate_limiter: Option<Arc<GlobalRateLimiter>>,
@@ -381,6 +392,121 @@ fn telegram_inbound_text(update: &TelegramUpdate) -> Option<(String, String)> {
     Some((msg.chat.id.to_string(), text.to_string()))
 }
 
+/// 按 Telegram 4096 字符上限截断 `sendMessage` 文本。
+fn truncate_telegram_text(text: &str) -> &str {
+    match text.char_indices().nth(TELEGRAM_MAX_TEXT_LEN) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
+/// 错误信息里可能含 Bot Token（minreq 会把 URL 写进 Display），打码后再记日志/回传。
+fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, "***")
+    }
+}
+
+/// Telegram `sendMessage` 出站结果。失败不得改变 webhook HTTP 状态。
+struct TelegramDelivery {
+    delivered: bool,
+    error: Option<String>,
+}
+
+fn send_telegram_message_sync(
+    api_base: &str,
+    token: &str,
+    chat_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let url = format!("{api_base}/bot{token}/sendMessage");
+    let payload = json!({
+        "chat_id": chat_id,
+        "text": text,
+    });
+    let response = minreq::post(&url)
+        .with_header("Content-Type", "application/json")
+        .with_timeout(TELEGRAM_SEND_TIMEOUT_SECS)
+        .with_body(payload.to_string())
+        .send()
+        .map_err(|e| redact_secret(&e.to_string(), token))?;
+
+    let status = response.status_code;
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+
+    let body = response.as_str().unwrap_or_default();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+            let description = value
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("ok=false");
+            return Err(redact_secret(description, token));
+        }
+    }
+    Ok(())
+}
+
+async fn send_telegram_reply(
+    api_base: &str,
+    token: &str,
+    chat_id: &str,
+    text: &str,
+    request_id: &str,
+) -> TelegramDelivery {
+    let api_base = api_base.trim_end_matches('/').to_string();
+    let token = token.to_string();
+    let chat_id = chat_id.to_string();
+    let text = truncate_telegram_text(text).to_string();
+    let request_id = request_id.to_string();
+
+    let result = tokio::task::spawn_blocking(move || {
+        send_telegram_message_sync(&api_base, &token, &chat_id, &text)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => TelegramDelivery {
+            delivered: true,
+            error: None,
+        },
+        Ok(Err(err)) => {
+            tracing::warn!(
+                request_id = %request_id,
+                error = %err,
+                "Telegram sendMessage 失败；仍返回同步 reply，避免 webhook 重试"
+            );
+            TelegramDelivery {
+                delivered: false,
+                error: Some(err),
+            }
+        }
+        Err(join_err) => {
+            let err = format!("task join failed: {join_err}");
+            tracing::warn!(
+                request_id = %request_id,
+                error = %err,
+                "Telegram sendMessage 失败；仍返回同步 reply，避免 webhook 重试"
+            );
+            TelegramDelivery {
+                delivered: false,
+                error: Some(err),
+            }
+        }
+    }
+}
+
+fn telegram_token_config_source() -> &'static str {
+    match std::env::var("JIACLAW_TELEGRAM_BOT_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => "环境变量 JIACLAW_TELEGRAM_BOT_TOKEN",
+        _ => "配置文件",
+    }
+}
+
 /// Telegram 入站响应：有文本时同步回传 assistant 文本，便于长轮询调试。
 #[derive(Debug, Serialize, Deserialize)]
 struct TelegramInboundResponse {
@@ -393,6 +519,11 @@ struct TelegramInboundResponse {
     skipped: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// 是否已成功调用 Bot `sendMessage`；未配置 token 时省略，保持与仅入站切片兼容。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_error: Option<String>,
 }
 
 fn build_rate_limiter(per_minute: u32) -> Option<Arc<GlobalRateLimiter>> {
@@ -648,6 +779,9 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         .ok()
         .or(config.http.telegram_secret.clone());
 
+    // 读取 Telegram Bot API token（环境变量优先于配置文件）
+    let telegram_bot_token = config.http.effective_telegram_bot_token();
+
     // 读取限流配置（环境变量优先于配置文件）
     let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
     let rate_limiter = rate_limit_per_minute.and_then(build_rate_limiter);
@@ -678,6 +812,8 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         api_token: api_token.clone(),
         webhook_secret: webhook_secret.clone(),
         telegram_secret: telegram_secret.clone(),
+        telegram_bot_token: telegram_bot_token.clone(),
+        telegram_api_base: TELEGRAM_API_BASE.to_string(),
         persist_enabled: config.http.persist,
         persist_path: Arc::new(persist_path),
         rate_limiter,
@@ -732,6 +868,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • GET    /api/openapi.json    - OpenAPI 3 草图");
     tracing::info!("   • POST   /hooks/inbound       - Webhook 入站端点");
     tracing::info!("   • POST   /hooks/telegram      - Telegram Bot 入站端点");
+    if telegram_bot_token.is_some() {
+        tracing::info!("   • Telegram 出站: 已配置 Bot Token（成功回复后调用 sendMessage）");
+    } else {
+        tracing::info!("   • Telegram 出站: 未配置 Bot Token（仅同步 JSON reply）");
+    }
     tracing::info!("   • X-Request-Id                - 请求无该头则生成 UUID 并回写");
     if let Some(limit) = rate_limit_per_minute {
         tracing::info!(
@@ -792,6 +933,15 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         );
     } else {
         println!("   • Telegram 鉴权: ⚠️  未启用（任何请求都可访问 /hooks/telegram）");
+    }
+
+    if telegram_bot_token.is_some() {
+        println!(
+            "   • Telegram Bot Token: ✅ 已配置（通过 {}，明文不打印；将 sendMessage 出站）",
+            telegram_token_config_source()
+        );
+    } else {
+        println!("   • Telegram Bot Token: ⚠️  未配置（仅同步 JSON reply，不调用 sendMessage）");
     }
 
     if let Some(limit) = rate_limit_per_minute {
@@ -1474,6 +1624,8 @@ async fn hooks_telegram_handler(
             session_id: None,
             skipped: Some(true),
             reason: Some("no text in update".to_string()),
+            delivered: None,
+            delivery_error: None,
         };
         return Ok((StatusCode::OK, Json(skipped)).into_response());
     };
@@ -1481,12 +1633,28 @@ async fn hooks_telegram_handler(
     let session_id = format!("telegram:{chat_id}");
     let reply = run_session_user_chat(&state, &session_id, &text, &request_id, "telegram").await?;
 
+    let (delivered, delivery_error) = if let Some(token) = state.telegram_bot_token.as_deref() {
+        let delivery = send_telegram_reply(
+            &state.telegram_api_base,
+            token,
+            &chat_id,
+            &reply,
+            &request_id,
+        )
+        .await;
+        (Some(delivery.delivered), delivery.error)
+    } else {
+        (None, None)
+    };
+
     let body = TelegramInboundResponse {
         ok: true,
         reply: Some(reply),
         session_id: Some(session_id),
         skipped: None,
         reason: None,
+        delivered,
+        delivery_error,
     };
 
     Ok((StatusCode::OK, Json(body)).into_response())
@@ -2261,6 +2429,20 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_TELEGRAM_SECRET=your-secret-token");
     }
 
+    // 检查 Telegram Bot API token（环境变量优先，不打印明文）
+    let telegram_bot_token = config.http.effective_telegram_bot_token();
+    if telegram_bot_token.is_some() {
+        println!(
+            "   Telegram Bot Token: ✅ 已配置（通过 {}，明文不打印）",
+            telegram_token_config_source()
+        );
+    } else {
+        println!(
+            "   Telegram Bot Token: ⚠️  未配置（/hooks/telegram 仅同步 JSON，不 sendMessage）"
+        );
+        println!("   💡 设置环境变量: export JIACLAW_TELEGRAM_BOT_TOKEN=your-bot-token");
+    }
+
     let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
     if let Some(limit) = rate_limit_per_minute {
         println!(
@@ -2330,6 +2512,14 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
             "已启用"
         } else {
             "未启用"
+        }
+    );
+    println!(
+        "   • Telegram Bot Token: {}",
+        if telegram_bot_token.is_some() {
+            "已配置"
+        } else {
+            "未配置"
         }
     );
     println!(
@@ -2426,6 +2616,8 @@ mod tests {
             api_token: None,
             webhook_secret: None,
             telegram_secret,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
@@ -2433,6 +2625,95 @@ mod tests {
         };
 
         build_router(state)
+    }
+
+    #[derive(Clone)]
+    struct TelegramApiMockState {
+        status: StatusCode,
+        captured: Arc<Mutex<Vec<CapturedTelegramOutbound>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedTelegramOutbound {
+        method: String,
+        path: String,
+        body: serde_json::Value,
+    }
+
+    async fn telegram_api_mock_fallback(
+        State(state): State<TelegramApiMockState>,
+        req: axum::extract::Request,
+    ) -> impl IntoResponse {
+        let method = req.method().to_string();
+        let path = req.uri().path().to_string();
+        let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        state
+            .captured
+            .lock()
+            .unwrap()
+            .push(CapturedTelegramOutbound { method, path, body });
+        let ok = state.status.is_success();
+        (state.status, Json(json!({ "ok": ok })))
+    }
+
+    async fn spawn_telegram_api_mock(
+        status: StatusCode,
+    ) -> (String, Arc<Mutex<Vec<CapturedTelegramOutbound>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let state = TelegramApiMockState {
+            status,
+            captured: captured.clone(),
+        };
+        let app = Router::new()
+            .fallback(telegram_api_mock_fallback)
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind telegram mock");
+        let addr = listener.local_addr().expect("telegram mock local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("telegram mock serve");
+        });
+        (format!("http://{addr}"), captured)
+    }
+
+    fn create_test_app_with_telegram_outbound(
+        bot_token: Option<String>,
+        api_base: String,
+    ) -> Router {
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: bot_token,
+            telegram_api_base: api_base,
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+        };
+        build_router(state)
+    }
+
+    fn json_chat_id(body: &serde_json::Value) -> Option<String> {
+        body.get("chat_id").and_then(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| value.as_i64().map(|n| n.to_string()))
+                .or_else(|| value.as_u64().map(|n| n.to_string()))
+        })
     }
 
     fn create_test_app_with_full(
@@ -2451,6 +2732,8 @@ mod tests {
             api_token,
             webhook_secret,
             telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: rate_limit_per_minute.and_then(build_rate_limiter),
@@ -3178,6 +3461,8 @@ mod tests {
             api_token: None,
             webhook_secret: None,
             telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
             persist_enabled: true,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
@@ -3229,6 +3514,8 @@ mod tests {
             api_token: None,
             webhook_secret: None,
             telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
             persist_enabled: true,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
@@ -3268,6 +3555,8 @@ mod tests {
             api_token: None,
             webhook_secret: None,
             telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
@@ -3920,6 +4209,85 @@ mod tests {
         assert_eq!(inbound.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn test_truncate_telegram_text_at_4096_chars() {
+        let exact = "a".repeat(TELEGRAM_MAX_TEXT_LEN);
+        assert_eq!(truncate_telegram_text(&exact), exact);
+        let over: String = "你".repeat(TELEGRAM_MAX_TEXT_LEN + 8);
+        let truncated = truncate_telegram_text(&over);
+        assert_eq!(truncated.chars().count(), TELEGRAM_MAX_TEXT_LEN);
+        assert!(truncated.chars().all(|c| c == '你'));
+    }
+
+    #[tokio::test]
+    async fn test_telegram_without_bot_token_does_not_call_send_message() {
+        let (base, captured) = spawn_telegram_api_mock(StatusCode::OK).await;
+        let app = create_test_app_with_telegram_outbound(None, base);
+        let response = post_telegram(&app, telegram_text_update(4242, "你好"), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tg: TelegramInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(tg.ok);
+        assert!(tg.reply.as_ref().is_some_and(|r| !r.is_empty()));
+        assert!(tg.delivered.is_none());
+        assert!(tg.delivery_error.is_none());
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(raw.get("delivered").is_none());
+        assert!(raw.get("delivery_error").is_none());
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_telegram_send_message_called_with_chat_id_and_text() {
+        let token = "123456:TEST-TOKEN";
+        let (base, captured) = spawn_telegram_api_mock(StatusCode::OK).await;
+        let app = create_test_app_with_telegram_outbound(Some(token.to_string()), base);
+        let response = post_telegram(&app, telegram_text_update(4242, "你好 Telegram"), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tg: TelegramInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(tg.ok);
+        let reply = tg.reply.expect("reply");
+        assert!(!reply.is_empty());
+        assert_eq!(tg.delivered, Some(true));
+        assert!(tg.delivery_error.is_none());
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].method, "POST");
+        assert_eq!(captured[0].path, format!("/bot{token}/sendMessage"));
+        assert_eq!(json_chat_id(&captured[0].body).as_deref(), Some("4242"));
+        assert_eq!(captured[0].body["text"].as_str(), Some(reply.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_telegram_send_message_5xx_still_returns_200_with_reply() {
+        let token = "123456:TEST-TOKEN";
+        let (base, captured) = spawn_telegram_api_mock(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let app = create_test_app_with_telegram_outbound(Some(token.to_string()), base);
+        let response = post_telegram(&app, telegram_text_update(99, "hello"), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tg: TelegramInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(tg.ok);
+        assert!(tg.reply.as_ref().is_some_and(|r| !r.is_empty()));
+        assert_eq!(tg.delivered, Some(false));
+        assert!(
+            tg.delivery_error
+                .as_ref()
+                .is_some_and(|err| err.contains("500")),
+            "delivery_error={:?}",
+            tg.delivery_error
+        );
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn test_session_persistence_disabled() {
         let config = AgentConfig::default();
@@ -3933,6 +4301,8 @@ mod tests {
             api_token: None,
             webhook_secret: None,
             telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,

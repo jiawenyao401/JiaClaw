@@ -28,7 +28,8 @@
       "rate_limit_per_minute": null,
       "session_ttl_secs": null,
       "webhook_secret": null,
-      "telegram_secret": null
+      "telegram_secret": null,
+      "telegram_bot_token": null
     },
     "memory": {
       "path": "MEMORY.md"

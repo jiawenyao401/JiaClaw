@@ -40,6 +40,7 @@ tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors"] }
 uuid = { version = "=1.7.0", features = ["v4"] }
 governor = "0.6"
+minreq = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

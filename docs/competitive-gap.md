@@ -61,6 +61,7 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 | **技能列表 API** | ✅ 支持 | ❌ 无 | ✅ **GET /api/skills** | P1 | - |
 | **Webhook 入站** | ✅ 支持 | ⏳ 部分 | ✅ **POST /hooks/inbound** | P1 | - |
 | **Telegram Bot 入站** | ✅ 支持 | ⏳ 部分 | ✅ **POST /hooks/telegram** | P1 | - |
+| **Telegram Bot 出站** | ✅ 支持 | ⏳ 部分 | ✅ **可选 sendMessage** | P1 | - |
 | **Request ID** | ✅ 支持 | ⏳ 部分 | ✅ **X-Request-Id** | P1 | - |
 | **OpenAPI** | ✅ FastAPI 自动 | ⏳ 部分 | ✅ **GET /api/openapi.json** | P1 | - |
 | **SSE 事件流** | ✅ 支持 | ⏳ 部分 | ⏳ 计划中 | P1 | [#92](https://github.com/StateKnot/StateKnot/issues/92) AgentServiceV1 |
@@ -85,7 +86,8 @@ JiaClaw 是基于 [StateKnot](https://github.com/StateKnot/StateKnot) 的持久�
 - ✅ 工具列表 API（GET /api/tools 列出已注册工具名称和描述）
 - ✅ 技能列表 API（GET /api/skills 列出已发现技能）
 - ✅ Webhook 入站 API（POST /hooks/inbound，支持可选鉴权，自动 session 管理）
-- ✅ **Telegram Bot 入站**（POST /hooks/telegram，手写 serde 解析 Bot API Update 最小子集；session `telegram:{chat.id}`；可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret` 校验 `X-Telegram-Bot-Api-Secret-Token`；无文本 200 跳过；同步回传 `{ ok, reply }`。本切片不实现 `sendMessage` 出站）
+- ✅ **Telegram Bot 入站**（POST /hooks/telegram，手写 serde 解析 Bot API Update 最小子集；session `telegram:{chat.id}`；可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret` 校验 `X-Telegram-Bot-Api-Secret-Token`；无文本 200 跳过；同步回传 `{ ok, reply }`）
+- ✅ **Telegram Bot 可选出站**（`JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token` 优先；成功回复后 POST `sendMessage`，文本按 4096 截断；出站失败 warn + 仍 200 原 JSON，避免 webhook 重试；未配置 token 时行为与仅入站一致。`setWebhook` 指向公网 `/hooks/telegram`）
 - ❌ SSE 事件流需要 `DurableAgentRuns` 的事件订阅 API
 
 **目标方案**:
@@ -341,7 +343,7 @@ triggers:
 **JiaClaw 现状**:
 - ✅ Cargo 工作空间已配置
 - ✅ `jiaclaw init` 命令创建工作空间
-- ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、cors_allow_origins、可选限流、可选 Session TTL）
+- ✅ HTTP 配置支持（bind、webhook_secret、telegram_secret、telegram_bot_token、cors_allow_origins、可选限流、可选 Session TTL）
 - ✅ 可选工具超时（`[agent] tool_timeout_secs` / `JIACLAW_TOOL_TIMEOUT_SECS`）
 - ✅ `jiaclaw doctor` 诊断命令（检查配置、工具、技能、HTTP 设置、限流状态、Session TTL、工具超时、MEMORY/SOUL/USER 文件）
 - ⏳ 文档持续改进中
@@ -349,7 +351,7 @@ triggers:
 **目标方案**:
 - **P1 运维配置**: ✅ **已实现**
   - TOML 配置支持 `[http]` 段落
-  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_TOOL_TIMEOUT_SECS` 优先）
+  - 环境变量覆盖（`JIACLAW_WEBHOOK_SECRET`、`JIACLAW_TELEGRAM_SECRET`、`JIACLAW_TELEGRAM_BOT_TOKEN`、`JIACLAW_RATE_LIMIT_PER_MINUTE`、`JIACLAW_SESSION_TTL_SECS`、`JIACLAW_TOOL_TIMEOUT_SECS` 优先）
   - CORS 来源控制（空或 `["*"]` 保持 permissive，否则限制）
   - 可选进程内全局限流（`rate_limit_per_minute`，超限 429 + Retry-After）
   - 可选会话闲置 TTL（`session_ttl_secs`，过期清理内存 store；落盘开启时同步 save）
@@ -357,7 +359,7 @@ triggers:
   - 启动日志打印配置摘要（不泄露 secret 明文）
 - **P1 doctor 诊断**: ✅ **已实现**
   - 检查 workspace 可读性、工具数量、技能数量、MEMORY / SOUL / USER 是否存在及大小
-  - HTTP 配置摘要（bind、webhook / Telegram 鉴权状态、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数、工具超时是否开启及秒数）
+  - HTTP 配置摘要（bind、webhook / Telegram 鉴权状态、Telegram Bot Token 是否配置（不打印明文）、CORS 模式、限流是否开启及数值、Session TTL 是否开启及秒数、工具超时是否开启及秒数）
   - 明确提示 stub 模式（当 API key 缺失）
 - **P1 文档改进**: 添加 Quick Start 和 Tutorial
 
