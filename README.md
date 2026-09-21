@@ -60,7 +60,7 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 可配置的持久化开关
   - 原子写入保证数据安全
   - 自动处理文件损坏情况
-- ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*`、`/hooks/inbound` 与 `/hooks/telegram`
+- ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*`、`/hooks/inbound`、`/hooks/telegram` 与 `/hooks/slack`
   - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - 超限返回 429 + `Retry-After`；`GET /health` 始终不限流
 - ✅ **可选 Session TTL** - 闲置超时自动清理内存会话（长时间 `serve` 防堆积）
@@ -74,6 +74,11 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
   - 同步回传 `{ ok: true, reply }` 便于长轮询调试
   - 可选 `JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token`：成功回复后调用 Bot `sendMessage` 推回聊天（文本按 4096 截断）；出站失败仍 200 + 原 `reply`（可带 `delivered` / `delivery_error`）
+- ✅ **Slack Events API 入站** - `POST /hooks/slack` 把 Events API 映射到 session `slack:{team_id}:{channel}`（无 team 则为 `slack:{channel}`）
+  - `type=url_verification` 返回 `{ challenge }`；仅处理 `message` 且 `subtype` 为空（忽略 bot_message / message_changed，避免环）
+  - 可选 `JIACLAW_SLACK_SIGNING_SECRET` / `[http] slack_signing_secret`：官方 v0 HMAC-SHA256（`X-Slack-Signature` + `X-Slack-Request-Timestamp`，±5 分钟）；先取 raw body 再反序列化
+  - 同步回传 `{ ok: true, reply, session_id }`；无文本/忽略事件 200 + skipped
+  - 可选 `JIACLAW_SLACK_BOT_TOKEN` / `[http] slack_bot_token`：成功回复后 `chat.postMessage` 推回 channel；出站失败仍 200 + 原 `reply`
 - ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
 - ✅ **可选 SSE 流式** - `POST /api/chat` 在 `Accept: text/event-stream` 或 body `stream: true` 时返回事件流
   - 事件：`meta`（session_id / request_id）、`token`（文本增量）、`tool`（name + ok/error）、`done`（最终 reply）、`error`
@@ -159,6 +164,15 @@ bind = "127.0.0.1:8080"
 # 若设置，成功得到 assistant 回复后会 POST sendMessage 推回聊天；未设置则仅同步 JSON reply
 # telegram_bot_token = "123456:ABC-your-bot-token"
 
+# Slack Events API signing secret（可选，环境变量 JIACLAW_SLACK_SIGNING_SECRET 优先）
+# 若设置，/hooks/slack 校验 X-Slack-Signature + X-Slack-Request-Timestamp（v0 HMAC-SHA256，±5 分钟）
+# 未设置则开放（开发友好）。签名使用原始 body 字节。
+# slack_signing_secret = "your-slack-signing-secret"
+
+# Slack Bot token（可选，环境变量 JIACLAW_SLACK_BOT_TOKEN 优先）
+# 若设置，成功得到 assistant 回复后会 POST chat.postMessage 推回 channel；未设置则仅同步 JSON reply
+# slack_bot_token = "xoxb-your-bot-token"
+
 # CORS 允许的来源列表（空或 ["*"] 表示允许所有来源）
 cors_allow_origins = ["*"]
 # 或限制特定来源：
@@ -169,7 +183,7 @@ persist = true  # 启用 session 持久化
 persist_path = ".jiaclaw/sessions.json"
 
 # HTTP 限流（可选，环境变量 JIACLAW_RATE_LIMIT_PER_MINUTE 优先）
-# 正整数：对 /api/* 与 /hooks/inbound、/hooks/telegram 做进程内全局限流（次/分钟）
+# 正整数：对 /api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack 做进程内全局限流（次/分钟）
 # 未设置或 0：不限流。GET /health 始终不限流；超限返回 429 + Retry-After。
 # rate_limit_per_minute = 60
 
@@ -364,13 +378,30 @@ curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
   -d "url=https://your-host.example/hooks/telegram" \
   -d "secret_token=${JIACLAW_TELEGRAM_SECRET}"
 # 查看 webhook 状态：curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+
+# Slack Events API URL 验证（Request URL 指向 https://your-host.example/hooks/slack）
+curl -X POST http://127.0.0.1:8080/hooks/slack \
+  -H "Content-Type: application/json" \
+  -d '{"type":"url_verification","challenge":"3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"}'
+
+# Slack 入站（普通 message；session slack:{team_id}:{channel}）
+curl -X POST http://127.0.0.1:8080/hooks/slack \
+  -H "Content-Type: application/json" \
+  -d '{"type":"event_callback","team_id":"T123","event":{"type":"message","channel":"C456","user":"U789","text":"你好 Slack"}}'
+
+# 配置 signing secret 后校验官方签名头（生产应开启；开发未配置则开放）
+export JIACLAW_SLACK_SIGNING_SECRET=your-slack-signing-secret
+# Slack 会带 X-Slack-Request-Timestamp 与 X-Slack-Signature: v0=<hmac-sha256-hex>
+
+# 配置 Bot Token 后，成功回复会再调用 chat.postMessage 推回 channel
+export JIACLAW_SLACK_BOT_TOKEN=xoxb-your-bot-token
 ```
 
 **注意**：
 - 使用 Brokerrouter 需要有效的虚拟密钥（`brk_live_...`）
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
-- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
+- 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET 为 404
 - 可选工具超时：设置 `JIACLAW_TOOL_TIMEOUT_SECS` 或 `[agent] tool_timeout_secs`（正整数）后，单次 tool 超过该秒数会把 `Tool timed out after Ns` 写入 tool result 并继续循环；未设置则不限制
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
@@ -378,6 +409,7 @@ curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
 - 可选 SSE：`POST /api/chat` 在 `Accept: text/event-stream` 或 `"stream": true` 时返回 `text/event-stream`（`meta` / `token` / `tool` / `done` / `error`）。未请求流式时 JSON 不变。**当前为分块推送；Brokerrouter 真流式后续**
 - Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
 - Telegram Bot 入站：`POST /hooks/telegram` 解析 Bot API Update（`message.text` / `edited_message.text`），会话键 `telegram:{chat.id}`；无文本返回 200 + 跳过说明。可选 `JIACLAW_TELEGRAM_SECRET`。配置 `JIACLAW_TELEGRAM_BOT_TOKEN` 后会调用 `sendMessage` 出站（文本超 4096 截断）；出站失败仍返回 200 + 原 `reply`，避免 Telegram 重试。用 `setWebhook` 把公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`
+- Slack Events API 入站：`POST /hooks/slack` 处理 `url_verification`（回传 `{ challenge }`）与 `event_callback`（仅 `message` 且 `subtype` 为空）；会话键 `slack:{team_id}:{channel}`（无 team 则为 `slack:{channel}`）。可选 `JIACLAW_SLACK_SIGNING_SECRET`（官方 v0 HMAC-SHA256，先取 raw body）。配置 `JIACLAW_SLACK_BOT_TOKEN` 后会调用 `chat.postMessage` 出站；出站失败仍 200 + 原 `reply`。在 Slack 应用的 Event Subscriptions 把 Request URL 指到公网 `https://…/hooks/slack`
 - 可选 HEARTBEAT.md：`[heartbeat] enabled = true` 后仅 `jiaclaw serve` 按间隔读取约定文件全文并跑一轮 chat（固定 session，默认 `heartbeat`）。`JIACLAW_HEARTBEAT_INTERVAL_SECS` 可覆盖间隔。文件缺失/空则跳过；CLI `chat` 不跑心跳
 
 ## 项目结构
@@ -463,7 +495,7 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Configurable persistence toggle
   - Atomic writes for data safety
   - Automatic handling of corrupted files
-- ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*`, `/hooks/inbound`, and `/hooks/telegram`
+- ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*`, `/hooks/inbound`, `/hooks/telegram`, and `/hooks/slack`
   - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - Over-limit returns 429 + `Retry-After`; `GET /health` is never limited
 - ✅ **Optional Session TTL** - idle sessions are expired to avoid unbounded memory growth during long `serve`
@@ -477,6 +509,11 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
   - Sync JSON `{ ok: true, reply }` for long-poll debugging
   - Optional `JIACLAW_TELEGRAM_BOT_TOKEN` / `[http] telegram_bot_token`: after a successful reply, call Bot `sendMessage` (text truncated at 4096). Outbound failure still returns 200 + the original `reply` (may include `delivered` / `delivery_error`)
+- ✅ **Slack Events API inbound** - `POST /hooks/slack` maps Events API payloads onto session `slack:{team_id}:{channel}` (or `slack:{channel}` if team is missing)
+  - `type=url_verification` returns `{ challenge }`; only `message` events with empty `subtype` (ignore `bot_message` / `message_changed` to avoid loops)
+  - Optional `JIACLAW_SLACK_SIGNING_SECRET` / `[http] slack_signing_secret`: official v0 HMAC-SHA256 (`X-Slack-Signature` + `X-Slack-Request-Timestamp`, ±5 minutes); raw body is captured before JSON parse
+  - Sync JSON `{ ok: true, reply, session_id }`; no-text / ignored events return 200 + skipped
+  - Optional `JIACLAW_SLACK_BOT_TOKEN` / `[http] slack_bot_token`: after a successful reply, call `chat.postMessage`; outbound failure still returns 200 + the original `reply`
 - ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
 - ✅ **Optional SSE** - `POST /api/chat` returns `text/event-stream` when `Accept: text/event-stream` or body `stream: true`
   - Events: `meta` (session_id / request_id), `token` (text chunks), `tool` (name + ok/error), `done` (final reply), `error`
@@ -562,6 +599,15 @@ bind = "127.0.0.1:8080"
 # When set, a successful assistant reply is also POSTed via sendMessage; unset keeps sync JSON only
 # telegram_bot_token = "123456:ABC-your-bot-token"
 
+# Slack Events API signing secret (optional, JIACLAW_SLACK_SIGNING_SECRET env var takes priority)
+# When set, /hooks/slack checks X-Slack-Signature + X-Slack-Request-Timestamp (v0 HMAC-SHA256, ±5 minutes)
+# Unset stays open (dev-friendly). Signature uses the raw request body bytes.
+# slack_signing_secret = "your-slack-signing-secret"
+
+# Slack Bot token (optional, JIACLAW_SLACK_BOT_TOKEN env var takes priority)
+# When set, a successful assistant reply is also POSTed via chat.postMessage; unset keeps sync JSON only
+# slack_bot_token = "xoxb-your-bot-token"
+
 # CORS allowed origins (empty or ["*"] allows all origins)
 cors_allow_origins = ["*"]
 # Or restrict to specific origins:
@@ -572,7 +618,7 @@ persist = true  # Enable session persistence
 persist_path = ".jiaclaw/sessions.json"
 
 # Optional HTTP rate limit (JIACLAW_RATE_LIMIT_PER_MINUTE env var takes priority)
-# Positive integer: process-wide limit for /api/* and /hooks/inbound, /hooks/telegram (requests/minute)
+# Positive integer: process-wide limit for /api/* and /hooks/inbound, /hooks/telegram, /hooks/slack (requests/minute)
 # Unset or 0: disabled. GET /health is never limited; over-limit returns 429 + Retry-After.
 # rate_limit_per_minute = 60
 
@@ -755,13 +801,30 @@ curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
   -d "url=https://your-host.example/hooks/telegram" \
   -d "secret_token=${JIACLAW_TELEGRAM_SECRET}"
 # Inspect webhook status: curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+
+# Slack Events API URL verification (Request URL → https://your-host.example/hooks/slack)
+curl -X POST http://127.0.0.1:8080/hooks/slack \
+  -H "Content-Type: application/json" \
+  -d '{"type":"url_verification","challenge":"3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"}'
+
+# Slack inbound (plain message; session slack:{team_id}:{channel})
+curl -X POST http://127.0.0.1:8080/hooks/slack \
+  -H "Content-Type: application/json" \
+  -d '{"type":"event_callback","team_id":"T123","event":{"type":"message","channel":"C456","user":"U789","text":"Hello Slack"}}'
+
+# With a signing secret, Slack sends official signature headers (enable in production; unset stays open)
+export JIACLAW_SLACK_SIGNING_SECRET=your-slack-signing-secret
+# Slack sends X-Slack-Request-Timestamp and X-Slack-Signature: v0=<hmac-sha256-hex>
+
+# With a Bot token, a successful reply is also pushed back with chat.postMessage
+export JIACLAW_SLACK_BOT_TOKEN=xoxb-your-bot-token
 ```
 
 **Note**:
 - Brokerrouter requires a valid virtual key (`brk_live_...`)
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
-- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, and `/hooks/telegram` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
+- Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, and `/hooks/slack` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET of an expired id returns 404
 - Optional tool timeout: set `JIACLAW_TOOL_TIMEOUT_SECS` or `[agent] tool_timeout_secs` (positive integer); a tool that exceeds the limit writes `Tool timed out after Ns` into the tool result and the loop continues; unset means unlimited
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
@@ -769,6 +832,7 @@ curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
 - Optional SSE: `POST /api/chat` returns `text/event-stream` when `Accept: text/event-stream` or `"stream": true` (`meta` / `token` / `tool` / `done` / `error`). JSON is unchanged when streaming is not requested. **Currently chunked after the full loop; Brokerrouter true streaming comes later**
 - Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)
 - Telegram Bot inbound: `POST /hooks/telegram` parses Bot API Updates (`message.text` / `edited_message.text`) into session `telegram:{chat.id}`; updates without text return 200 + a skip reason. Optional `JIACLAW_TELEGRAM_SECRET`. With `JIACLAW_TELEGRAM_BOT_TOKEN`, replies are also sent via `sendMessage` (text truncated at 4096); outbound failure still returns 200 + the original `reply` so Telegram does not retry. Point `setWebhook` at the public `https://…/hooks/telegram` URL, optionally with `secret_token`
+- Slack Events API inbound: `POST /hooks/slack` handles `url_verification` (echo `{ challenge }`) and `event_callback` (plain `message` with empty `subtype` only); session key `slack:{team_id}:{channel}` (or `slack:{channel}` if team is missing). Optional `JIACLAW_SLACK_SIGNING_SECRET` (official v0 HMAC-SHA256 over the raw body). With `JIACLAW_SLACK_BOT_TOKEN`, replies are also sent via `chat.postMessage`; outbound failure still returns 200 + the original `reply`. Point the Slack app Event Subscriptions Request URL at the public `https://…/hooks/slack`
 - Optional HEARTBEAT.md: with `[heartbeat] enabled = true`, only `jiaclaw serve` reads the file on an interval and runs one chat turn (fixed session, default `heartbeat`). `JIACLAW_HEARTBEAT_INTERVAL_SECS` overrides the interval. Missing/empty files skip the tick; CLI `chat` does not run heartbeats
 
 ### Documentation
