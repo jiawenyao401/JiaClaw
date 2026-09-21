@@ -187,7 +187,7 @@ pub struct AgentConfig {
     #[serde(default = "default_max_tool_iterations")]
     pub max_tool_iterations: usize,
 
-    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` / `memory_search` / `memory_write` / `read_file` / `list_dir` 默认启用）
+    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` / `memory_search` / `memory_write` / `read_file` / `list_dir` / `write_file` 默认启用）
     #[serde(default)]
     pub tools: ToolsConfig,
 }
@@ -562,11 +562,15 @@ fn default_list_dir_enabled() -> bool {
     true
 }
 
+fn default_write_file_enabled() -> bool {
+    true
+}
+
 /// 本地工具总配置（缺省本段不影响现有 `[http]` / `[memory]` 等段）
 ///
 /// 历史示例里的 `[tools] enabled = [...]` 列表仍可出现在文件中（未知字段忽略），
 /// 当前真正生效的是嵌套表 `[tools.web_search]`、`[tools.web_fetch]`、
-/// `[tools.memory_search]`、`[tools.memory_write]`、`[tools.read_file]` 与 `[tools.list_dir]`。
+/// `[tools.memory_search]`、`[tools.memory_write]`、`[tools.read_file]`、`[tools.list_dir]` 与 `[tools.write_file]`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
     /// `web_search` 工具配置
@@ -592,6 +596,10 @@ pub struct ToolsConfig {
     /// `list_dir` 工具配置
     #[serde(default)]
     pub list_dir: ListDirToolConfig,
+
+    /// `write_file` 工具配置
+    #[serde(default)]
+    pub write_file: WriteFileToolConfig,
 }
 
 /// 可选 `web_search` 联网检索配置
@@ -714,6 +722,22 @@ impl Default for ListDirToolConfig {
     fn default() -> Self {
         Self {
             enabled: default_list_dir_enabled(),
+        }
+    }
+}
+
+/// 可选 `write_file` 工作区文件写入配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteFileToolConfig {
+    /// 是否注册 `write_file` 工具（默认 `true`）
+    #[serde(default = "default_write_file_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for WriteFileToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_write_file_enabled(),
         }
     }
 }
@@ -1488,11 +1512,11 @@ mod tests {
         resolve_session_ttl_secs, resolve_shutdown_timeout_secs, resolve_tool_timeout_secs,
         AgentConfig, HeartbeatConfig, HttpConfig, HttpCorsConfig, ListDirToolConfig,
         MemorySearchToolConfig, MemoryWriteToolConfig, ReadFileToolConfig, SessionConfig,
-        ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-        DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS,
-        DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
-        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
-        MIN_MAX_TOOL_ITERATIONS,
+        ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, WriteFileToolConfig,
+        DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
+        DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
+        DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
+        MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -2487,6 +2511,7 @@ bind = "127.0.0.1:8080"
         assert!(config.tools.memory_write.enabled);
         assert!(config.tools.read_file.enabled);
         assert!(config.tools.list_dir.enabled);
+        assert!(config.tools.write_file.enabled);
         assert_eq!(config.http.bind, "127.0.0.1:8080");
     }
 
@@ -2538,6 +2563,10 @@ path = "MEMORY.md"
         assert!(
             config.tools.list_dir.enabled,
             "omitted [tools.list_dir] should keep default enabled"
+        );
+        assert!(
+            config.tools.write_file.enabled,
+            "omitted [tools.write_file] should keep default enabled"
         );
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.memory.path, "MEMORY.md");
@@ -2754,16 +2783,20 @@ enabled = false
         assert!(config.tools.web_fetch.enabled);
         assert!(config.tools.read_file.enabled);
         assert!(config.tools.list_dir.enabled);
+        assert!(config.tools.write_file.enabled);
     }
 
     #[test]
     fn read_file_and_list_dir_config_defaults_to_enabled() {
         assert!(ReadFileToolConfig::default().enabled);
         assert!(ListDirToolConfig::default().enabled);
+        assert!(WriteFileToolConfig::default().enabled);
         assert!(ToolsConfig::default().read_file.enabled);
         assert!(ToolsConfig::default().list_dir.enabled);
+        assert!(ToolsConfig::default().write_file.enabled);
         assert!(AgentConfig::default().tools.read_file.enabled);
         assert!(AgentConfig::default().tools.list_dir.enabled);
+        assert!(AgentConfig::default().tools.write_file.enabled);
     }
 
     #[test]
@@ -2846,6 +2879,53 @@ enabled = false
         let config = AgentConfig::from_json_str(json).expect("parse json");
         assert!(!config.tools.list_dir.enabled);
         assert!(config.tools.read_file.enabled);
+        assert!(config.tools.write_file.enabled);
+        assert!(config.tools.web_search.enabled);
+    }
+
+    #[test]
+    fn tools_write_file_parses_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools.write_file]
+enabled = false
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.write_file.enabled);
+        assert!(
+            config.tools.read_file.enabled,
+            "omitted [tools.read_file] should keep default enabled"
+        );
+        assert!(
+            config.tools.list_dir.enabled,
+            "omitted [tools.list_dir] should keep default enabled"
+        );
+    }
+
+    #[test]
+    fn tools_write_file_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "tools": {
+                "write_file": {
+                    "enabled": false
+                }
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(!config.tools.write_file.enabled);
+        assert!(config.tools.read_file.enabled);
+        assert!(config.tools.list_dir.enabled);
         assert!(config.tools.web_search.enabled);
     }
 

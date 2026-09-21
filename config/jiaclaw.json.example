@@ -81,6 +81,9 @@
       },
       "list_dir": {
         "enabled": true
+      },
+      "write_file": {
+        "enabled": true
       }
     }
 }

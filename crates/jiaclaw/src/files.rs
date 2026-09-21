@@ -1,13 +1,13 @@
 // Copyright 2026 JiaClaw contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! 工作区只读文件工具：`read_file` / `list_dir`。
+//! 工作区文件工具：`read_file` / `list_dir` / `write_file`。
 //!
 //! 路径解析复用 [`crate::memory::resolve_workspace_relative_path`]（禁 `..`、绝对路径、symlink 逃逸）。
 //! 不调用 LLM，不执行 shell。
 
 use crate::memory::{
-    canonicalize_existing_or_clone, ensure_existing_within_workspace,
+    atomic_write_bytes, canonicalize_existing_or_clone, ensure_existing_within_workspace,
     resolve_workspace_relative_path,
 };
 use crate::tools::Tool;
@@ -15,11 +15,15 @@ use async_trait::async_trait;
 use jiaclaw_core::JiaClawError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// `read_file` 单文件读取上限（字节）。超过则明确报错，不截断返回。
 pub const READ_FILE_MAX_BYTES: usize = 256 * 1024;
+
+/// `write_file` 结果文件上限（字节）。与 [`READ_FILE_MAX_BYTES`] 对齐。超过则报错且不落盘。
+pub const WRITE_FILE_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
 
 /// `list_dir` 的 `max_entries` 缺省值
 pub const LIST_DIR_DEFAULT_MAX_ENTRIES: usize = 200;
@@ -47,6 +51,59 @@ pub struct ListDirArgs {
     pub max_entries: usize,
     /// 是否递归（默认 `false`）
     pub recursive: bool,
+}
+
+/// `write_file` 写入模式：覆盖或追加。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WriteFileMode {
+    /// 覆盖整个文件（默认）
+    Overwrite,
+    /// 在已有内容后追加
+    Append,
+}
+
+impl WriteFileMode {
+    /// 解析 `overwrite` / `append`（大小写不敏感，首尾空白忽略）。
+    ///
+    /// # Errors
+    ///
+    /// 其它字符串返回错误。
+    pub fn parse(raw: &str) -> Result<Self, JiaClawError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "overwrite" => Ok(Self::Overwrite),
+            "append" => Ok(Self::Append),
+            _ => Err(JiaClawError::ToolExecution(
+                "参数 'mode' 必须是 overwrite 或 append（默认 overwrite）".to_string(),
+            )),
+        }
+    }
+
+    /// 配置 / JSON 用短名。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overwrite => "overwrite",
+            Self::Append => "append",
+        }
+    }
+
+    /// `overwrite` 对应整文件替换。
+    #[must_use]
+    pub fn is_overwrite(self) -> bool {
+        matches!(self, Self::Overwrite)
+    }
+}
+
+/// 解析后的 `write_file` 参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteFileArgs {
+    /// 工作区相对路径
+    pub path: String,
+    /// 要写入的内容
+    pub content: String,
+    /// 写入模式（默认 overwrite）
+    pub mode: WriteFileMode,
 }
 
 /// 将 `max_entries` 钳制到 `1..=1000`。
@@ -159,6 +216,223 @@ pub fn parse_list_dir_args(args: &Value) -> Result<ListDirArgs, JiaClawError> {
         path,
         max_entries,
         recursive,
+    })
+}
+
+/// 解析 `write_file` 参数：必填 `path` / `content`；可选 `mode`（默认 `overwrite`）。
+///
+/// # Errors
+///
+/// `path` 缺失/空白、`content` 缺失或不是字符串、或 `mode` 非法时返回错误。
+pub fn parse_write_file_args(args: &Value) -> Result<WriteFileArgs, JiaClawError> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            JiaClawError::ToolExecution("缺少参数 'path'（工作区相对路径）".to_string())
+        })?;
+
+    let content = match args.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        None | Some(Value::Null) => {
+            return Err(JiaClawError::ToolExecution(
+                "缺少参数 'content'".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'content' 必须是字符串".to_string(),
+            ));
+        }
+    };
+
+    let mode = match args.get("mode") {
+        None | Some(Value::Null) => WriteFileMode::Overwrite,
+        Some(Value::String(raw)) => WriteFileMode::parse(raw)?,
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'mode' 必须是 overwrite 或 append（默认 overwrite）".to_string(),
+            ));
+        }
+    };
+
+    Ok(WriteFileArgs {
+        path: path.to_string(),
+        content,
+        mode,
+    })
+}
+
+/// 解析写入目标：已存在路径 canonicalize 后必须落在工作区内且为常规文件；
+/// 不存在时沿已存在祖先 canonicalize，再拼回剩余组件（可随后创建中间目录）。
+fn prepare_workspace_write_path(workspace: &Path, rel_path: &str) -> Result<PathBuf, JiaClawError> {
+    let joined = resolve_workspace_relative_path(workspace, rel_path)?;
+    let ws = canonicalize_existing_or_clone(workspace);
+
+    let mut ancestor = joined.clone();
+    let mut suffix: Vec<OsString> = Vec::new();
+    loop {
+        if fs::symlink_metadata(&ancestor).is_ok() {
+            break;
+        }
+        match ancestor.file_name() {
+            Some(name) => {
+                suffix.push(name.to_os_string());
+                match ancestor.parent() {
+                    Some(parent) => ancestor = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+            None => break,
+        }
+        if ancestor == ws {
+            break;
+        }
+    }
+
+    if fs::symlink_metadata(&ancestor).is_err() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "无法解析写入路径 {rel_path}"
+        )));
+    }
+    if !ancestor.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 路径 {rel_path} 指向无效或损坏的链接"
+        )));
+    }
+
+    ensure_existing_within_workspace(workspace, &ancestor)?;
+    let mut current = ancestor
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析写入路径 {rel_path}: {e}")))?;
+    if !current.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 路径 {rel_path} 指向工作空间外部"
+        )));
+    }
+
+    if suffix.is_empty() {
+        if !current.is_file() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径不是文件: {rel_path}"
+            )));
+        }
+        return Ok(current);
+    }
+
+    if !current.is_dir() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径的父级不是目录: {rel_path}"
+        )));
+    }
+
+    for name in suffix.iter().rev() {
+        current.push(name);
+    }
+    if !current.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 路径 {rel_path} 指向工作空间外部"
+        )));
+    }
+    Ok(current)
+}
+
+fn atomic_write_regular_file(
+    workspace: &Path,
+    dest: &Path,
+    rel_path: &str,
+    contents: &[u8],
+) -> Result<(), JiaClawError> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| JiaClawError::ToolExecution(format!("无效的文件路径: {rel_path}")))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法创建中间目录 {rel_path}: {e}")))?;
+    ensure_existing_within_workspace(workspace, parent)?;
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析父目录 {rel_path}: {e}")))?;
+    let ws = canonicalize_existing_or_clone(workspace);
+    if !parent_canon.starts_with(&ws) || !parent_canon.is_dir() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 路径 {rel_path} 指向工作空间外部"
+        )));
+    }
+
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| JiaClawError::ToolExecution(format!("无效的文件名: {rel_path}")))?;
+    let final_path = parent_canon.join(file_name);
+    if final_path.exists() {
+        ensure_existing_within_workspace(workspace, &final_path)?;
+        let canon = final_path
+            .canonicalize()
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法解析文件 {rel_path}: {e}")))?;
+        if !canon.is_file() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径不是文件: {rel_path}"
+            )));
+        }
+        return atomic_write_bytes(&canon, contents);
+    }
+
+    atomic_write_bytes(&final_path, contents)
+}
+
+/// 写入工作区相对路径下的常规文件（覆盖或追加）。可创建中间目录。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、symlink 逃逸、不是常规文件、超过大小上限，或 IO 失败时返回错误。
+/// 超限时不落盘。
+pub fn write_workspace_regular_file(
+    workspace: &Path,
+    rel_path: &str,
+    content: &str,
+    mode: WriteFileMode,
+    max_bytes: usize,
+) -> Result<WriteFileOutput, JiaClawError> {
+    let dest = prepare_workspace_write_path(workspace, rel_path)?;
+    let new_bytes = if mode == WriteFileMode::Append && dest.exists() {
+        ensure_existing_within_workspace(workspace, &dest)?;
+        let meta = fs::metadata(&dest).map_err(|e| {
+            JiaClawError::ToolExecution(format!("无法读取文件元数据 {rel_path}: {e}"))
+        })?;
+        if !meta.is_file() {
+            return Err(JiaClawError::ToolExecution(format!(
+                "路径不是文件: {rel_path}"
+            )));
+        }
+        let existing_len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+        if existing_len.saturating_add(content.len()) > max_bytes {
+            return Err(JiaClawError::ToolExecution(format!(
+                "文件超过上限 {max_bytes} 字节（将写入 {} 字节）: {rel_path}",
+                existing_len.saturating_add(content.len())
+            )));
+        }
+        let mut existing = fs::read(&dest)
+            .map_err(|e| JiaClawError::ToolExecution(format!("无法读取文件 {rel_path}: {e}")))?;
+        existing.extend_from_slice(content.as_bytes());
+        existing
+    } else {
+        content.as_bytes().to_vec()
+    };
+
+    if new_bytes.len() > max_bytes {
+        return Err(JiaClawError::ToolExecution(format!(
+            "文件超过上限 {max_bytes} 字节（将写入 {} 字节）: {rel_path}",
+            new_bytes.len()
+        )));
+    }
+
+    atomic_write_regular_file(workspace, &dest, rel_path, &new_bytes)?;
+
+    Ok(WriteFileOutput {
+        path: rel_path.to_string(),
+        mode,
+        bytes_written: new_bytes.len(),
     })
 }
 
@@ -389,6 +663,17 @@ pub struct ListDirOutput {
     pub entries: Vec<DirEntryInfo>,
 }
 
+/// `write_file` 的 JSON 返回体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteFileOutput {
+    /// 调用方传入的工作区相对路径
+    pub path: String,
+    /// 实际使用的写入模式
+    pub mode: WriteFileMode,
+    /// 结果文件字节数
+    pub bytes_written: usize,
+}
+
 /// `read_file` 工具：读取工作区相对路径下的文本文件（路径沙箱，不调用 LLM）。
 pub struct WorkspaceReadFileTool {
     workspace_path: PathBuf,
@@ -523,6 +808,79 @@ impl Tool for WorkspaceListDirTool {
         )?;
         serde_json::to_string_pretty(&output)
             .map_err(|e| JiaClawError::ToolExecution(format!("序列化目录列表失败: {e}")))
+    }
+}
+
+/// `write_file` 工具：写入工作区相对路径下的常规文件（路径沙箱，不调用 LLM）。
+pub struct WorkspaceWriteFileTool {
+    workspace_path: PathBuf,
+    max_bytes: usize,
+}
+
+impl WorkspaceWriteFileTool {
+    /// 创建工具；写入上限为 [`WRITE_FILE_MAX_BYTES`]（与 read 对齐，256KiB）。
+    #[must_use]
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+            max_bytes: WRITE_FILE_MAX_BYTES,
+        }
+    }
+
+    /// 测试或自定义上限。
+    #[must_use]
+    pub fn with_max_bytes(workspace_path: &Path, max_bytes: usize) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+            max_bytes,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WorkspaceWriteFileTool {
+    fn name(&self) -> &str {
+        "write_file"
+    }
+
+    fn description(&self) -> &str {
+        "写入工作区相对路径下的常规文件。path / content 必填；可选 mode=overwrite|append（默认 overwrite）。禁止 .. / 绝对路径 / symlink 逃逸。可创建中间目录。结果文件超过 256KiB 则报错且不落盘。tmp + rename 原子写。返回 {path, mode, bytes_written}。不执行 shell，不调用 LLM。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "文件相对路径（相对于工作区根目录）"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "要写入的文件内容"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["overwrite", "append"],
+                    "description": "overwrite（默认）覆盖整个文件；append 追加",
+                    "default": "overwrite"
+                }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let parsed = parse_write_file_args(&args)?;
+        let output = write_workspace_regular_file(
+            &self.workspace_path,
+            &parsed.path,
+            &parsed.content,
+            parsed.mode,
+            self.max_bytes,
+        )?;
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化写入结果失败: {e}")))
     }
 }
 
@@ -774,6 +1132,198 @@ mod tests {
         assert!(result.contains("\"truncated\": true"), "{result}");
         let parsed: ListDirOutput = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.entries.len(), 2);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn parse_write_file_args_requires_path_content_and_defaults_mode() {
+        let err = parse_write_file_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path"), "{err}");
+
+        let err = parse_write_file_args(&serde_json::json!({"path": "a.md"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("content"), "{err}");
+
+        let parsed = parse_write_file_args(&serde_json::json!({
+            "path": " notes/a.md ",
+            "content": "hello"
+        }))
+        .unwrap();
+        assert_eq!(parsed.path, "notes/a.md");
+        assert_eq!(parsed.content, "hello");
+        assert_eq!(parsed.mode, WriteFileMode::Overwrite);
+
+        let parsed = parse_write_file_args(&serde_json::json!({
+            "path": "a.md",
+            "content": "more",
+            "mode": "APPEND"
+        }))
+        .unwrap();
+        assert_eq!(parsed.mode, WriteFileMode::Append);
+
+        let err = parse_write_file_args(&serde_json::json!({
+            "path": "a.md",
+            "content": "x",
+            "mode": "delete"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mode"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn write_file_overwrite_and_append() {
+        let ws = unique_temp("jiaclaw_write_file_ok");
+        let tool = WorkspaceWriteFileTool::new(&ws);
+        assert_eq!(tool.name(), "write_file");
+
+        let created = tool
+            .execute(serde_json::json!({
+                "path": "notes/hello.md",
+                "content": "alpha"
+            }))
+            .await
+            .unwrap();
+        assert!(created.contains("overwrite"), "{created}");
+        assert!(created.contains("notes/hello.md"), "{created}");
+        assert_eq!(
+            fs::read_to_string(ws.join("notes").join("hello.md")).unwrap(),
+            "alpha"
+        );
+
+        let overwritten = tool
+            .execute(serde_json::json!({
+                "path": "notes/hello.md",
+                "content": "beta",
+                "mode": "overwrite"
+            }))
+            .await
+            .unwrap();
+        assert!(overwritten.contains("overwrite"), "{overwritten}");
+        assert_eq!(
+            fs::read_to_string(ws.join("notes").join("hello.md")).unwrap(),
+            "beta"
+        );
+
+        let appended = tool
+            .execute(serde_json::json!({
+                "path": "notes/hello.md",
+                "content": "gamma",
+                "mode": "append"
+            }))
+            .await
+            .unwrap();
+        assert!(appended.contains("append"), "{appended}");
+        assert_eq!(
+            fs::read_to_string(ws.join("notes").join("hello.md")).unwrap(),
+            "betagamma"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_traversal_and_absolute() {
+        let ws = unique_temp("jiaclaw_write_file_trav");
+        let tool = WorkspaceWriteFileTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "../secret.md",
+                "content": "nope"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+        assert!(!ws.parent().unwrap().join("secret.md").exists());
+
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "/etc/passwd",
+                "content": "nope"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_rejects_symlink_escape() {
+        let ws = unique_temp("jiaclaw_write_file_symlink");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_write_outside_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret-outside").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("leak.md")).unwrap();
+
+        let tool = WorkspaceWriteFileTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "leak.md",
+                "content": "pwned"
+            }))
+            .await;
+        assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("安全") || err.contains("工作空间"), "{err}");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret-outside");
+
+        let outside_dir = ws.parent().unwrap().join(format!(
+            "jiaclaw_write_outside_dir_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, ws.join("escape")).unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "escape/pwned.md",
+                "content": "nope"
+            }))
+            .await;
+        assert!(result.is_err(), "symlink 目录逃逸应被拒绝: {result:?}");
+        assert!(!outside_dir.join("pwned.md").exists());
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_oversize_without_writing() {
+        let ws = unique_temp("jiaclaw_write_file_limits");
+        let tool = WorkspaceWriteFileTool::with_max_bytes(&ws, 8);
+        fs::write(ws.join("keep.md"), "old").unwrap();
+
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "keep.md",
+                "content": "abcdefghijk"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("超过上限"), "{err}");
+        assert_eq!(fs::read_to_string(ws.join("keep.md")).unwrap(), "old");
+
+        fs::write(ws.join("log.md"), "12345").unwrap();
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "log.md",
+                "content": "67890",
+                "mode": "append"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("超过上限"), "{err}");
+        assert_eq!(fs::read_to_string(ws.join("log.md")).unwrap(), "12345");
         let _ = fs::remove_dir_all(&ws);
     }
 }

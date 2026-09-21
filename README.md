@@ -122,7 +122,12 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 可选 `max_entries`（默认 200，钳制 1..=1000）、`recursive`（默认 `false`，且不跟随 symlink 目录）
   - 返回 `{path, recursive, truncated, entries:[{name, type, size?}]}`；`type` 为 `file` 或 `dir`
   - 配置 `[tools.list_dir] enabled`（默认 `true`）；禁止穿越 / 绝对路径 / symlink 逃逸
-  - `enabled = false` 时不注册；无 shell、不调用 LLM；**不做 write_file / exec**
+  - `enabled = false` 时不注册；无 shell、不调用 LLM
+- ✅ **可选 write_file** - 默认注册的工作区文件写入工具（`path` / `content` 必填，工作区相对路径）
+  - 可选 `mode=overwrite|append`（默认 `overwrite`）；可创建中间目录
+  - 配置 `[tools.write_file] enabled`（默认 `true`）；结果文件超过 **256KiB**（与 read_file 对齐）明确报错且不落盘
+  - tmp + rename 原子写；路径安全与 MEMORY / read_file 对齐：禁止 `..` / 绝对路径 / symlink 逃逸；只写工作区内常规文件
+  - `enabled = false` 时不注册；无 shell、不调用 LLM；**不做 exec**
 - ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
   - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
@@ -339,6 +344,11 @@ enabled = true
 [tools.list_dir]
 # 可选工作区列目录（默认启用并注册）。path 默认 . ；可选 max_entries（默认 200）。默认不递归。
 # 返回 name / type(file|dir) / 可选 size。禁止穿越。enabled = false 不注册。无 shell。
+enabled = true
+
+[tools.write_file]
+# 可选工作区文件写入（默认启用并注册）。path / content 必填；mode=overwrite|append（默认 overwrite）。
+# 结果超过 256KiB（与 read_file 对齐）报错且不落盘。原子写。禁止穿越 / symlink 逃逸。enabled = false 不注册。
 enabled = true
 ```
 
@@ -612,6 +622,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 memory_write：默认注册。只写配置的 MEMORY.md；`mode=append|overwrite`（默认 append）；结果超过 32KiB 报错；`enabled = false` 不注册。无向量库/远程 sync
 - 可选 read_file：默认注册。读取工作区相对路径文本文件；`offset`/`limit` 按行（1-indexed）；超过 256KiB 或二进制报错；禁穿越。`enabled = false` 不注册。无 shell
 - 可选 list_dir：默认注册。列出工作区目录（默认 `.`，不递归）；返回 name/type/size；禁穿越。`enabled = false` 不注册。无 shell
+- 可选 write_file：默认注册。写入工作区相对路径常规文件；`mode=overwrite|append`（默认 overwrite）；超过 256KiB 报错且不落盘；原子写；禁穿越。`enabled = false` 不注册。无 shell / exec
 
 ## 项目结构
 
@@ -758,7 +769,12 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Optional `max_entries` (default 200, clamped to 1..=1000) and `recursive` (default `false`; symlink dirs are not followed)
   - Returns `{path, recursive, truncated, entries:[{name, type, size?}]}`; `type` is `file` or `dir`
   - Configure `[tools.list_dir] enabled` (default `true`); traversal / absolute / symlink escape is rejected
-  - `enabled = false` skips registration; no shell, no LLM; **no write_file / exec**
+  - `enabled = false` skips registration; no shell, no LLM
+- ✅ **Optional write_file** - registered by default (`path` / `content` required, workspace-relative)
+  - Optional `mode=overwrite|append` (default `overwrite`); intermediate directories may be created
+  - Configure `[tools.write_file] enabled` (default `true`); resulting file over **256KiB** (aligned with read_file) is rejected and not written
+  - tmp + rename atomic write; same path policy as MEMORY / read_file: no `..` / absolute / symlink escape; regular in-workspace files only
+  - `enabled = false` skips registration; no shell, no LLM; **no exec**
 - ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
   - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
   - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
@@ -974,6 +990,11 @@ enabled = true
 [tools.list_dir]
 # Optional workspace directory listing (registered by default). path defaults to . ; max_entries default 200.
 # recursive defaults to false. Returns name / type(file|dir) / optional size. Traversal is rejected. No shell.
+enabled = true
+
+[tools.write_file]
+# Optional workspace file write (registered by default). path / content required; mode=overwrite|append (default overwrite).
+# Result over 256KiB (aligned with read_file) is rejected and not written. Atomic write. No traversal / symlink escape.
 enabled = true
 ```
 
@@ -1240,6 +1261,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional memory_write: registered by default. Writes only the configured MEMORY.md; `mode=append|overwrite` (default append); oversize >32KiB is rejected; `enabled = false` skips registration. No vector DB / remote sync
 - Optional read_file: registered by default. Reads a workspace-relative text file; `offset`/`limit` are 1-indexed lines; over 256KiB or binary is rejected; no traversal. `enabled = false` skips registration. No shell
 - Optional list_dir: registered by default. Lists a workspace directory (default `.`, non-recursive); returns name/type/size; no traversal. `enabled = false` skips registration. No shell
+- Optional write_file: registered by default. Writes a workspace-relative regular file; `mode=overwrite|append` (default overwrite); over 256KiB is rejected and not written; atomic write; no traversal. `enabled = false` skips registration. No shell / exec
 
 ### Documentation
 

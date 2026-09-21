@@ -206,6 +206,12 @@ enabled = true
 # enabled = false 不注册。无 shell、不调用 LLM。
 enabled = true
 
+[tools.write_file]
+# 可选工作区文件写入（默认启用并注册）。path / content 必填；可选 mode=overwrite|append（默认 overwrite）。
+# 结果文件超过 256KiB（与 read_file 对齐）明确报错且不落盘。tmp + rename 原子写。可创建中间目录。
+# 禁止 .. / 绝对路径 / symlink 逃逸；只写工作区内常规文件。enabled = false 不注册。无 shell、不调用 LLM。
+enabled = true
+
 [skills]
 # 启用的技能列表（示例）
 enabled = [
