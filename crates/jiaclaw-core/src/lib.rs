@@ -190,6 +190,10 @@ pub struct AgentConfig {
     /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` / `memory_search` / `memory_write` / `read_file` / `list_dir` / `write_file` 默认启用）
     #[serde(default)]
     pub tools: ToolsConfig,
+
+    /// 进程日志配置（缺省 `format = "text"`，与当前 tracing fmt 一致）
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 fn default_workspace_path() -> std::path::PathBuf {
@@ -219,6 +223,9 @@ pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 3600;
 
 /// `jiaclaw serve` 优雅退出时等待进行中请求的默认宽限期（秒）
 pub const DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
+
+/// 默认日志级别（与当前 `EnvFilter::new("info")` 回退一致）
+pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// 默认工具循环上限（与历史硬编码 `MAX_ITERATIONS = 5` 保持兼容）
 pub const DEFAULT_MAX_TOOL_ITERATIONS: usize = 5;
@@ -433,6 +440,141 @@ impl SessionConfig {
     #[must_use]
     pub fn effective_keep_recent(&self) -> usize {
         resolve_session_keep_recent(self.keep_recent)
+    }
+}
+
+/// 进程日志格式（`[logging] format`）。默认人类可读文本，与当前 tracing fmt 一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// 人类可读文本（默认；`format=text` 时行为与当前完全一致）
+    Text,
+    /// 每行一条 JSON（`timestamp` / `level` / `target` / `fields` / `message`）
+    Json,
+}
+
+impl Default for LogFormat {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
+impl LogFormat {
+    /// 配置与日志中使用的稳定名称。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl std::fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for LogFormat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LogFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        parse_log_format(&raw)
+            .ok_or_else(|| serde::de::Error::unknown_variant(raw.trim(), &["text", "json"]))
+    }
+}
+
+/// 解析 `text` / `json`（大小写不敏感）。无法识别时返回 `None`。
+#[must_use]
+pub fn parse_log_format(raw: &str) -> Option<LogFormat> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "text" => Some(LogFormat::Text),
+        "json" => Some(LogFormat::Json),
+        _ => None,
+    }
+}
+
+/// 环境变量 `JIACLAW_LOG_FORMAT` 优先；无法识别时回退配置（默认 [`LogFormat::Text`]）。
+#[must_use]
+pub fn resolve_log_format(configured: LogFormat, env_value: Option<&str>) -> LogFormat {
+    match env_value {
+        Some(raw) => parse_log_format(raw).unwrap_or(configured),
+        None => configured,
+    }
+}
+
+fn nonempty_log_directive(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+/// 解析生效的日志级别指令。
+///
+/// 优先级：`JIACLAW_LOG_LEVEL` > `RUST_LOG` > `[logging] level` > [`DEFAULT_LOG_LEVEL`]。
+/// 空白视为未设置。
+#[must_use]
+pub fn resolve_log_level(
+    configured: Option<&str>,
+    jiaclaw_env: Option<&str>,
+    rust_log: Option<&str>,
+) -> String {
+    nonempty_log_directive(jiaclaw_env)
+        .or_else(|| nonempty_log_directive(rust_log))
+        .or_else(|| nonempty_log_directive(configured))
+        .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string())
+}
+
+/// 进程日志配置（`[logging]`）。
+///
+/// 默认 `format = "text"`，保持现有人类可读 tracing fmt。`format = "json"` 时
+/// 每行一条 JSON，仍走同一套 tracing 事件（含可选 `request_id` 字段）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    /// 日志格式：`text`（默认）或 `json`。环境变量 `JIACLAW_LOG_FORMAT` 优先。
+    #[serde(default)]
+    pub format: LogFormat,
+
+    /// 日志级别指令（可选，例如 `info` 或 `jiaclaw=debug`）。
+    ///
+    /// 环境变量 `JIACLAW_LOG_LEVEL` 优先于 `RUST_LOG`，再回退本字段，最后为
+    /// [`DEFAULT_LOG_LEVEL`]。
+    #[serde(default)]
+    pub level: Option<String>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            format: LogFormat::Text,
+            level: None,
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// 解析生效的日志格式。环境变量 `JIACLAW_LOG_FORMAT` 优先。
+    #[must_use]
+    pub fn effective_format(&self) -> LogFormat {
+        resolve_log_format(
+            self.format,
+            std::env::var("JIACLAW_LOG_FORMAT").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的日志级别指令（供 `EnvFilter` 使用）。
+    #[must_use]
+    pub fn effective_level_directive(&self) -> String {
+        resolve_log_level(
+            self.level.as_deref(),
+            std::env::var("JIACLAW_LOG_LEVEL").ok().as_deref(),
+            std::env::var("RUST_LOG").ok().as_deref(),
+        )
     }
 }
 
@@ -1338,6 +1480,7 @@ impl Default for AgentConfig {
             tool_timeout_secs: None,
             max_tool_iterations: default_max_tool_iterations(),
             tools: ToolsConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -1402,12 +1545,14 @@ impl AgentConfig {
             session: Option<SessionConfig>,
             #[serde(default)]
             tools: Option<ToolsConfig>,
+            #[serde(default)]
+            logging: Option<LoggingConfig>,
         }
 
         let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory / identity / heartbeat / session / tools 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity / heartbeat / session / tools / logging 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -1428,6 +1573,9 @@ impl AgentConfig {
         }
         if let Some(tools) = config_file.tools {
             config_file.agent.tools = tools;
+        }
+        if let Some(logging) = config_file.logging {
+            config_file.agent.logging = logging;
         }
 
         Ok(config_file.agent)
@@ -1467,12 +1615,14 @@ impl AgentConfig {
             session: Option<SessionConfig>,
             #[serde(default)]
             tools: Option<ToolsConfig>,
+            #[serde(default)]
+            logging: Option<LoggingConfig>,
         }
 
         let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory / identity / heartbeat / session / tools 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity / heartbeat / session / tools / logging 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -1494,6 +1644,9 @@ impl AgentConfig {
         if let Some(tools) = config_file.tools {
             config_file.agent.tools = tools;
         }
+        if let Some(logging) = config_file.logging {
+            config_file.agent.logging = logging;
+        }
 
         Ok(config_file.agent)
     }
@@ -1502,21 +1655,23 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_boolish_flag, parse_cors_enabled, parse_cors_origins, parse_metrics_require_auth,
-        parse_positive_heartbeat_interval, parse_positive_max_tool_iterations,
-        parse_positive_rate_limit, parse_positive_session_ttl, parse_positive_shutdown_timeout,
-        parse_positive_tool_timeout, parse_session_summarize_on_overflow, resolve_cors_enabled,
-        resolve_cors_origins, resolve_heartbeat_interval_secs, resolve_max_tool_iterations,
-        resolve_metrics_public, resolve_optional_secret, resolve_rate_limit_per_minute,
-        resolve_session_keep_recent, resolve_session_summarize_on_overflow,
-        resolve_session_ttl_secs, resolve_shutdown_timeout_secs, resolve_tool_timeout_secs,
-        AgentConfig, HeartbeatConfig, HttpConfig, HttpCorsConfig, ListDirToolConfig,
+        parse_boolish_flag, parse_cors_enabled, parse_cors_origins, parse_log_format,
+        parse_metrics_require_auth, parse_positive_heartbeat_interval,
+        parse_positive_max_tool_iterations, parse_positive_rate_limit, parse_positive_session_ttl,
+        parse_positive_shutdown_timeout, parse_positive_tool_timeout,
+        parse_session_summarize_on_overflow, resolve_cors_enabled, resolve_cors_origins,
+        resolve_heartbeat_interval_secs, resolve_log_format, resolve_log_level,
+        resolve_max_tool_iterations, resolve_metrics_public, resolve_optional_secret,
+        resolve_rate_limit_per_minute, resolve_session_keep_recent,
+        resolve_session_summarize_on_overflow, resolve_session_ttl_secs,
+        resolve_shutdown_timeout_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
+        HttpConfig, HttpCorsConfig, ListDirToolConfig, LogFormat, LoggingConfig,
         MemorySearchToolConfig, MemoryWriteToolConfig, ReadFileToolConfig, SessionConfig,
         ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, WriteFileToolConfig,
         DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-        DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
-        DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
-        MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
+        DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_LOG_LEVEL, DEFAULT_MAX_TOOL_ITERATIONS,
+        DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
+        MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -1555,6 +1710,132 @@ mod tests {
     fn http_config_metrics_public_defaults_to_true() {
         assert!(HttpConfig::default().metrics_public);
         assert!(HttpConfig::default().effective_metrics_public());
+    }
+
+    #[test]
+    fn logging_config_defaults_to_text() {
+        let logging = LoggingConfig::default();
+        assert_eq!(logging.format, LogFormat::Text);
+        assert_eq!(logging.level, None);
+        assert_eq!(AgentConfig::default().logging.format, LogFormat::Text);
+        assert_eq!(DEFAULT_LOG_LEVEL, "info");
+        assert_eq!(resolve_log_level(None, None, None), "info");
+    }
+
+    #[test]
+    fn parse_log_format_accepts_text_and_json() {
+        assert_eq!(parse_log_format("text"), Some(LogFormat::Text));
+        assert_eq!(parse_log_format(" JSON "), Some(LogFormat::Json));
+        assert_eq!(parse_log_format("Text"), Some(LogFormat::Text));
+        assert_eq!(parse_log_format(""), None);
+        assert_eq!(parse_log_format("pretty"), None);
+        assert_eq!(parse_log_format("compact"), None);
+    }
+
+    #[test]
+    fn resolve_log_format_env_overrides_config() {
+        assert_eq!(
+            resolve_log_format(LogFormat::Text, Some("json")),
+            LogFormat::Json
+        );
+        assert_eq!(
+            resolve_log_format(LogFormat::Json, Some("text")),
+            LogFormat::Text
+        );
+        assert_eq!(
+            resolve_log_format(LogFormat::Json, Some("nope")),
+            LogFormat::Json
+        );
+        assert_eq!(
+            resolve_log_format(LogFormat::Text, Some("")),
+            LogFormat::Text
+        );
+        assert_eq!(resolve_log_format(LogFormat::Json, None), LogFormat::Json);
+    }
+
+    #[test]
+    fn resolve_log_level_prefers_jiaclaw_env_then_rust_log() {
+        assert_eq!(
+            resolve_log_level(Some("warn"), Some("debug"), Some("error")),
+            "debug"
+        );
+        assert_eq!(
+            resolve_log_level(Some("warn"), None, Some("error")),
+            "error"
+        );
+        assert_eq!(resolve_log_level(Some("warn"), None, None), "warn");
+        assert_eq!(resolve_log_level(None, Some("  "), Some("trace")), "trace");
+        assert_eq!(resolve_log_level(Some("  "), None, None), "info");
+    }
+
+    #[test]
+    fn logging_config_parses_default_text_when_section_missing() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.logging.format, LogFormat::Text);
+        assert_eq!(config.logging.level, None);
+    }
+
+    #[test]
+    fn logging_config_parses_json_format_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[logging]
+format = "json"
+level = "debug"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.logging.format, LogFormat::Json);
+        assert_eq!(config.logging.level.as_deref(), Some("debug"));
+        assert_eq!(
+            resolve_log_format(config.logging.format, Some("json")),
+            LogFormat::Json
+        );
+    }
+
+    #[test]
+    fn logging_config_parses_missing_logging_from_json_as_text() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert_eq!(config.logging.format, LogFormat::Text);
+        assert_eq!(config.logging.level, None);
+    }
+
+    #[test]
+    fn logging_config_parses_json_format_from_json_file() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "logging": {
+                "format": "json",
+                "level": "warn"
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert_eq!(config.logging.format, LogFormat::Json);
+        assert_eq!(config.logging.level.as_deref(), Some("warn"));
     }
 
     #[test]
