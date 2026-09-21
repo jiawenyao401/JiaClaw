@@ -540,6 +540,257 @@ impl Tool for HttpGetTool {
     }
 }
 
+/// Brave Search 默认端点
+pub const DEFAULT_BRAVE_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
+
+/// `web_search` HTTP 超时（秒）；仍遵守注册表级 `tool_timeout_secs`
+pub const WEB_SEARCH_HTTP_TIMEOUT_SECS: u64 = 10;
+
+/// `max_results` 缺省值
+pub const WEB_SEARCH_DEFAULT_MAX_RESULTS: usize = 5;
+
+/// `max_results` 上限（含）
+pub const WEB_SEARCH_MAX_RESULTS: usize = 10;
+
+/// 将 `max_results` 钳制到 `1..=10`。
+#[must_use]
+pub fn clamp_web_search_max_results(raw: u64) -> usize {
+    usize::try_from(raw)
+        .unwrap_or(WEB_SEARCH_MAX_RESULTS)
+        .clamp(1, WEB_SEARCH_MAX_RESULTS)
+}
+
+/// 解析 `web_search` 参数：必填 `query`，可选 `max_results`（默认 5，钳制 1..=10）。
+///
+/// # Errors
+///
+/// `query` 缺失/空白，或 `max_results` 不是数字时返回错误。
+pub fn parse_web_search_args(args: &Value) -> Result<(String, usize), JiaClawError> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'query'（非空字符串）".to_string()))?;
+
+    let max_results = match args.get("max_results") {
+        None => WEB_SEARCH_DEFAULT_MAX_RESULTS,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()));
+            match raw {
+                Some(n) => clamp_web_search_max_results(n),
+                None => {
+                    return Err(JiaClawError::ToolExecution(
+                        "参数 'max_results' 必须是整数（将钳制到 1..=10）".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+
+    Ok((query.to_string(), max_results))
+}
+
+fn percent_encode_query(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            b' ' => encoded.push_str("%20"),
+            _ => {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    encoded
+}
+
+const WEB_SEARCH_MISSING_KEY_HINT: &str = "web_search 需要 Brave Search API key。\
+请设置环境变量 JIACLAW_BRAVE_API_KEY，或在配置中设置 [tools.web_search] brave_api_key。\
+可在 https://brave.com/search/api/ 申请。若暂不使用该工具，设置 [tools.web_search] enabled = false。";
+
+/// 联网检索工具（Brave Search；无 key 时返回友好错误，不访问网络）
+pub struct WebSearchTool {
+    api_key: Option<String>,
+    endpoint: String,
+}
+
+impl WebSearchTool {
+    /// 使用默认 Brave 端点创建工具
+    #[must_use]
+    pub fn new(api_key: Option<String>) -> Self {
+        Self {
+            api_key,
+            endpoint: DEFAULT_BRAVE_SEARCH_ENDPOINT.to_string(),
+        }
+    }
+
+    /// 指定检索端点（测试可指向 mockito；生产默认 Brave）
+    #[must_use]
+    pub fn with_endpoint(api_key: Option<String>, endpoint: impl Into<String>) -> Self {
+        Self {
+            api_key,
+            endpoint: endpoint.into(),
+        }
+    }
+}
+
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BraveSearchResponse {
+    #[serde(default)]
+    web: Option<BraveWebResults>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct BraveWebResults {
+    #[serde(default)]
+    results: Vec<BraveSearchHit>,
+}
+
+#[derive(serde::Deserialize)]
+struct BraveSearchHit {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default, alias = "snippet")]
+    description: String,
+}
+
+#[derive(serde::Serialize)]
+struct WebSearchResultItem {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+
+    fn description(&self) -> &str {
+        "使用搜索引擎检索网页，返回若干条 {title, url, snippet}。默认 Brave Search（需 API key）；未配置 key 时返回友好错误。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索查询（必填）"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "返回条数（可选，默认 5，钳制到 1..=10）",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 5
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let (query, max_results) = parse_web_search_args(&args)?;
+
+        let Some(api_key) = self
+            .api_key
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        else {
+            return Err(JiaClawError::ToolExecution(
+                WEB_SEARCH_MISSING_KEY_HINT.to_string(),
+            ));
+        };
+
+        let endpoint = self.endpoint.clone();
+        let api_key = api_key.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            perform_brave_search(&endpoint, &api_key, &query, max_results)
+        })
+        .await
+        .map_err(|e| JiaClawError::ToolExecution(format!("任务执行失败: {e}")))?
+    }
+}
+
+fn perform_brave_search(
+    endpoint: &str,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<String, JiaClawError> {
+    let separator = if endpoint.contains('?') { '&' } else { '?' };
+    let url = format!(
+        "{endpoint}{separator}q={}&count={max_results}",
+        percent_encode_query(query)
+    );
+
+    tracing::debug!("web_search 请求: {url}");
+
+    let response = minreq::get(&url)
+        .with_header("Accept", "application/json")
+        .with_header("User-Agent", "JiaClaw/0.1 (web_search)")
+        .with_header("X-Subscription-Token", api_key)
+        .with_timeout(WEB_SEARCH_HTTP_TIMEOUT_SECS)
+        .send()
+        .map_err(|e| JiaClawError::ToolExecution(format!("web_search 请求失败: {e}")))?;
+
+    let status = response.status_code;
+    if status == 401 || status == 403 {
+        return Err(JiaClawError::ToolExecution(
+            format!(
+                "Brave Search 拒绝了 API key（HTTP {status}）。请检查 JIACLAW_BRAVE_API_KEY 或 [tools.web_search] brave_api_key。"
+            ),
+        ));
+    }
+    if status == 429 {
+        return Err(JiaClawError::ToolExecution(
+            "Brave Search 触发限流（HTTP 429），请稍后重试。".to_string(),
+        ));
+    }
+    if status != 200 {
+        return Err(JiaClawError::ToolExecution(format!(
+            "Brave Search 返回 HTTP {status}"
+        )));
+    }
+
+    let parsed: BraveSearchResponse = response
+        .json()
+        .map_err(|e| JiaClawError::ToolExecution(format!("解析 Brave Search 响应失败: {e}")))?;
+
+    let items: Vec<WebSearchResultItem> = parsed
+        .web
+        .unwrap_or_default()
+        .results
+        .into_iter()
+        .take(max_results)
+        .map(|hit| WebSearchResultItem {
+            title: hit.title,
+            url: hit.url,
+            snippet: hit.description,
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&items)
+        .map_err(|e| JiaClawError::ToolExecution(format!("序列化搜索结果失败: {e}")))
+}
+
 /// `DateTime` 工具
 pub struct DateTimeTool;
 
@@ -1487,5 +1738,146 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("不在安全白名单中"));
 
         let _ = fs::remove_dir_all(&temp_workspace);
+    }
+
+    #[test]
+    fn parse_web_search_args_requires_non_empty_query() {
+        let err = parse_web_search_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query"), "{err}");
+
+        let err = parse_web_search_args(&serde_json::json!({"query": "   "}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query"), "{err}");
+    }
+
+    #[test]
+    fn parse_web_search_args_defaults_and_clamps_max_results() {
+        let (query, max_results) =
+            parse_web_search_args(&serde_json::json!({"query": " rust "})).unwrap();
+        assert_eq!(query, "rust");
+        assert_eq!(max_results, WEB_SEARCH_DEFAULT_MAX_RESULTS);
+
+        let (_, max_results) =
+            parse_web_search_args(&serde_json::json!({"query": "q", "max_results": 1})).unwrap();
+        assert_eq!(max_results, 1);
+
+        let (_, max_results) =
+            parse_web_search_args(&serde_json::json!({"query": "q", "max_results": 0})).unwrap();
+        assert_eq!(max_results, 1);
+
+        let (_, max_results) =
+            parse_web_search_args(&serde_json::json!({"query": "q", "max_results": 99})).unwrap();
+        assert_eq!(max_results, WEB_SEARCH_MAX_RESULTS);
+
+        let err = parse_web_search_args(&serde_json::json!({
+            "query": "q",
+            "max_results": "nope"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_results"), "{err}");
+    }
+
+    #[test]
+    fn clamp_web_search_max_results_bounds() {
+        assert_eq!(clamp_web_search_max_results(0), 1);
+        assert_eq!(clamp_web_search_max_results(5), 5);
+        assert_eq!(clamp_web_search_max_results(10), 10);
+        assert_eq!(clamp_web_search_max_results(11), 10);
+    }
+
+    #[tokio::test]
+    async fn web_search_without_key_returns_friendly_error() {
+        let tool = WebSearchTool::new(None);
+        assert_eq!(tool.name(), "web_search");
+        let err = tool
+            .execute(serde_json::json!({"query": "hello"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("JIACLAW_BRAVE_API_KEY"), "{err}");
+        assert!(err.contains("tools.web_search"), "{err}");
+        assert!(
+            !err.to_lowercase().contains("bsa-"),
+            "must not leak api key: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_blank_key_returns_friendly_error() {
+        let tool = WebSearchTool::new(Some("   ".to_string()));
+        let err = tool
+            .execute(serde_json::json!({"query": "hello"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Brave Search API key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn web_search_with_key_hits_brave_endpoint_and_parses_results() {
+        let path = "/web-search-parse";
+        let _mock = mockito::mock("GET", path)
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("q".into(), "hello world".into()),
+                mockito::Matcher::UrlEncoded("count".into(), "2".into()),
+            ]))
+            .match_header("X-Subscription-Token", "test-brave-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"web":{"results":[
+                    {"title":"Hello","url":"https://example.com/hello","description":"A greeting"},
+                    {"title":"World","url":"https://example.com/world","snippet":"The planet"}
+                ]}}"#,
+            )
+            .create();
+
+        let tool = WebSearchTool::with_endpoint(
+            Some("test-brave-key".to_string()),
+            format!("{}{path}", mockito::server_url()),
+        );
+        let result = tool
+            .execute(serde_json::json!({"query": "hello world", "max_results": 2}))
+            .await
+            .unwrap();
+
+        assert!(result.contains("Hello"), "{result}");
+        assert!(result.contains("https://example.com/hello"), "{result}");
+        assert!(result.contains("A greeting"), "{result}");
+        assert!(result.contains("The planet"), "{result}");
+        assert!(
+            !result.contains("test-brave-key"),
+            "must not echo api key: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_unauthorized_does_not_echo_key() {
+        let path = "/web-search-401";
+        let _mock = mockito::mock("GET", path)
+            .match_query(mockito::Matcher::Any)
+            .match_header("X-Subscription-Token", "secret-key-value")
+            .with_status(401)
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .create();
+
+        let tool = WebSearchTool::with_endpoint(
+            Some("secret-key-value".to_string()),
+            format!("{}{path}", mockito::server_url()),
+        );
+        let err = tool
+            .execute(serde_json::json!({"query": "hello"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("401"), "{err}");
+        assert!(
+            !err.contains("secret-key-value"),
+            "must not leak api key: {err}"
+        );
     }
 }
