@@ -120,6 +120,12 @@ persist_path = ".jiaclaw/sessions.json"
 # 超限返回 429 并带 Retry-After。
 # rate_limit_per_minute = 60
 
+# HTTP 请求体上限（可选，环境变量 JIACLAW_MAX_BODY_BYTES 优先）
+# 正整数：超过该字节数返回 413 Payload Too Large（JSON error=payload_too_large，仍带 X-Request-Id）
+# 未设置、0 或非法回退默认 1048576（1MiB）。GET /health 与 GET /metrics 不检查。
+# 不做上传 / multipart 存储。
+# max_body_bytes = 1048576
+
 # GET /metrics 是否公开（默认 true，无需 API Bearer，便于 Prometheus scrape）
 # 设为 false 时与 /api/* 相同鉴权。环境变量 JIACLAW_METRICS_REQUIRE_AUTH=1 优先表示要求鉴权。
 # metrics_public = true

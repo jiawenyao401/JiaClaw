@@ -224,6 +224,12 @@ pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 3600;
 /// `jiaclaw serve` 优雅退出时等待进行中请求的默认宽限期（秒）
 pub const DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
 
+/// HTTP 请求体默认上限（1 MiB）。
+///
+/// axum 提取器另有约 2MiB 的隐式上限；JiaClaw 在中间件层默认收紧为 1MiB，
+/// 并允许通过 `[http] max_body_bytes` / `JIACLAW_MAX_BODY_BYTES` 调整。
+pub const DEFAULT_HTTP_MAX_BODY_BYTES: u64 = 1_048_576;
+
 /// 默认日志级别（与当前 `EnvFilter::new("info")` 回退一致）
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -1123,6 +1129,13 @@ pub struct HttpConfig {
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
 
+    /// HTTP 请求体上限（字节，环境变量 `JIACLAW_MAX_BODY_BYTES` 优先）
+    ///
+    /// 超限返回 413。正整数生效；未设置、`0` 或无法解析时回退 [`DEFAULT_HTTP_MAX_BODY_BYTES`]。
+    /// `GET /health` 与 `GET /metrics` 不检查该上限。
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: u64,
+
     /// `GET /metrics` 是否无需 API Bearer（默认 `true`，便于 Prometheus scrape）。
     ///
     /// 设为 `false` 时与 `/api/*` 相同鉴权。环境变量 `JIACLAW_METRICS_REQUIRE_AUTH=1`
@@ -1147,6 +1160,10 @@ fn default_shutdown_timeout_secs() -> u64 {
     DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
 }
 
+fn default_max_body_bytes() -> u64 {
+    DEFAULT_HTTP_MAX_BODY_BYTES
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -1165,6 +1182,7 @@ impl Default for HttpConfig {
             rate_limit_per_minute: None,
             session_ttl_secs: None,
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            max_body_bytes: default_max_body_bytes(),
             metrics_public: default_metrics_public(),
         }
     }
@@ -1251,6 +1269,33 @@ pub fn resolve_shutdown_timeout_secs(configured: u64, env_value: Option<&str>) -
     }
 }
 
+/// 解析正整数请求体上限（字节）；`0` 或无法解析时返回 `None`。
+#[must_use]
+pub fn parse_positive_max_body_bytes(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+fn fallback_max_body_bytes(configured: u64) -> u64 {
+    if configured > 0 {
+        configured
+    } else {
+        DEFAULT_HTTP_MAX_BODY_BYTES
+    }
+}
+
+/// 根据配置文件值与可选环境变量解析 HTTP 请求体上限（字节）。
+///
+/// 环境变量 `JIACLAW_MAX_BODY_BYTES` 优先（仅正整数）；非法 / `0` 回退配置，
+/// 配置亦非正整数时回退 [`DEFAULT_HTTP_MAX_BODY_BYTES`]。
+#[must_use]
+pub fn resolve_max_body_bytes(configured: u64, env_value: Option<&str>) -> u64 {
+    match env_value {
+        Some(raw) => parse_positive_max_body_bytes(raw)
+            .unwrap_or_else(|| fallback_max_body_bytes(configured)),
+        None => fallback_max_body_bytes(configured),
+    }
+}
+
 /// 解析正整数工具超时（秒）；`0` 或无法解析时视为不启用。
 #[must_use]
 pub fn parse_positive_tool_timeout(raw: &str) -> Option<u64> {
@@ -1334,6 +1379,18 @@ impl HttpConfig {
             std::env::var("JIACLAW_SHUTDOWN_TIMEOUT_SECS")
                 .ok()
                 .as_deref(),
+        )
+    }
+
+    /// 解析生效的 HTTP 请求体上限（字节）。
+    ///
+    /// 环境变量 `JIACLAW_MAX_BODY_BYTES` 优先于配置文件。
+    /// 仅正整数生效；非法 / `0` 回退配置或默认 1MiB。
+    #[must_use]
+    pub fn effective_max_body_bytes(&self) -> u64 {
+        resolve_max_body_bytes(
+            self.max_body_bytes,
+            std::env::var("JIACLAW_MAX_BODY_BYTES").ok().as_deref(),
         )
     }
 
@@ -1664,21 +1721,22 @@ mod tests {
     use super::{
         parse_boolish_flag, parse_cors_enabled, parse_cors_origins, parse_log_format,
         parse_metrics_require_auth, parse_positive_heartbeat_interval,
-        parse_positive_max_tool_iterations, parse_positive_rate_limit, parse_positive_session_ttl,
-        parse_positive_shutdown_timeout, parse_positive_tool_timeout,
-        parse_session_summarize_on_overflow, resolve_cors_enabled, resolve_cors_origins,
-        resolve_heartbeat_interval_secs, resolve_log_format, resolve_log_level,
-        resolve_max_tool_iterations, resolve_metrics_public, resolve_optional_secret,
-        resolve_rate_limit_per_minute, resolve_session_keep_recent,
-        resolve_session_summarize_on_overflow, resolve_session_ttl_secs,
-        resolve_shutdown_timeout_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
-        HttpConfig, HttpCorsConfig, ListDirToolConfig, LogFormat, LoggingConfig,
-        MemorySearchToolConfig, MemoryWriteToolConfig, ReadFileToolConfig, SessionConfig,
-        ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, WriteFileToolConfig,
+        parse_positive_max_body_bytes, parse_positive_max_tool_iterations,
+        parse_positive_rate_limit, parse_positive_session_ttl, parse_positive_shutdown_timeout,
+        parse_positive_tool_timeout, parse_session_summarize_on_overflow, resolve_cors_enabled,
+        resolve_cors_origins, resolve_heartbeat_interval_secs, resolve_log_format,
+        resolve_log_level, resolve_max_body_bytes, resolve_max_tool_iterations,
+        resolve_metrics_public, resolve_optional_secret, resolve_rate_limit_per_minute,
+        resolve_session_keep_recent, resolve_session_summarize_on_overflow,
+        resolve_session_ttl_secs, resolve_shutdown_timeout_secs, resolve_tool_timeout_secs,
+        AgentConfig, HeartbeatConfig, HttpConfig, HttpCorsConfig, ListDirToolConfig, LogFormat,
+        LoggingConfig, MemorySearchToolConfig, MemoryWriteToolConfig, ReadFileToolConfig,
+        SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig, WriteFileToolConfig,
         DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-        DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_LOG_LEVEL, DEFAULT_MAX_TOOL_ITERATIONS,
-        DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
-        MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
+        DEFAULT_HTTP_MAX_BODY_BYTES, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_LOG_LEVEL,
+        DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
+        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
+        MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -1710,6 +1768,24 @@ mod tests {
         assert_eq!(
             resolve_shutdown_timeout_secs(DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, None),
             DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn http_config_max_body_bytes_defaults_to_1mib() {
+        assert_eq!(DEFAULT_HTTP_MAX_BODY_BYTES, 1_048_576);
+        assert_eq!(
+            HttpConfig::default().max_body_bytes,
+            DEFAULT_HTTP_MAX_BODY_BYTES
+        );
+        assert_eq!(
+            HttpConfig::default().effective_max_body_bytes(),
+            DEFAULT_HTTP_MAX_BODY_BYTES
+        );
+        assert_eq!(resolve_max_body_bytes(0, None), DEFAULT_HTTP_MAX_BODY_BYTES);
+        assert_eq!(
+            resolve_max_body_bytes(DEFAULT_HTTP_MAX_BODY_BYTES, None),
+            DEFAULT_HTTP_MAX_BODY_BYTES
         );
     }
 
@@ -2078,6 +2154,37 @@ max_age_secs = 600
     }
 
     #[test]
+    fn parse_positive_max_body_bytes_accepts_only_positive_integers() {
+        assert_eq!(parse_positive_max_body_bytes("1048576"), Some(1_048_576));
+        assert_eq!(parse_positive_max_body_bytes(" 64 "), Some(64));
+        assert_eq!(parse_positive_max_body_bytes("0"), None);
+        assert_eq!(parse_positive_max_body_bytes(""), None);
+        assert_eq!(parse_positive_max_body_bytes("abc"), None);
+        assert_eq!(parse_positive_max_body_bytes("-1"), None);
+    }
+
+    #[test]
+    fn resolve_max_body_bytes_env_overrides_and_falls_back() {
+        assert_eq!(resolve_max_body_bytes(1_048_576, Some("2048")), 2048);
+        assert_eq!(
+            resolve_max_body_bytes(4096, Some("0")),
+            4096,
+            "env 0 应忽略并回退配置"
+        );
+        assert_eq!(
+            resolve_max_body_bytes(4096, Some("nope")),
+            4096,
+            "非法 env 应忽略并回退配置"
+        );
+        assert_eq!(resolve_max_body_bytes(8192, None), 8192);
+        assert_eq!(resolve_max_body_bytes(0, None), DEFAULT_HTTP_MAX_BODY_BYTES);
+        assert_eq!(
+            resolve_max_body_bytes(0, Some("bad")),
+            DEFAULT_HTTP_MAX_BODY_BYTES
+        );
+    }
+
+    #[test]
     fn parse_positive_tool_timeout_accepts_only_positive_integers() {
         assert_eq!(parse_positive_tool_timeout("30"), Some(30));
         assert_eq!(parse_positive_tool_timeout(" 1 "), Some(1));
@@ -2193,6 +2300,7 @@ session_ttl_secs = 3600
             config.http.shutdown_timeout_secs,
             DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
         );
+        assert_eq!(config.http.max_body_bytes, DEFAULT_HTTP_MAX_BODY_BYTES);
         assert!(config.http.metrics_public);
         assert_eq!(config.http.api_token, None);
         assert_eq!(config.http.webhook_secret, None);
@@ -2221,6 +2329,24 @@ shutdown_timeout_secs = 5
 "#;
         let config = AgentConfig::from_toml_str(toml).expect("parse toml");
         assert_eq!(config.http.shutdown_timeout_secs, 5);
+    }
+
+    #[test]
+    fn http_config_parses_max_body_bytes_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:8080"
+max_body_bytes = 2048
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.http.max_body_bytes, 2048);
+        assert_eq!(config.http.effective_max_body_bytes(), 2048);
     }
 
     #[test]
@@ -2410,6 +2536,7 @@ tool_timeout_secs = 30
             config.http.shutdown_timeout_secs,
             DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS
         );
+        assert_eq!(config.http.max_body_bytes, DEFAULT_HTTP_MAX_BODY_BYTES);
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
         assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
         assert_eq!(config.identity.user_path, DEFAULT_USER_PATH);
