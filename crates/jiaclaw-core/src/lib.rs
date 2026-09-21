@@ -378,6 +378,20 @@ pub struct HttpConfig {
     #[serde(default)]
     pub telegram_bot_token: Option<String>,
 
+    /// Slack Events API signing secret（可选，环境变量 `JIACLAW_SLACK_SIGNING_SECRET` 优先）
+    ///
+    /// 配置后，`POST /hooks/slack` 校验 `X-Slack-Signature` + `X-Slack-Request-Timestamp`
+    ///（官方 v0 HMAC-SHA256，时间窗 ±5 分钟）。未配置则开放（开发友好，与 telegram 一致）。
+    #[serde(default)]
+    pub slack_signing_secret: Option<String>,
+
+    /// Slack Bot token（可选，环境变量 `JIACLAW_SLACK_BOT_TOKEN` 优先）
+    ///
+    /// 配置后，`POST /hooks/slack` 在得到 assistant 回复时会调用 `chat.postMessage` 推回 channel。
+    /// 未配置则仅同步 JSON 回传 `reply`。
+    #[serde(default)]
+    pub slack_bot_token: Option<String>,
+
     /// CORS 允许的来源列表（空或 `["*"]` 表示允许所有来源）
     #[serde(default = "default_cors_allow_origins")]
     pub cors_allow_origins: Vec<String>,
@@ -423,6 +437,8 @@ impl Default for HttpConfig {
             webhook_secret: None,
             telegram_secret: None,
             telegram_bot_token: None,
+            slack_signing_secret: None,
+            slack_bot_token: None,
             cors_allow_origins: default_cors_allow_origins(),
             persist: false,
             persist_path: default_persist_path(),
@@ -538,6 +554,30 @@ impl HttpConfig {
         resolve_optional_secret(
             self.telegram_bot_token.clone(),
             std::env::var("JIACLAW_TELEGRAM_BOT_TOKEN").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的 Slack signing secret。
+    ///
+    /// 环境变量 `JIACLAW_SLACK_SIGNING_SECRET` 优先于配置文件；空白视为未配置。
+    #[must_use]
+    pub fn effective_slack_signing_secret(&self) -> Option<String> {
+        resolve_optional_secret(
+            self.slack_signing_secret.clone(),
+            std::env::var("JIACLAW_SLACK_SIGNING_SECRET")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// 解析生效的 Slack Bot token。
+    ///
+    /// 环境变量 `JIACLAW_SLACK_BOT_TOKEN` 优先于配置文件；空白视为未配置。
+    #[must_use]
+    pub fn effective_slack_bot_token(&self) -> Option<String> {
+        resolve_optional_secret(
+            self.slack_bot_token.clone(),
+            std::env::var("JIACLAW_SLACK_BOT_TOKEN").ok().as_deref(),
         )
     }
 }
@@ -862,6 +902,8 @@ session_ttl_secs = 3600
         assert_eq!(config.http.webhook_secret, None);
         assert_eq!(config.http.telegram_secret, None);
         assert_eq!(config.http.telegram_bot_token, None);
+        assert_eq!(config.http.slack_signing_secret, None);
+        assert_eq!(config.http.slack_bot_token, None);
         assert_eq!(config.tool_timeout_secs, None);
     }
 
@@ -869,6 +911,8 @@ session_ttl_secs = 3600
     fn http_config_telegram_secret_defaults_to_none() {
         assert_eq!(HttpConfig::default().telegram_secret, None);
         assert_eq!(HttpConfig::default().telegram_bot_token, None);
+        assert_eq!(HttpConfig::default().slack_signing_secret, None);
+        assert_eq!(HttpConfig::default().slack_bot_token, None);
     }
 
     #[test]
@@ -916,6 +960,35 @@ telegram_bot_token = "123456:ABC-bot-token"
             config.http.telegram_bot_token.as_deref(),
             Some("123456:ABC-bot-token")
         );
+        assert_eq!(config.http.slack_signing_secret, None);
+        assert_eq!(config.http.slack_bot_token, None);
+    }
+
+    #[test]
+    fn http_config_parses_slack_fields_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:8080"
+slack_signing_secret = "slack-signing-secret"
+slack_bot_token = "xoxb-test-token"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(
+            config.http.slack_signing_secret.as_deref(),
+            Some("slack-signing-secret")
+        );
+        assert_eq!(
+            config.http.slack_bot_token.as_deref(),
+            Some("xoxb-test-token")
+        );
+        assert_eq!(config.http.telegram_bot_token, None);
+        assert_eq!(config.http.telegram_secret, None);
     }
 
     #[test]

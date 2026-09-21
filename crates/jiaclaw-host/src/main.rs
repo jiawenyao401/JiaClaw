@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use axum::{
+    body::Bytes,
     extract::{Path, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
@@ -22,6 +23,7 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
+use hmac::{Hmac, Mac};
 use jiaclaw::{
     inspect_heartbeat_file, inspect_identity_file, inspect_memory_file, load_heartbeat_message,
     resolve_heartbeat_path, JiaClawAgent, Workspace,
@@ -29,13 +31,14 @@ use jiaclaw::{
 use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::Sha256;
 use std::{
     collections::HashMap,
     convert::Infallible,
     num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
@@ -57,6 +60,27 @@ const TELEGRAM_MAX_TEXT_LEN: usize = 4096;
 
 /// Telegram 出站 HTTP 超时（秒）。
 const TELEGRAM_SEND_TIMEOUT_SECS: u64 = 10;
+
+/// Slack Events API 签名头（官方名称，大小写不敏感）。
+const X_SLACK_SIGNATURE: &str = "X-Slack-Signature";
+
+/// Slack Events API 请求时间戳头（Unix 秒）。
+const X_SLACK_REQUEST_TIMESTAMP: &str = "X-Slack-Request-Timestamp";
+
+/// Slack Web API 默认根路径。
+const SLACK_API_BASE: &str = "https://slack.com/api";
+
+/// Slack `chat.postMessage` 文本上限（字符）。
+const SLACK_MAX_TEXT_LEN: usize = 40_000;
+
+/// Slack 出站 HTTP 超时（秒）。
+const SLACK_SEND_TIMEOUT_SECS: u64 = 10;
+
+/// Slack 签名时间窗（秒）：`|now - timestamp|` 超过则拒绝。
+const SLACK_MAX_TIMESTAMP_SKEW_SECS: u64 = 300;
+
+/// HMAC-SHA256 用于 Slack v0 签名。
+type HmacSha256 = Hmac<Sha256>;
 
 /// 手写 `OpenAPI` 3 草图（不引入代码生成）。
 const OPENAPI_JSON: &str = include_str!("openapi.json");
@@ -321,6 +345,9 @@ struct AppState {
     telegram_secret: Option<String>,
     telegram_bot_token: Option<String>,
     telegram_api_base: String,
+    slack_signing_secret: Option<String>,
+    slack_bot_token: Option<String>,
+    slack_api_base: String,
     persist_enabled: bool,
     persist_path: Arc<PathBuf>,
     rate_limiter: Option<Arc<GlobalRateLimiter>>,
@@ -516,6 +543,336 @@ fn telegram_token_config_source() -> &'static str {
     }
 }
 
+fn slack_signing_secret_config_source() -> &'static str {
+    match std::env::var("JIACLAW_SLACK_SIGNING_SECRET") {
+        Ok(value) if !value.trim().is_empty() => "环境变量 JIACLAW_SLACK_SIGNING_SECRET",
+        _ => "配置文件",
+    }
+}
+
+fn slack_token_config_source() -> &'static str {
+    match std::env::var("JIACLAW_SLACK_BOT_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => "环境变量 JIACLAW_SLACK_BOT_TOKEN",
+        _ => "配置文件",
+    }
+}
+
+/// Slack Events API envelope 最小子集（手写 serde，不引入 Slack SDK）。
+#[derive(Debug, Deserialize)]
+struct SlackEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    challenge: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
+    event: Option<SlackEvent>,
+}
+
+/// Slack `event` 最小子集：message 文本入站。
+#[derive(Debug, Deserialize)]
+struct SlackEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    subtype: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// Slack 入站分类。
+#[derive(Debug, PartialEq, Eq)]
+enum SlackInboundKind {
+    UrlVerification {
+        challenge: String,
+    },
+    Message {
+        session_id: String,
+        channel: String,
+        text: String,
+    },
+    Skipped {
+        reason: String,
+    },
+}
+
+fn optional_nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn slack_session_id(team_id: Option<&str>, channel: &str) -> String {
+    match optional_nonempty(team_id) {
+        Some(team) => format!("slack:{team}:{channel}"),
+        None => format!("slack:{channel}"),
+    }
+}
+
+fn classify_slack_envelope(envelope: &SlackEnvelope) -> SlackInboundKind {
+    if envelope.event_type == "url_verification" {
+        return SlackInboundKind::UrlVerification {
+            challenge: envelope.challenge.clone().unwrap_or_default(),
+        };
+    }
+    if envelope.event_type != "event_callback" {
+        return SlackInboundKind::Skipped {
+            reason: "ignored event type".to_string(),
+        };
+    }
+    let Some(event) = envelope.event.as_ref() else {
+        return SlackInboundKind::Skipped {
+            reason: "ignored event type".to_string(),
+        };
+    };
+    if event.event_type != "message" {
+        return SlackInboundKind::Skipped {
+            reason: "ignored event type".to_string(),
+        };
+    }
+    if optional_nonempty(event.subtype.as_deref()).is_some() {
+        return SlackInboundKind::Skipped {
+            reason: "ignored message subtype".to_string(),
+        };
+    }
+    let Some(channel) = optional_nonempty(event.channel.as_deref()) else {
+        return SlackInboundKind::Skipped {
+            reason: "missing channel".to_string(),
+        };
+    };
+    let Some(text) = optional_nonempty(event.text.as_deref()) else {
+        return SlackInboundKind::Skipped {
+            reason: "no text in event".to_string(),
+        };
+    };
+    SlackInboundKind::Message {
+        session_id: slack_session_id(envelope.team_id.as_deref(), channel),
+        channel: channel.to_string(),
+        text: text.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn encode_hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[(byte >> 4) as usize]));
+        out.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    out
+}
+
+fn from_hex_digit(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_hex(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let hi = from_hex_digit(chunk[0])?;
+        let lo = from_hex_digit(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn slack_timestamp_fresh(timestamp: &str, now_secs: u64) -> bool {
+    timestamp
+        .parse::<u64>()
+        .is_ok_and(|ts| now_secs.abs_diff(ts) <= SLACK_MAX_TIMESTAMP_SKEW_SECS)
+}
+
+/// 计算 Slack 官方 `v0=` HMAC-SHA256 签名（用于测试与对照已知向量）。
+#[cfg(test)]
+fn slack_v0_signature(secret: &str, timestamp: &str, body: &[u8]) -> Option<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(b"v0:");
+    mac.update(timestamp.as_bytes());
+    mac.update(b":");
+    mac.update(body);
+    Some(format!(
+        "v0={}",
+        encode_hex_lower(&mac.finalize().into_bytes())
+    ))
+}
+
+fn verify_slack_v0_signature(secret: &str, timestamp: &str, body: &[u8], signature: &str) -> bool {
+    let Some(hex_sig) = signature.strip_prefix("v0=") else {
+        return false;
+    };
+    let Some(sig_bytes) = decode_hex(hex_sig) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(b"v0:");
+    mac.update(timestamp.as_bytes());
+    mac.update(b":");
+    mac.update(body);
+    mac.verify_slice(&sig_bytes).is_ok()
+}
+
+fn verify_slack_request(
+    secret: &str,
+    timestamp: Option<&str>,
+    signature: Option<&str>,
+    body: &[u8],
+    now_secs: u64,
+) -> bool {
+    let Some(timestamp) = timestamp.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if !slack_timestamp_fresh(timestamp, now_secs) {
+        return false;
+    }
+    let Some(signature) = signature.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    verify_slack_v0_signature(secret, timestamp, body, signature)
+}
+
+fn truncate_slack_text(text: &str) -> &str {
+    match text.char_indices().nth(SLACK_MAX_TEXT_LEN) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
+/// Slack `chat.postMessage` 出站结果。失败不得改变 webhook HTTP 状态。
+struct SlackDelivery {
+    delivered: bool,
+    error: Option<String>,
+}
+
+fn send_slack_message_sync(
+    api_base: &str,
+    token: &str,
+    channel: &str,
+    text: &str,
+) -> Result<(), String> {
+    let url = format!("{api_base}/chat.postMessage");
+    let payload = json!({
+        "channel": channel,
+        "text": text,
+    });
+    let response = minreq::post(&url)
+        .with_header("Content-Type", "application/json")
+        .with_header("Authorization", format!("Bearer {token}"))
+        .with_timeout(SLACK_SEND_TIMEOUT_SECS)
+        .with_body(payload.to_string())
+        .send()
+        .map_err(|e| redact_secret(&e.to_string(), token))?;
+
+    let status = response.status_code;
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+
+    let body = response.as_str().unwrap_or_default();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+            let description = value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("ok=false");
+            return Err(redact_secret(description, token));
+        }
+    }
+    Ok(())
+}
+
+async fn send_slack_reply(
+    api_base: &str,
+    token: &str,
+    channel: &str,
+    text: &str,
+    request_id: &str,
+) -> SlackDelivery {
+    let api_base = api_base.trim_end_matches('/').to_string();
+    let token = token.to_string();
+    let channel = channel.to_string();
+    let text = truncate_slack_text(text).to_string();
+    let request_id = request_id.to_string();
+
+    let result = tokio::task::spawn_blocking(move || {
+        send_slack_message_sync(&api_base, &token, &channel, &text)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => SlackDelivery {
+            delivered: true,
+            error: None,
+        },
+        Ok(Err(err)) => {
+            tracing::warn!(
+                request_id = %request_id,
+                error = %err,
+                "Slack chat.postMessage 失败；仍返回同步 reply，避免 Events API 重试"
+            );
+            SlackDelivery {
+                delivered: false,
+                error: Some(err),
+            }
+        }
+        Err(join_err) => {
+            let err = format!("task join failed: {join_err}");
+            tracing::warn!(
+                request_id = %request_id,
+                error = %err,
+                "Slack chat.postMessage 失败；仍返回同步 reply，避免 Events API 重试"
+            );
+            SlackDelivery {
+                delivered: false,
+                error: Some(err),
+            }
+        }
+    }
+}
+
+/// Slack 入站响应：URL 验证以外，有文本时同步回传 assistant 文本。
+#[derive(Debug, Serialize, Deserialize)]
+struct SlackInboundResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_error: Option<String>,
+}
+
+/// Slack URL 验证响应：必须是 `{ challenge }`。
+#[derive(Debug, Serialize)]
+struct SlackChallengeResponse {
+    challenge: String,
+}
+
 /// Telegram 入站响应：有文本时同步回传 assistant 文本，便于长轮询调试。
 #[derive(Debug, Serialize, Deserialize)]
 struct TelegramInboundResponse {
@@ -540,7 +897,10 @@ fn build_rate_limiter(per_minute: u32) -> Option<Arc<GlobalRateLimiter>> {
 }
 
 fn is_rate_limited_path(path: &str) -> bool {
-    path.starts_with("/api/") || path == "/hooks/inbound" || path == "/hooks/telegram"
+    path.starts_with("/api/")
+        || path == "/hooks/inbound"
+        || path == "/hooks/telegram"
+        || path == "/hooks/slack"
 }
 
 fn rate_limited_response(retry_after_secs: u64) -> Response {
@@ -637,6 +997,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/openapi.json", get(openapi_handler))
         .route("/hooks/inbound", post(hooks_inbound_handler))
         .route("/hooks/telegram", post(hooks_telegram_handler))
+        .route("/hooks/slack", post(hooks_slack_handler))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
@@ -897,6 +1258,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     // 读取 Telegram Bot API token（环境变量优先于配置文件）
     let telegram_bot_token = config.http.effective_telegram_bot_token();
 
+    // 读取 Slack signing secret / Bot token（环境变量优先于配置文件）
+    let slack_signing_secret = config.http.effective_slack_signing_secret();
+    let slack_bot_token = config.http.effective_slack_bot_token();
+
     // 读取限流配置（环境变量优先于配置文件）
     let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
     let rate_limiter = rate_limit_per_minute.and_then(build_rate_limiter);
@@ -929,6 +1294,9 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         telegram_secret: telegram_secret.clone(),
         telegram_bot_token: telegram_bot_token.clone(),
         telegram_api_base: TELEGRAM_API_BASE.to_string(),
+        slack_signing_secret: slack_signing_secret.clone(),
+        slack_bot_token: slack_bot_token.clone(),
+        slack_api_base: SLACK_API_BASE.to_string(),
         persist_enabled: config.http.persist,
         persist_path: Arc::new(persist_path),
         rate_limiter,
@@ -998,15 +1366,21 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • GET    /api/openapi.json    - OpenAPI 3 草图");
     tracing::info!("   • POST   /hooks/inbound       - Webhook 入站端点");
     tracing::info!("   • POST   /hooks/telegram      - Telegram Bot 入站端点");
+    tracing::info!("   • POST   /hooks/slack         - Slack Events API 入站端点");
     if telegram_bot_token.is_some() {
         tracing::info!("   • Telegram 出站: 已配置 Bot Token（成功回复后调用 sendMessage）");
     } else {
         tracing::info!("   • Telegram 出站: 未配置 Bot Token（仅同步 JSON reply）");
     }
+    if slack_bot_token.is_some() {
+        tracing::info!("   • Slack 出站: 已配置 Bot Token（成功回复后调用 chat.postMessage）");
+    } else {
+        tracing::info!("   • Slack 出站: 未配置 Bot Token（仅同步 JSON reply）");
+    }
     tracing::info!("   • X-Request-Id                - 请求无该头则生成 UUID 并回写");
     if let Some(limit) = rate_limit_per_minute {
         tracing::info!(
-            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound、/hooks/telegram；GET /health 不限流）"
+            "   • HTTP 限流: {limit} 次/分钟（/api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack；GET /health 不限流）"
         );
     } else {
         tracing::info!("   • HTTP 限流: 未启用");
@@ -1083,13 +1457,33 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         println!("   • Telegram Bot Token: ⚠️  未配置（仅同步 JSON reply，不调用 sendMessage）");
     }
 
+    if slack_signing_secret.is_some() {
+        println!(
+            "   • Slack 签名校验: ✅ 已启用（通过 {}）",
+            slack_signing_secret_config_source()
+        );
+    } else {
+        println!("   • Slack 签名校验: ⚠️  未启用（任何请求都可访问 /hooks/slack）");
+    }
+
+    if slack_bot_token.is_some() {
+        println!(
+            "   • Slack Bot Token: ✅ 已配置（通过 {}，明文不打印；将 chat.postMessage 出站）",
+            slack_token_config_source()
+        );
+    } else {
+        println!("   • Slack Bot Token: ⚠️  未配置（仅同步 JSON reply，不调用 chat.postMessage）");
+    }
+
     if let Some(limit) = rate_limit_per_minute {
         println!(
             "   • HTTP 限流: ✅ 已启用（{limit} 次/分钟，通过 {}）",
             rate_limit_config_source()
         );
     } else {
-        println!("   • HTTP 限流: ⚠️  未启用（/api/* 与 /hooks/inbound、/hooks/telegram 不限流）");
+        println!(
+            "   • HTTP 限流: ⚠️  未启用（/api/* 与 /hooks/inbound、/hooks/telegram、/hooks/slack 不限流）"
+        );
     }
 
     if let Some(ttl) = session_ttl_secs {
@@ -1735,7 +2129,7 @@ fn unauthorized_hook_response() -> Response {
         .into_response()
 }
 
-/// 将用户文本写入指定 session 并跑一轮 agent chat（`/hooks/inbound` 与 `/hooks/telegram` 共用）。
+/// 将用户文本写入指定 session 并跑一轮 agent chat（`/hooks/inbound`、`/hooks/telegram` 与 `/hooks/slack` 共用）。
 async fn run_session_user_chat(
     state: &AppState,
     session_id: &str,
@@ -1951,6 +2345,104 @@ async fn hooks_telegram_handler(
     };
 
     Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+fn slack_skipped_response(reason: &str) -> Response {
+    let skipped = SlackInboundResponse {
+        ok: true,
+        reply: None,
+        session_id: None,
+        skipped: Some(true),
+        reason: Some(reason.to_string()),
+        delivered: None,
+        delivery_error: None,
+    };
+    (StatusCode::OK, Json(skipped)).into_response()
+}
+
+fn invalid_json_hook_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"ok": false, "error": "invalid json"})),
+    )
+        .into_response()
+}
+
+/// Slack Events API 入站：先取 raw body 再反序列化，以便校验官方 v0 签名。
+async fn hooks_slack_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let request_id = request_id_log_value(&headers).to_string();
+
+    tracing::info!(request_id = %request_id, "收到 Slack Events 入站");
+
+    if let Some(secret) = state.slack_signing_secret.as_deref() {
+        let timestamp = headers
+            .get(X_SLACK_REQUEST_TIMESTAMP)
+            .and_then(|v| v.to_str().ok());
+        let signature = headers.get(X_SLACK_SIGNATURE).and_then(|v| v.to_str().ok());
+        if !verify_slack_request(secret, timestamp, signature, &body, unix_now_secs()) {
+            tracing::warn!(
+                request_id = %request_id,
+                "Slack 鉴权失败: 签名或时间戳无效"
+            );
+            return Ok(unauthorized_hook_response());
+        }
+    }
+
+    let envelope = match serde_json::from_slice::<SlackEnvelope>(&body) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            tracing::warn!(
+                request_id = %request_id,
+                error = %err,
+                "Slack 入站 JSON 无法解析"
+            );
+            return Ok(invalid_json_hook_response());
+        }
+    };
+
+    match classify_slack_envelope(&envelope) {
+        SlackInboundKind::UrlVerification { challenge } => {
+            tracing::info!(request_id = %request_id, "Slack URL 验证 challenge 回传");
+            Ok((StatusCode::OK, Json(SlackChallengeResponse { challenge })).into_response())
+        }
+        SlackInboundKind::Skipped { reason } => {
+            tracing::info!(request_id = %request_id, reason = %reason, "跳过 Slack 事件");
+            Ok(slack_skipped_response(&reason))
+        }
+        SlackInboundKind::Message {
+            session_id,
+            channel,
+            text,
+        } => {
+            let reply =
+                run_session_user_chat(&state, &session_id, &text, &request_id, "slack").await?;
+
+            let (delivered, delivery_error) = if let Some(token) = state.slack_bot_token.as_deref()
+            {
+                let delivery =
+                    send_slack_reply(&state.slack_api_base, token, &channel, &reply, &request_id)
+                        .await;
+                (Some(delivery.delivered), delivery.error)
+            } else {
+                (None, None)
+            };
+
+            let body = SlackInboundResponse {
+                ok: true,
+                reply: Some(reply),
+                session_id: Some(session_id),
+                skipped: None,
+                reason: None,
+                delivered,
+                delivery_error,
+            };
+            Ok((StatusCode::OK, Json(body)).into_response())
+        }
+    }
 }
 
 /// 应用错误类型
@@ -2757,6 +3249,28 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_TELEGRAM_BOT_TOKEN=your-bot-token");
     }
 
+    let slack_signing_secret = config.http.effective_slack_signing_secret();
+    if slack_signing_secret.is_some() {
+        println!(
+            "   Slack 签名校验: ✅ 已启用（通过 {}）",
+            slack_signing_secret_config_source()
+        );
+    } else {
+        println!("   Slack 签名校验: ⚠️  未启用");
+        println!("   💡 设置环境变量: export JIACLAW_SLACK_SIGNING_SECRET=your-signing-secret");
+    }
+
+    let slack_bot_token = config.http.effective_slack_bot_token();
+    if slack_bot_token.is_some() {
+        println!(
+            "   Slack Bot Token: ✅ 已配置（通过 {}，明文不打印）",
+            slack_token_config_source()
+        );
+    } else {
+        println!("   Slack Bot Token: ⚠️  未配置（/hooks/slack 仅同步 JSON，不 chat.postMessage）");
+        println!("   💡 设置环境变量: export JIACLAW_SLACK_BOT_TOKEN=xoxb-your-bot-token");
+    }
+
     let rate_limit_per_minute = config.http.effective_rate_limit_per_minute();
     if let Some(limit) = rate_limit_per_minute {
         println!(
@@ -2846,6 +3360,22 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!(
         "   • Telegram Bot Token: {}",
         if telegram_bot_token.is_some() {
+            "已配置"
+        } else {
+            "未配置"
+        }
+    );
+    println!(
+        "   • Slack 签名校验: {}",
+        if slack_signing_secret.is_some() {
+            "已启用"
+        } else {
+            "未启用"
+        }
+    );
+    println!(
+        "   • Slack Bot Token: {}",
+        if slack_bot_token.is_some() {
             "已配置"
         } else {
             "未配置"
@@ -2958,6 +3488,9 @@ mod tests {
             telegram_secret,
             telegram_bot_token: None,
             telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
@@ -3038,6 +3571,9 @@ mod tests {
             telegram_secret: None,
             telegram_bot_token: bot_token,
             telegram_api_base: api_base,
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
@@ -3054,6 +3590,120 @@ mod tests {
                 .or_else(|| value.as_i64().map(|n| n.to_string()))
                 .or_else(|| value.as_u64().map(|n| n.to_string()))
         })
+    }
+
+    fn json_channel(body: &serde_json::Value) -> Option<String> {
+        body.get("channel")
+            .and_then(|value| value.as_str().map(ToString::to_string))
+    }
+
+    fn create_test_app_with_slack_signing_secret(signing_secret: Option<String>) -> Router {
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: signing_secret,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+        };
+        build_router(state)
+    }
+
+    fn create_test_app_with_slack_outbound(bot_token: Option<String>, api_base: String) -> Router {
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config.clone()).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: bot_token,
+            slack_api_base: api_base,
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+        };
+        build_router(state)
+    }
+
+    #[derive(Clone)]
+    struct SlackApiMockState {
+        status: StatusCode,
+        captured: Arc<Mutex<Vec<CapturedSlackOutbound>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedSlackOutbound {
+        method: String,
+        path: String,
+        authorization: String,
+        body: serde_json::Value,
+    }
+
+    async fn slack_api_mock_fallback(
+        State(state): State<SlackApiMockState>,
+        req: axum::extract::Request,
+    ) -> impl IntoResponse {
+        let method = req.method().to_string();
+        let path = req.uri().path().to_string();
+        let authorization = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        state.captured.lock().unwrap().push(CapturedSlackOutbound {
+            method,
+            path,
+            authorization,
+            body,
+        });
+        let ok = state.status.is_success();
+        (state.status, Json(json!({ "ok": ok })))
+    }
+
+    async fn spawn_slack_api_mock(
+        status: StatusCode,
+    ) -> (String, Arc<Mutex<Vec<CapturedSlackOutbound>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let state = SlackApiMockState {
+            status,
+            captured: captured.clone(),
+        };
+        let app = Router::new()
+            .fallback(slack_api_mock_fallback)
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slack mock");
+        let addr = listener.local_addr().expect("slack mock local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("slack mock serve");
+        });
+        (format!("http://{addr}"), captured)
     }
 
     fn create_test_app_with_full(
@@ -3074,6 +3724,9 @@ mod tests {
             telegram_secret: None,
             telegram_bot_token: None,
             telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: rate_limit_per_minute.and_then(build_rate_limiter),
@@ -3803,6 +4456,9 @@ mod tests {
             telegram_secret: None,
             telegram_bot_token: None,
             telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
             persist_enabled: true,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
@@ -3848,6 +4504,9 @@ mod tests {
             telegram_secret: None,
             telegram_bot_token: None,
             telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
@@ -4038,6 +4697,9 @@ mod tests {
             telegram_secret: None,
             telegram_bot_token: None,
             telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
             persist_enabled: true,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
@@ -4079,6 +4741,9 @@ mod tests {
             telegram_secret: None,
             telegram_bot_token: None,
             telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path),
             rate_limiter: None,
@@ -4810,6 +5475,448 @@ mod tests {
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
+    fn slack_url_verification(challenge: &str) -> String {
+        json!({
+            "type": "url_verification",
+            "challenge": challenge
+        })
+        .to_string()
+    }
+
+    fn slack_message_event(team_id: Option<&str>, channel: &str, text: &str) -> String {
+        let mut value = json!({
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "channel": channel,
+                "user": "U123",
+                "text": text
+            }
+        });
+        if let Some(team) = team_id {
+            value["team_id"] = json!(team);
+        }
+        value.to_string()
+    }
+
+    fn slack_subtype_event(subtype: &str) -> String {
+        json!({
+            "type": "event_callback",
+            "team_id": "TTEAM",
+            "event": {
+                "type": "message",
+                "subtype": subtype,
+                "channel": "CCHAN",
+                "text": "should skip",
+                "bot_id": "B123"
+            }
+        })
+        .to_string()
+    }
+
+    async fn post_slack(
+        app: &Router,
+        body: String,
+        signature: Option<(&str, &str)>,
+    ) -> axum::http::Response<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/hooks/slack")
+            .header("content-type", "application/json");
+        if let Some((timestamp, sig)) = signature {
+            builder = builder
+                .header(X_SLACK_REQUEST_TIMESTAMP, timestamp)
+                .header(X_SLACK_SIGNATURE, sig);
+        }
+        app.clone()
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn post_slack_signed(
+        app: &Router,
+        body: String,
+        secret: &str,
+    ) -> axum::http::Response<Body> {
+        let timestamp = unix_now_secs().to_string();
+        let signature = slack_v0_signature(secret, &timestamp, body.as_bytes()).expect("sign");
+        post_slack(app, body, Some((&timestamp, &signature))).await
+    }
+
+    #[test]
+    fn test_slack_known_hmac_vector() {
+        const SECRET: &str = "8f742231b10e8888abcd99yyyzzz85a5";
+        const TIMESTAMP: &str = "1531420618";
+        const BODY: &[u8] = br#"{"type":"url_verification","challenge":"3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"}"#;
+        const EXPECTED: &str =
+            "v0=2b617e8d1eba789c3e90a54b772adadfc772137987c87d3c1e4129005632e406";
+        assert_eq!(
+            slack_v0_signature(SECRET, TIMESTAMP, BODY).as_deref(),
+            Some(EXPECTED)
+        );
+        assert!(verify_slack_v0_signature(SECRET, TIMESTAMP, BODY, EXPECTED));
+        assert!(!verify_slack_v0_signature(
+            SECRET,
+            TIMESTAMP,
+            BODY,
+            "v0=0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(verify_slack_request(
+            SECRET,
+            Some(TIMESTAMP),
+            Some(EXPECTED),
+            BODY,
+            1_531_420_618
+        ));
+        assert!(!verify_slack_request(
+            SECRET,
+            Some(TIMESTAMP),
+            Some(EXPECTED),
+            BODY,
+            1_531_420_618 + 301
+        ));
+    }
+
+    #[test]
+    fn test_slack_timestamp_freshness_window() {
+        assert!(slack_timestamp_fresh("1000", 1000));
+        assert!(slack_timestamp_fresh("1300", 1000));
+        assert!(!slack_timestamp_fresh("1301", 1000));
+        assert!(slack_timestamp_fresh("700", 1000));
+        assert!(!slack_timestamp_fresh("699", 1000));
+        assert!(!slack_timestamp_fresh("nope", 1000));
+        assert!(!slack_timestamp_fresh("-1", 1000));
+    }
+
+    #[test]
+    fn test_classify_slack_envelope_message_and_skips() {
+        let verification: SlackEnvelope =
+            serde_json::from_str(&slack_url_verification("abc")).unwrap();
+        assert_eq!(
+            classify_slack_envelope(&verification),
+            SlackInboundKind::UrlVerification {
+                challenge: "abc".to_string()
+            }
+        );
+
+        let with_team: SlackEnvelope =
+            serde_json::from_str(&slack_message_event(Some("T1"), "C9", "hello")).unwrap();
+        assert_eq!(
+            classify_slack_envelope(&with_team),
+            SlackInboundKind::Message {
+                session_id: "slack:T1:C9".to_string(),
+                channel: "C9".to_string(),
+                text: "hello".to_string(),
+            }
+        );
+
+        let no_team: SlackEnvelope =
+            serde_json::from_str(&slack_message_event(None, "C9", "hello")).unwrap();
+        assert_eq!(
+            classify_slack_envelope(&no_team),
+            SlackInboundKind::Message {
+                session_id: "slack:C9".to_string(),
+                channel: "C9".to_string(),
+                text: "hello".to_string(),
+            }
+        );
+
+        let bot: SlackEnvelope = serde_json::from_str(&slack_subtype_event("bot_message")).unwrap();
+        assert_eq!(
+            classify_slack_envelope(&bot),
+            SlackInboundKind::Skipped {
+                reason: "ignored message subtype".to_string()
+            }
+        );
+
+        let changed: SlackEnvelope =
+            serde_json::from_str(&slack_subtype_event("message_changed")).unwrap();
+        assert_eq!(
+            classify_slack_envelope(&changed),
+            SlackInboundKind::Skipped {
+                reason: "ignored message subtype".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slack_url_verification_returns_challenge() {
+        let app = create_test_app();
+        let response = post_slack(&app, slack_url_verification("challenge-xyz"), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!request_id_header(&response).is_empty());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["challenge"], "challenge-xyz");
+        assert!(value.get("ok").is_none());
+        assert!(value.get("reply").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_slack_message_creates_and_reuses_session() {
+        let app = create_test_app();
+        let body = slack_message_event(Some("TTEAM"), "CCHAN", "你好 Slack");
+        let response = post_slack(&app, body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let slack: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(slack.ok);
+        assert!(slack.reply.as_ref().is_some_and(|r| !r.is_empty()));
+        assert_eq!(slack.session_id.as_deref(), Some("slack:TTEAM:CCHAN"));
+        assert!(slack.skipped.is_none());
+
+        let history = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/slack:TTEAM:CCHAN")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+
+        let second = post_slack(
+            &app,
+            slack_message_event(Some("TTEAM"), "CCHAN", "第二句"),
+            None,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let slack2: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(slack2.session_id.as_deref(), Some("slack:TTEAM:CCHAN"));
+    }
+
+    #[tokio::test]
+    async fn test_slack_session_without_team_id() {
+        let app = create_test_app();
+        let response = post_slack(&app, slack_message_event(None, "CNOTEAM", "hi"), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let slack: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(slack.session_id.as_deref(), Some("slack:CNOTEAM"));
+    }
+
+    #[tokio::test]
+    async fn test_slack_skips_bot_message_and_message_changed() {
+        let app = create_test_app();
+        for subtype in ["bot_message", "message_changed"] {
+            let response = post_slack(&app, slack_subtype_event(subtype), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let slack: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+            assert!(slack.ok);
+            assert_eq!(slack.skipped, Some(true));
+            assert_eq!(slack.reason.as_deref(), Some("ignored message subtype"));
+            assert!(slack.reply.is_none());
+        }
+        let missing = http_get_session_status(&app, "slack:TTEAM:CCHAN").await;
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_slack_skips_empty_text() {
+        let app = create_test_app();
+        let body = json!({
+            "type": "event_callback",
+            "team_id": "T1",
+            "event": { "type": "message", "channel": "C1", "text": "   " }
+        })
+        .to_string();
+        let response = post_slack(&app, body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let slack: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(slack.skipped, Some(true));
+        assert_eq!(slack.reason.as_deref(), Some("no text in event"));
+    }
+
+    #[tokio::test]
+    async fn test_slack_signature_missing_when_configured() {
+        let app = create_test_app_with_slack_signing_secret(Some("signing-secret".to_string()));
+        let response = post_slack(&app, slack_message_event(Some("T1"), "C1", "hi"), None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_slack_signature_wrong() {
+        let secret = "signing-secret";
+        let app = create_test_app_with_slack_signing_secret(Some(secret.to_string()));
+        let body = slack_message_event(Some("T1"), "C1", "hi");
+        let ts = unix_now_secs().to_string();
+        let response = post_slack(
+            &app,
+            body,
+            Some((
+                &ts,
+                "v0=0000000000000000000000000000000000000000000000000000000000000000",
+            )),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_slack_signature_correct() {
+        let secret = "signing-secret";
+        let app = create_test_app_with_slack_signing_secret(Some(secret.to_string()));
+        let body = slack_message_event(Some("T55"), "C55", "ok");
+        let response = post_slack_signed(&app, body, secret).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let slack: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(slack.ok);
+        assert_eq!(slack.session_id.as_deref(), Some("slack:T55:C55"));
+    }
+
+    #[tokio::test]
+    async fn test_slack_signature_stale_timestamp() {
+        let secret = "signing-secret";
+        let app = create_test_app_with_slack_signing_secret(Some(secret.to_string()));
+        let body = slack_message_event(Some("T1"), "C1", "hi");
+        let ts = "1";
+        let sig = slack_v0_signature(secret, ts, body.as_bytes()).expect("sign");
+        let response = post_slack(&app, body, Some((ts, &sig))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_slack_signed_url_verification() {
+        let secret = "signing-secret";
+        let app = create_test_app_with_slack_signing_secret(Some(secret.to_string()));
+        let response = post_slack_signed(&app, slack_url_verification("from-slack"), secret).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["challenge"], "from-slack");
+    }
+
+    #[tokio::test]
+    async fn test_slack_signing_secret_does_not_affect_inbound_or_telegram() {
+        let app = create_test_app_with_slack_signing_secret(Some("signing-secret".to_string()));
+        let inbound = InboundWebhookRequest {
+            channel: "webhook".to_string(),
+            chat_id: "no-slack".to_string(),
+            text: "webhook 不走 slack 签名".to_string(),
+            username: None,
+        };
+        let webhook = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/inbound")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&inbound).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webhook.status(), StatusCode::OK);
+
+        let telegram = post_telegram(&app, telegram_text_update(7, "tg"), None).await;
+        assert_eq!(telegram.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_slack_without_bot_token_does_not_call_post_message() {
+        let (base, captured) = spawn_slack_api_mock(StatusCode::OK).await;
+        let app = create_test_app_with_slack_outbound(None, base);
+        let response = post_slack(&app, slack_message_event(Some("T1"), "C1", "你好"), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let slack: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(slack.ok);
+        assert!(slack.delivered.is_none());
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(raw.get("delivered").is_none());
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_slack_chat_post_message_called_with_channel_and_text() {
+        let token = "xoxb-test-token";
+        let (base, captured) = spawn_slack_api_mock(StatusCode::OK).await;
+        let app = create_test_app_with_slack_outbound(Some(token.to_string()), base);
+        let response = post_slack(
+            &app,
+            slack_message_event(Some("T1"), "C42", "你好 Slack"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let slack: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        let reply = slack.reply.expect("reply");
+        assert_eq!(slack.delivered, Some(true));
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].method, "POST");
+        assert_eq!(captured[0].path, "/chat.postMessage");
+        assert_eq!(captured[0].authorization, format!("Bearer {token}"));
+        assert_eq!(json_channel(&captured[0].body).as_deref(), Some("C42"));
+        assert_eq!(captured[0].body["text"].as_str(), Some(reply.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_slack_chat_post_message_5xx_still_returns_200_with_reply() {
+        let token = "xoxb-test-token";
+        let (base, captured) = spawn_slack_api_mock(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let app = create_test_app_with_slack_outbound(Some(token.to_string()), base);
+        let response = post_slack(&app, slack_message_event(Some("T1"), "C9", "hello"), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let slack: SlackInboundResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(slack.ok);
+        assert!(slack.reply.as_ref().is_some_and(|r| !r.is_empty()));
+        assert_eq!(slack.delivered, Some(false));
+        assert!(
+            slack
+                .delivery_error
+                .as_ref()
+                .is_some_and(|err| err.contains("500")),
+            "delivery_error={:?}",
+            slack.delivery_error
+        );
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_truncate_slack_text_at_40000_chars() {
+        let exact: String = "a".repeat(SLACK_MAX_TEXT_LEN);
+        assert_eq!(truncate_slack_text(&exact), exact);
+        let over: String = "你".repeat(SLACK_MAX_TEXT_LEN + 8);
+        let truncated = truncate_slack_text(&over);
+        assert_eq!(truncated.chars().count(), SLACK_MAX_TEXT_LEN);
+        assert!(truncated.chars().all(|c| c == '你'));
+    }
+
     #[tokio::test]
     async fn test_session_persistence_disabled() {
         let config = AgentConfig::default();
@@ -4825,6 +5932,9 @@ mod tests {
             telegram_secret: None,
             telegram_bot_token: None,
             telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
             persist_enabled: false,
             persist_path: Arc::new(persist_path.clone()),
             rate_limiter: None,
@@ -5457,6 +6567,20 @@ mod tests {
         assert!(!request_id_header(&second).is_empty());
     }
 
+    #[tokio::test]
+    async fn test_hooks_slack_is_rate_limited() {
+        let app = create_test_app_with_rate_limit(1);
+        let body = slack_message_event(Some("T9"), "C9", "限流");
+
+        let first = post_slack(&app, body.clone(), None).await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = post_slack(&app, body, None).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(second.headers().get(header::RETRY_AFTER).is_some());
+        assert!(!request_id_header(&second).is_empty());
+    }
+
     #[test]
     fn test_is_rate_limited_path() {
         assert!(is_rate_limited_path("/api/chat"));
@@ -5466,6 +6590,7 @@ mod tests {
         assert!(is_rate_limited_path("/api/openapi.json"));
         assert!(is_rate_limited_path("/hooks/inbound"));
         assert!(is_rate_limited_path("/hooks/telegram"));
+        assert!(is_rate_limited_path("/hooks/slack"));
         assert!(!is_rate_limited_path("/health"));
         assert!(!is_rate_limited_path("/"));
         assert!(!is_rate_limited_path("/api"));
@@ -5622,6 +6747,7 @@ mod tests {
             "/api/skills",
             "/hooks/inbound",
             "/hooks/telegram",
+            "/hooks/slack",
         ] {
             assert!(
                 paths.contains_key(required),
