@@ -30,7 +30,7 @@ use jiaclaw::{
 };
 use jiaclaw_core::{
     AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole, ToolCall,
-    MAX_SESSION_MESSAGES,
+    MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1517,6 +1517,22 @@ fn tool_timeout_config_source() -> &'static str {
     }
 }
 
+fn max_tool_iterations_config_source() -> &'static str {
+    if std::env::var("JIACLAW_MAX_TOOL_ITERATIONS").is_ok() {
+        "环境变量 JIACLAW_MAX_TOOL_ITERATIONS"
+    } else {
+        "配置文件"
+    }
+}
+
+fn max_tool_iterations_status_line(config: &AgentConfig) -> String {
+    format!(
+        "{}（通过 {}）",
+        config.effective_max_tool_iterations(),
+        max_tool_iterations_config_source()
+    )
+}
+
 fn heartbeat_interval_config_source() -> &'static str {
     if std::env::var("JIACLAW_HEARTBEAT_INTERVAL_SECS").is_ok() {
         "环境变量 JIACLAW_HEARTBEAT_INTERVAL_SECS"
@@ -2014,6 +2030,10 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         tracing::info!("   • 工具超时: 未启用（不限制）");
     }
+    tracing::info!(
+        "   • 工具循环上限: {}",
+        max_tool_iterations_status_line(&config)
+    );
     if config.tools.web_search.enabled {
         if config.tools.web_search.effective_brave_api_key().is_some() {
             tracing::info!("   • web_search: 已启用（Brave API key 已配置，明文不打印）");
@@ -2170,6 +2190,11 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     } else {
         println!("   • 工具超时: ⚠️  未启用（不限制单次工具执行时间）");
     }
+
+    println!(
+        "   • 工具循环上限: {}",
+        max_tool_iterations_status_line(&config)
+    );
 
     if config.tools.web_search.enabled {
         if config.tools.web_search.effective_brave_api_key().is_some() {
@@ -3785,6 +3810,13 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_TOOL_TIMEOUT_SECS=30");
     }
 
+    println!(
+        "   工具循环上限: {}（范围 {}–{}；可用 JIACLAW_MAX_TOOL_ITERATIONS 覆盖）",
+        max_tool_iterations_status_line(&config),
+        MIN_MAX_TOOL_ITERATIONS,
+        MAX_MAX_TOOL_ITERATIONS
+    );
+
     let web_search_lines = web_search_status_lines(&config);
     if config.tools.web_search.enabled
         && config.tools.web_search.effective_brave_api_key().is_some()
@@ -4135,6 +4167,10 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         } else {
             "未启用".to_string()
         }
+    );
+    println!(
+        "   • 工具循环上限: {}",
+        max_tool_iterations_status_line(&config)
     );
     println!(
         "   • Heartbeat: {}",
@@ -6037,6 +6073,20 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(web_fetch_status_line(&allow_private).contains("allow_private"));
+    }
+
+    #[test]
+    fn max_tool_iterations_status_line_shows_effective_default() {
+        let config = AgentConfig::default();
+        let line = max_tool_iterations_status_line(&config);
+        assert!(
+            line.contains(&config.effective_max_tool_iterations().to_string()),
+            "{line}"
+        );
+        assert!(
+            line.contains("配置文件") || line.contains("环境变量"),
+            "{line}"
+        );
     }
 
     #[tokio::test]

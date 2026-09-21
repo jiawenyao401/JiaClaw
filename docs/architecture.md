@@ -142,7 +142,7 @@
 - **CLI 接口**
   - `jiaclaw serve` - 启动 HTTP 服务
   - `jiaclaw chat <message>` - 单次聊天
-  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔）
+  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔；工具循环上限生效值）
   - `jiaclaw memory show` - 显示工作区长期记忆
   - `jiaclaw soul show` / `jiaclaw user show` - 显示人格与用户画像
   - `jiaclaw version` - 版本信息

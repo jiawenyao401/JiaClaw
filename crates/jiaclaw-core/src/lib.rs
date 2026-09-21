@@ -180,6 +180,13 @@ pub struct AgentConfig {
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
 
+    /// 整轮 tool loop 最大迭代次数（环境变量 `JIACLAW_MAX_TOOL_ITERATIONS` 优先）
+    ///
+    /// 默认 [`DEFAULT_MAX_TOOL_ITERATIONS`]（与历史硬编码上限兼容）。
+    /// 生效值经 [`AgentConfig::effective_max_tool_iterations`] 钳制到 1..=32。
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: usize,
+
     /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` 默认启用）
     #[serde(default)]
     pub tools: ToolsConfig,
@@ -209,6 +216,19 @@ pub const DEFAULT_HEARTBEAT_SESSION_ID: &str = "heartbeat";
 
 /// 默认心跳间隔（秒）
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 3600;
+
+/// 默认工具循环上限（与历史硬编码 `MAX_ITERATIONS = 5` 保持兼容）
+pub const DEFAULT_MAX_TOOL_ITERATIONS: usize = 5;
+
+/// 工具循环上限的下限（防止配成 0 导致无法跑完一轮）
+pub const MIN_MAX_TOOL_ITERATIONS: usize = 1;
+
+/// 工具循环上限的上限（防止离谱配置引发工具风暴）
+pub const MAX_MAX_TOOL_ITERATIONS: usize = 32;
+
+fn default_max_tool_iterations() -> usize {
+    DEFAULT_MAX_TOOL_ITERATIONS
+}
 
 /// 每个 session 保留的最大消息数（防止内存涨爆）
 pub const MAX_SESSION_MESSAGES: usize = 50;
@@ -714,6 +734,34 @@ pub fn resolve_tool_timeout_secs(configured: Option<u64>, env_value: Option<&str
     }
 }
 
+/// 解析正整数工具循环上限；`0` 或无法解析时返回 `None`。
+#[must_use]
+pub fn parse_positive_max_tool_iterations(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().filter(|&n| n > 0)
+}
+
+fn fallback_max_tool_iterations(configured: usize) -> usize {
+    if configured == 0 {
+        DEFAULT_MAX_TOOL_ITERATIONS
+    } else {
+        configured
+    }
+}
+
+/// 根据配置文件值与可选环境变量解析工具循环上限。
+///
+/// 环境变量 `JIACLAW_MAX_TOOL_ITERATIONS` 优先（仅正整数；`0`/非法忽略）。
+/// 配置值为 `0` 时回退默认 5。最终钳制到 `[1, 32]`。
+#[must_use]
+pub fn resolve_max_tool_iterations(configured: usize, env_value: Option<&str>) -> usize {
+    let raw = match env_value {
+        Some(raw) => parse_positive_max_tool_iterations(raw)
+            .unwrap_or_else(|| fallback_max_tool_iterations(configured)),
+        None => fallback_max_tool_iterations(configured),
+    };
+    raw.clamp(MIN_MAX_TOOL_ITERATIONS, MAX_MAX_TOOL_ITERATIONS)
+}
+
 impl HttpConfig {
     /// 解析生效的每分钟请求上限。
     ///
@@ -875,6 +923,7 @@ impl Default for AgentConfig {
             heartbeat: HeartbeatConfig::default(),
             session: SessionConfig::default(),
             tool_timeout_secs: None,
+            max_tool_iterations: default_max_tool_iterations(),
             tools: ToolsConfig::default(),
         }
     }
@@ -890,6 +939,19 @@ impl AgentConfig {
         resolve_tool_timeout_secs(
             self.tool_timeout_secs,
             std::env::var("JIACLAW_TOOL_TIMEOUT_SECS").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的工具循环上限。
+    ///
+    /// 环境变量 `JIACLAW_MAX_TOOL_ITERATIONS` 优先于配置文件。
+    /// 仅正整数生效；未设置、`0` 或无法解析时回退配置值（`0` 再回退默认 5）。
+    /// 最终钳制到 `[MIN_MAX_TOOL_ITERATIONS, MAX_MAX_TOOL_ITERATIONS]`。
+    #[must_use]
+    pub fn effective_max_tool_iterations(&self) -> usize {
+        resolve_max_tool_iterations(
+            self.max_tool_iterations,
+            std::env::var("JIACLAW_MAX_TOOL_ITERATIONS").ok().as_deref(),
         )
     }
 
@@ -1027,15 +1089,17 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_positive_heartbeat_interval, parse_positive_rate_limit, parse_positive_session_ttl,
-        parse_positive_tool_timeout, parse_session_summarize_on_overflow,
-        resolve_heartbeat_interval_secs, resolve_optional_secret, resolve_rate_limit_per_minute,
+        parse_positive_heartbeat_interval, parse_positive_max_tool_iterations,
+        parse_positive_rate_limit, parse_positive_session_ttl, parse_positive_tool_timeout,
+        parse_session_summarize_on_overflow, resolve_heartbeat_interval_secs,
+        resolve_max_tool_iterations, resolve_optional_secret, resolve_rate_limit_per_minute,
         resolve_session_keep_recent, resolve_session_summarize_on_overflow,
         resolve_session_ttl_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
         HttpConfig, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
         DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-        DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
-        MAX_SESSION_MESSAGES,
+        DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
+        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
+        MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -1057,6 +1121,19 @@ mod tests {
     fn agent_config_tool_timeout_defaults_to_none() {
         assert_eq!(AgentConfig::default().tool_timeout_secs, None);
         assert_eq!(AgentConfig::default().effective_tool_timeout_secs(), None);
+    }
+
+    #[test]
+    fn agent_config_max_tool_iterations_defaults_to_legacy_constant() {
+        assert_eq!(DEFAULT_MAX_TOOL_ITERATIONS, 5);
+        assert_eq!(
+            AgentConfig::default().max_tool_iterations,
+            DEFAULT_MAX_TOOL_ITERATIONS
+        );
+        assert_eq!(
+            AgentConfig::default().effective_max_tool_iterations(),
+            DEFAULT_MAX_TOOL_ITERATIONS
+        );
     }
 
     #[test]
@@ -1123,6 +1200,80 @@ mod tests {
     }
 
     #[test]
+    fn parse_positive_max_tool_iterations_accepts_only_positive_integers() {
+        assert_eq!(parse_positive_max_tool_iterations("8"), Some(8));
+        assert_eq!(parse_positive_max_tool_iterations(" 1 "), Some(1));
+        assert_eq!(parse_positive_max_tool_iterations("0"), None);
+        assert_eq!(parse_positive_max_tool_iterations(""), None);
+        assert_eq!(parse_positive_max_tool_iterations("abc"), None);
+        assert_eq!(parse_positive_max_tool_iterations("-1"), None);
+    }
+
+    #[test]
+    fn resolve_max_tool_iterations_env_overrides_and_clamps() {
+        assert_eq!(resolve_max_tool_iterations(5, Some("12")), 12);
+        assert_eq!(
+            resolve_max_tool_iterations(8, Some("0")),
+            8,
+            "env 0 应忽略并回退配置"
+        );
+        assert_eq!(
+            resolve_max_tool_iterations(8, Some("nope")),
+            8,
+            "非法 env 应忽略并回退配置"
+        );
+        assert_eq!(resolve_max_tool_iterations(8, None), 8);
+        assert_eq!(
+            resolve_max_tool_iterations(0, None),
+            DEFAULT_MAX_TOOL_ITERATIONS
+        );
+        assert_eq!(
+            resolve_max_tool_iterations(5, Some("1")),
+            MIN_MAX_TOOL_ITERATIONS
+        );
+        assert_eq!(
+            resolve_max_tool_iterations(5, Some("999")),
+            MAX_MAX_TOOL_ITERATIONS
+        );
+        assert_eq!(
+            resolve_max_tool_iterations(100, None),
+            MAX_MAX_TOOL_ITERATIONS
+        );
+    }
+
+    #[test]
+    fn agent_config_parses_max_tool_iterations_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+max_tool_iterations = 12
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert_eq!(config.max_tool_iterations, 12);
+        assert_eq!(config.effective_max_tool_iterations(), 12);
+        assert_eq!(config.tool_timeout_secs, None);
+    }
+
+    #[test]
+    fn agent_config_parses_max_tool_iterations_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10,
+                "max_tool_iterations": 3
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert_eq!(config.max_tool_iterations, 3);
+        assert_eq!(config.effective_max_tool_iterations(), 3);
+    }
+
+    #[test]
     fn http_config_parses_rate_limit_from_toml() {
         let toml = r#"
 [agent]
@@ -1149,6 +1300,7 @@ session_ttl_secs = 3600
         assert_eq!(config.http.discord_public_key, None);
         assert_eq!(config.http.discord_bot_token, None);
         assert_eq!(config.tool_timeout_secs, None);
+        assert_eq!(config.max_tool_iterations, DEFAULT_MAX_TOOL_ITERATIONS);
     }
 
     #[test]
@@ -1345,6 +1497,7 @@ tool_timeout_secs = 30
         );
         assert_eq!(config.heartbeat.session_id, DEFAULT_HEARTBEAT_SESSION_ID);
         assert_eq!(config.tool_timeout_secs, None);
+        assert_eq!(config.max_tool_iterations, DEFAULT_MAX_TOOL_ITERATIONS);
     }
 
     #[test]
