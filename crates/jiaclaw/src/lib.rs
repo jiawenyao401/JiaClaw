@@ -581,6 +581,79 @@ impl JiaClawAgent {
         format!("已达到最大工具迭代次数（{limit}）。本轮停止，未执行剩余工具调用。")
     }
 
+    /// 单次 LLM / stub 补全（不进入 tool loop）。
+    async fn complete_turn(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+        provider_type: &str,
+        api_key: Option<&str>,
+    ) -> Result<ChatResponse, JiaClawError> {
+        if let Some(key) = api_key {
+            match provider_type {
+                "brokerrouter" => {
+                    let provider = BrokerrouterProvider::new(&self.config.provider.base_url, key);
+                    provider
+                        .chat(
+                            &self.config.provider.model,
+                            system_prompt,
+                            messages,
+                            self.config.provider.temperature,
+                            self.config.provider.max_tokens,
+                        )
+                        .await
+                }
+                "openai_compatible" => {
+                    let provider =
+                        OpenAICompatibleProvider::new(&self.config.provider.base_url, key);
+                    provider
+                        .chat(
+                            &self.config.provider.model,
+                            system_prompt,
+                            messages,
+                            self.config.provider.temperature,
+                            self.config.provider.max_tokens,
+                        )
+                        .await
+                }
+                _ => Err(JiaClawError::Configuration(format!(
+                    "未知的提供商类型: {provider_type}"
+                ))),
+            }
+        } else {
+            let request = ChatRequest {
+                messages: messages.to_vec(),
+                enabled_tools: vec![],
+                enabled_skills: vec![],
+                auto_skills: true,
+                session_id: None,
+            };
+            Ok(self.stub_chat(&request, system_prompt))
+        }
+    }
+
+    fn finish_at_tool_iteration_limit(
+        response: ChatResponse,
+        pending_tool_calls: Vec<ToolCall>,
+        mut all_tool_calls: Vec<ToolCall>,
+        max_iterations: usize,
+    ) -> ChatResponse {
+        let hint = Self::max_tool_iterations_stop_hint(max_iterations);
+        tracing::warn!("{hint}");
+        for mut tool_call in pending_tool_calls {
+            tool_call.result = Some(serde_json::json!({ "error": hint.as_str() }));
+            all_tool_calls.push(tool_call);
+        }
+        let mut message = response.message;
+        message.content = format!("{}\n\n{hint}", message.content.trim_end());
+        ChatResponse {
+            message,
+            tool_calls: all_tool_calls,
+            status: response.status,
+            session_id: None,
+        }
+    }
+
     /// 执行工具调用循环
     async fn execute_tool_loop(
         &self,
@@ -596,54 +669,9 @@ impl JiaClawAgent {
         loop {
             iteration += 1;
 
-            // 调用 LLM
-            let response = if let Some(key) = api_key {
-                match provider_type {
-                    "brokerrouter" => {
-                        let provider =
-                            BrokerrouterProvider::new(&self.config.provider.base_url, key);
-                        provider
-                            .chat(
-                                &self.config.provider.model,
-                                system_prompt,
-                                &messages,
-                                self.config.provider.temperature,
-                                self.config.provider.max_tokens,
-                            )
-                            .await?
-                    }
-                    "openai_compatible" => {
-                        let provider =
-                            OpenAICompatibleProvider::new(&self.config.provider.base_url, key);
-                        provider
-                            .chat(
-                                &self.config.provider.model,
-                                system_prompt,
-                                &messages,
-                                self.config.provider.temperature,
-                                self.config.provider.max_tokens,
-                            )
-                            .await?
-                    }
-                    _ => {
-                        return Err(JiaClawError::Configuration(format!(
-                            "未知的提供商类型: {provider_type}"
-                        )));
-                    }
-                }
-            } else {
-                // 存根模式
-                let request = ChatRequest {
-                    messages: messages.clone(),
-                    enabled_tools: vec![],
-                    enabled_skills: vec![],
-                    auto_skills: true,
-                    session_id: None,
-                };
-                self.stub_chat(&request, system_prompt)
-            };
-
-            // 解析工具调用
+            let response = self
+                .complete_turn(&messages, system_prompt, provider_type, api_key)
+                .await?;
             let tool_calls = Self::parse_tool_calls(&response.message.content);
 
             if tool_calls.is_empty() {
@@ -656,23 +684,14 @@ impl JiaClawAgent {
             }
 
             if iteration >= max_iterations {
-                let hint = Self::max_tool_iterations_stop_hint(max_iterations);
-                tracing::warn!("{hint}");
-                for mut tool_call in tool_calls {
-                    tool_call.result = Some(serde_json::json!({ "error": hint.clone() }));
-                    all_tool_calls.push(tool_call);
-                }
-                let mut message = response.message;
-                message.content = format!("{}\n\n{hint}", message.content.trim_end());
-                return Ok(ChatResponse {
-                    message,
-                    tool_calls: all_tool_calls,
-                    status: response.status,
-                    session_id: None,
-                });
+                return Ok(Self::finish_at_tool_iteration_limit(
+                    response,
+                    tool_calls,
+                    all_tool_calls,
+                    max_iterations,
+                ));
             }
 
-            // 执行工具调用
             let mut executed_tool_calls = Vec::new();
             let mut tool_results = Vec::new();
 
@@ -689,10 +708,7 @@ impl JiaClawAgent {
                 tool_results.push(message);
             }
 
-            // 将所有执行的工具调用添加到累积列表
             all_tool_calls.extend(executed_tool_calls);
-
-            // 将 assistant 的响应和工具结果添加到历史
             messages.push(response.message.clone());
             messages.push(ChatMessage {
                 role: MessageRole::User,
