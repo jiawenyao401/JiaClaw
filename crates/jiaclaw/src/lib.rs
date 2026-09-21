@@ -88,6 +88,38 @@ pub use workspace::Workspace;
 /// 工具执行计数钩子（`true` = ok，`false` = error）。
 pub type ToolMetricsHook = std::sync::Arc<dyn Fn(&str, bool) + Send + Sync>;
 
+/// 按配置注册可选工作区文件工具（`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` / `grep` / `glob` / `mkdir` / `move`）。
+fn register_optional_workspace_file_tools(tools: &mut ToolRegistry, config: &AgentConfig) {
+    let workspace = &config.workspace_path;
+    if config.tools.read_file.enabled {
+        tools.register(Box::new(WorkspaceReadFileTool::new(workspace)));
+    }
+    if config.tools.list_dir.enabled {
+        tools.register(Box::new(WorkspaceListDirTool::new(workspace)));
+    }
+    if config.tools.write_file.enabled {
+        tools.register(Box::new(WorkspaceWriteFileTool::new(workspace)));
+    }
+    if config.tools.delete_file.enabled {
+        tools.register(Box::new(WorkspaceDeleteFileTool::new(workspace)));
+    }
+    if config.tools.str_replace.enabled {
+        tools.register(Box::new(WorkspaceStrReplaceTool::new(workspace)));
+    }
+    if config.tools.grep.enabled {
+        tools.register(Box::new(WorkspaceGrepTool::new(workspace)));
+    }
+    if config.tools.glob.enabled {
+        tools.register(Box::new(WorkspaceGlobTool::new(workspace)));
+    }
+    if config.tools.mkdir.enabled {
+        tools.register(Box::new(WorkspaceMkdirTool::new(workspace)));
+    }
+    if config.tools.r#move.enabled {
+        tools.register(Box::new(WorkspaceMoveTool::new(workspace)));
+    }
+}
+
 /// `JiaClaw` Agent 包装器
 ///
 /// 当前实现状态：正在等待 `StateKnot` 稳定的公共 API。
@@ -166,39 +198,7 @@ impl JiaClawAgent {
                 config.memory.path.clone(),
             )));
         }
-        if config.tools.read_file.enabled {
-            tools.register(Box::new(WorkspaceReadFileTool::new(&config.workspace_path)));
-        }
-        if config.tools.list_dir.enabled {
-            tools.register(Box::new(WorkspaceListDirTool::new(&config.workspace_path)));
-        }
-        if config.tools.write_file.enabled {
-            tools.register(Box::new(WorkspaceWriteFileTool::new(
-                &config.workspace_path,
-            )));
-        }
-        if config.tools.delete_file.enabled {
-            tools.register(Box::new(WorkspaceDeleteFileTool::new(
-                &config.workspace_path,
-            )));
-        }
-        if config.tools.str_replace.enabled {
-            tools.register(Box::new(WorkspaceStrReplaceTool::new(
-                &config.workspace_path,
-            )));
-        }
-        if config.tools.grep.enabled {
-            tools.register(Box::new(WorkspaceGrepTool::new(&config.workspace_path)));
-        }
-        if config.tools.glob.enabled {
-            tools.register(Box::new(WorkspaceGlobTool::new(&config.workspace_path)));
-        }
-        if config.tools.mkdir.enabled {
-            tools.register(Box::new(WorkspaceMkdirTool::new(&config.workspace_path)));
-        }
-        if config.tools.r#move.enabled {
-            tools.register(Box::new(WorkspaceMoveTool::new(&config.workspace_path)));
-        }
+        register_optional_workspace_file_tools(&mut tools, &config);
         tools.register(Box::new(IdentityWriteTool::soul(
             &config.workspace_path,
             config.identity.soul_path.clone(),

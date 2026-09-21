@@ -203,7 +203,7 @@ pub struct MkdirArgs {
 pub enum MoveKind {
     /// 常规文件
     File,
-    /// 目录（含非空目录；同卷 `rename`）
+    /// 目录（含非空目录；同卷 [`std::fs::rename`]）
     Dir,
 }
 
@@ -1969,10 +1969,10 @@ fn rename_or_copy_delete(
     }
 }
 
-/// 在工作区内移动或重命名文件 / 目录。优先同卷 `rename`；文件与空目录在跨文件系统时回退 copy+delete。
+/// 在工作区内移动或重命名文件 / 目录。优先同卷 [`std::fs::rename`]；文件与空目录在跨文件系统时回退复制后删除。
 ///
 /// `from` 必须存在。`to` 已存在且 `overwrite=false`（默认）时报错。不创建中间目录。
-/// 非空目录仅同卷 `rename`；跨卷非空目录报错。
+/// 非空目录仅同卷 rename；跨卷非空目录报错。
 ///
 /// # Errors
 ///
@@ -2915,7 +2915,7 @@ impl Tool for WorkspaceMoveTool {
     }
 
     fn description(&self) -> &str {
-        "在工作区内移动或重命名文件或目录。文档主名 from / to（source / destination 为别名，同时给出时必须一致）。from 必须存在；to 已存在且 overwrite=false（默认）则报错。支持常规文件、空目录与非空目录（非空目录优先同卷 rename；跨文件系统的非空目录报错，文件与空目录回退 copy+delete）。禁止 .. / 绝对路径 / symlink 逃逸。canonicalize 后两端必须仍落在工作区。不创建中间目录。不执行 shell，不调用 LLM。"
+        "在工作区内移动或重命名文件或目录。文档主名 from / to（source / destination 为别名，同时给出时必须一致）。from 必须存在；to 已存在且 overwrite=false（默认）则报错。支持常规文件、空目录与非空目录（非空目录优先同卷 rename；跨文件系统的非空目录报错，文件与空目录回退复制后删除）。禁止 .. / 绝对路径 / symlink 逃逸。canonicalize 后两端必须仍落在工作区。不创建中间目录。不执行 shell，不调用 LLM。"
     }
 
     fn parameters_schema(&self) -> Value {
