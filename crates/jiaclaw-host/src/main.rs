@@ -9,7 +9,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use clap::{Parser, Subcommand};
@@ -838,27 +838,24 @@ async fn get_session_handler(
         map.get(&session_id).cloned()
     };
 
-    match messages {
-        Some(messages) => {
-            tracing::info!(
-                request_id = request_id_log_value(&headers),
-                "读取 session {}，消息数: {}",
-                session_id,
-                messages.len()
-            );
-            Ok(Json(GetSessionResponse {
-                id: session_id,
-                messages,
-            }))
-        }
-        None => {
-            tracing::info!(
-                request_id = request_id_log_value(&headers),
-                "session 不存在: {}",
-                session_id
-            );
-            Err(AppError::NotFound)
-        }
+    if let Some(messages) = messages {
+        tracing::info!(
+            request_id = request_id_log_value(&headers),
+            "读取 session {}，消息数: {}",
+            session_id,
+            messages.len()
+        );
+        Ok(Json(GetSessionResponse {
+            id: session_id,
+            messages,
+        }))
+    } else {
+        tracing::info!(
+            request_id = request_id_log_value(&headers),
+            "session 不存在: {}",
+            session_id
+        );
+        Err(AppError::NotFound)
     }
 }
 
