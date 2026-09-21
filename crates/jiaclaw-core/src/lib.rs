@@ -458,6 +458,50 @@ pub fn parse_metrics_require_auth(raw: &str) -> Option<bool> {
     parse_boolish_flag(raw)
 }
 
+/// 解析 `JIACLAW_CORS_ENABLED`；无法识别时返回 `None`。
+#[must_use]
+pub fn parse_cors_enabled(raw: &str) -> Option<bool> {
+    parse_boolish_flag(raw)
+}
+
+/// 解析逗号分隔的 CORS 来源列表；空白项丢弃。
+#[must_use]
+pub fn parse_cors_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// 根据配置文件值与可选环境变量解析 CORS 开关。
+///
+/// 环境变量 `JIACLAW_CORS_ENABLED` 优先：可解析的 `1`/`true`/`yes`/`on` 与
+/// `0`/`false`/`no`/`off` 覆盖配置；未设置或无法解析时回退配置值（默认关闭）。
+#[must_use]
+pub fn resolve_cors_enabled(configured: bool, env_value: Option<&str>) -> bool {
+    match env_value {
+        Some(raw) => parse_cors_enabled(raw).unwrap_or(configured),
+        None => configured,
+    }
+}
+
+/// 根据配置文件值与可选环境变量解析 CORS 允许来源。
+///
+/// 环境变量 `JIACLAW_CORS_ORIGINS`（逗号分隔）一旦设置即覆盖配置列表。
+/// 空白项丢弃；`*` 只有出现在列表中才表示允许所有来源。
+#[must_use]
+pub fn resolve_cors_origins(configured: Vec<String>, env_value: Option<&str>) -> Vec<String> {
+    match env_value {
+        Some(raw) => parse_cors_origins(raw),
+        None => configured
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+    }
+}
+
 /// 根据配置文件 `metrics_public` 与可选环境变量解析 `/metrics` 是否公开。
 ///
 /// 环境变量 `JIACLAW_METRICS_REQUIRE_AUTH` 优先：`1`/`true` 表示要求鉴权（不公开），
@@ -626,6 +670,150 @@ impl Default for MemoryWriteToolConfig {
     }
 }
 
+/// 可选浏览器 CORS 配置（`[http.cors]`）。
+///
+/// 默认关闭：不发送任何 CORS 头，行为与未配置时一致。开启后才处理
+/// `Origin` / OPTIONS preflight；`*` 仅在 `allowed_origins` 中显式写出时生效。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpCorsConfig {
+    /// 是否启用 CORS（默认 `false`）。环境变量 `JIACLAW_CORS_ENABLED` 优先。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 允许的精确 Origin 列表。环境变量 `JIACLAW_CORS_ORIGINS`（逗号分隔）优先。
+    ///
+    /// 仅当列表中显式包含 `*` 时才允许所有来源；空列表不回声任何 Origin。
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    /// 允许的 HTTP 方法。空则回退默认：GET / POST / DELETE / OPTIONS。
+    #[serde(default = "default_cors_allowed_methods")]
+    pub allowed_methods: Vec<String>,
+
+    /// 允许的请求头。空则回退默认：`Authorization`、`Content-Type`、`X-Request-Id`、`Accept`。
+    #[serde(default = "default_cors_allowed_headers")]
+    pub allowed_headers: Vec<String>,
+
+    /// 暴露给浏览器的响应头。空则回退默认：`X-Request-Id`。
+    #[serde(default = "default_cors_expose_headers")]
+    pub expose_headers: Vec<String>,
+
+    /// Preflight 缓存秒数（可选）。`None` / `0` 表示不发送 `Access-Control-Max-Age`。
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+}
+
+fn default_cors_allowed_methods() -> Vec<String> {
+    vec![
+        "GET".to_string(),
+        "POST".to_string(),
+        "DELETE".to_string(),
+        "OPTIONS".to_string(),
+    ]
+}
+
+fn default_cors_allowed_headers() -> Vec<String> {
+    vec![
+        "Authorization".to_string(),
+        "Content-Type".to_string(),
+        "X-Request-Id".to_string(),
+        "Accept".to_string(),
+    ]
+}
+
+fn default_cors_expose_headers() -> Vec<String> {
+    vec!["X-Request-Id".to_string()]
+}
+
+fn nonempty_or_default(values: &[String], fallback: Vec<String>) -> Vec<String> {
+    let trimmed: Vec<String> = values
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect();
+    if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    }
+}
+
+impl Default for HttpCorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_origins: Vec::new(),
+            allowed_methods: default_cors_allowed_methods(),
+            allowed_headers: default_cors_allowed_headers(),
+            expose_headers: default_cors_expose_headers(),
+            max_age_secs: None,
+        }
+    }
+}
+
+impl HttpCorsConfig {
+    /// 解析生效的 CORS 开关。环境变量 `JIACLAW_CORS_ENABLED` 优先。
+    #[must_use]
+    pub fn effective_enabled(&self) -> bool {
+        resolve_cors_enabled(
+            self.enabled,
+            std::env::var("JIACLAW_CORS_ENABLED").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的允许来源。环境变量 `JIACLAW_CORS_ORIGINS` 优先。
+    #[must_use]
+    pub fn effective_allowed_origins(&self) -> Vec<String> {
+        resolve_cors_origins(
+            self.allowed_origins.clone(),
+            std::env::var("JIACLAW_CORS_ORIGINS").ok().as_deref(),
+        )
+    }
+
+    /// 解析生效的允许方法；空配置回退默认 GET/POST/DELETE/OPTIONS。
+    #[must_use]
+    pub fn effective_allowed_methods(&self) -> Vec<String> {
+        nonempty_or_default(&self.allowed_methods, default_cors_allowed_methods())
+    }
+
+    /// 解析生效的允许请求头；空配置回退默认四项。
+    #[must_use]
+    pub fn effective_allowed_headers(&self) -> Vec<String> {
+        nonempty_or_default(&self.allowed_headers, default_cors_allowed_headers())
+    }
+
+    /// 解析生效的暴露响应头；空配置回退 `X-Request-Id`。
+    #[must_use]
+    pub fn effective_expose_headers(&self) -> Vec<String> {
+        nonempty_or_default(&self.expose_headers, default_cors_expose_headers())
+    }
+
+    /// 解析生效的 preflight 缓存秒数；`0` 视为未设置。
+    #[must_use]
+    pub fn effective_max_age_secs(&self) -> Option<u64> {
+        self.max_age_secs.filter(|&secs| secs > 0)
+    }
+
+    /// 应用环境变量覆盖后的 CORS 配置（serve / 中间件构建时调用）。
+    #[must_use]
+    pub fn resolved(&self) -> Self {
+        Self {
+            enabled: self.effective_enabled(),
+            allowed_origins: self.effective_allowed_origins(),
+            allowed_methods: self.effective_allowed_methods(),
+            allowed_headers: self.effective_allowed_headers(),
+            expose_headers: self.effective_expose_headers(),
+            max_age_secs: self.effective_max_age_secs(),
+        }
+    }
+
+    /// 当前来源列表是否显式包含 `*`（不读取环境变量；请先 `resolved()`）。
+    #[must_use]
+    pub fn allows_any_origin(&self) -> bool {
+        self.allowed_origins.iter().any(|origin| origin == "*")
+    }
+}
+
 /// HTTP 服务配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpConfig {
@@ -683,9 +871,9 @@ pub struct HttpConfig {
     #[serde(default)]
     pub discord_bot_token: Option<String>,
 
-    /// CORS 允许的来源列表（空或 `["*"]` 表示允许所有来源）
-    #[serde(default = "default_cors_allow_origins")]
-    pub cors_allow_origins: Vec<String>,
+    /// 可选浏览器 CORS（默认关闭）。详见 [`HttpCorsConfig`]。
+    #[serde(default)]
+    pub cors: HttpCorsConfig,
 
     /// 是否持久化 session 到磁盘
     #[serde(default)]
@@ -726,10 +914,6 @@ fn default_http_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
 
-fn default_cors_allow_origins() -> Vec<String> {
-    vec!["*".to_string()]
-}
-
 fn default_persist_path() -> String {
     ".jiaclaw/sessions.json".to_string()
 }
@@ -754,7 +938,7 @@ impl Default for HttpConfig {
             slack_bot_token: None,
             discord_public_key: None,
             discord_bot_token: None,
-            cors_allow_origins: default_cors_allow_origins(),
+            cors: HttpCorsConfig::default(),
             persist: false,
             persist_path: default_persist_path(),
             rate_limit_per_minute: None,
@@ -1246,20 +1430,20 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_boolish_flag, parse_metrics_require_auth, parse_positive_heartbeat_interval,
-        parse_positive_max_tool_iterations, parse_positive_rate_limit, parse_positive_session_ttl,
-        parse_positive_shutdown_timeout, parse_positive_tool_timeout,
-        parse_session_summarize_on_overflow, resolve_heartbeat_interval_secs,
-        resolve_max_tool_iterations, resolve_metrics_public, resolve_optional_secret,
-        resolve_rate_limit_per_minute, resolve_session_keep_recent,
-        resolve_session_summarize_on_overflow, resolve_session_ttl_secs,
-        resolve_shutdown_timeout_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
-        HttpConfig, MemorySearchToolConfig, MemoryWriteToolConfig, SessionConfig, ToolsConfig,
-        WebFetchToolConfig, WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-        DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS,
-        DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
-        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
-        MIN_MAX_TOOL_ITERATIONS,
+        parse_boolish_flag, parse_cors_enabled, parse_cors_origins, parse_metrics_require_auth,
+        parse_positive_heartbeat_interval, parse_positive_max_tool_iterations,
+        parse_positive_rate_limit, parse_positive_session_ttl, parse_positive_shutdown_timeout,
+        parse_positive_tool_timeout, parse_session_summarize_on_overflow, resolve_cors_enabled,
+        resolve_cors_origins, resolve_heartbeat_interval_secs, resolve_max_tool_iterations,
+        resolve_metrics_public, resolve_optional_secret, resolve_rate_limit_per_minute,
+        resolve_session_keep_recent, resolve_session_summarize_on_overflow,
+        resolve_session_ttl_secs, resolve_shutdown_timeout_secs, resolve_tool_timeout_secs,
+        AgentConfig, HeartbeatConfig, HttpConfig, HttpCorsConfig, MemorySearchToolConfig,
+        MemoryWriteToolConfig, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+        DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
+        DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
+        DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
+        MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -1298,6 +1482,133 @@ mod tests {
     fn http_config_metrics_public_defaults_to_true() {
         assert!(HttpConfig::default().metrics_public);
         assert!(HttpConfig::default().effective_metrics_public());
+    }
+
+    #[test]
+    fn http_cors_defaults_to_disabled_without_wildcard() {
+        let cors = HttpConfig::default().cors;
+        assert!(!cors.enabled);
+        assert!(!cors.effective_enabled());
+        assert!(cors.allowed_origins.is_empty());
+        assert!(cors.effective_allowed_origins().is_empty());
+        assert!(!cors.allows_any_origin());
+        assert_eq!(
+            cors.effective_allowed_methods(),
+            vec!["GET", "POST", "DELETE", "OPTIONS"]
+        );
+        assert_eq!(
+            cors.effective_allowed_headers(),
+            vec!["Authorization", "Content-Type", "X-Request-Id", "Accept"]
+        );
+        assert_eq!(cors.effective_expose_headers(), vec!["X-Request-Id"]);
+        assert_eq!(cors.effective_max_age_secs(), None);
+    }
+
+    #[test]
+    fn parse_cors_origins_splits_comma_and_trims() {
+        assert_eq!(
+            parse_cors_origins(" http://localhost:5173 , https://app.example "),
+            vec!["http://localhost:5173", "https://app.example"]
+        );
+        assert_eq!(parse_cors_origins("*"), vec!["*"]);
+        assert!(parse_cors_origins(" ,  , ").is_empty());
+        assert!(parse_cors_origins("").is_empty());
+    }
+
+    #[test]
+    fn parse_cors_enabled_accepts_boolish_values() {
+        assert_eq!(parse_cors_enabled("1"), Some(true));
+        assert_eq!(parse_cors_enabled("true"), Some(true));
+        assert_eq!(parse_cors_enabled(" YES "), Some(true));
+        assert_eq!(parse_cors_enabled("0"), Some(false));
+        assert_eq!(parse_cors_enabled("off"), Some(false));
+        assert_eq!(parse_cors_enabled(""), None);
+        assert_eq!(parse_cors_enabled("maybe"), None);
+    }
+
+    #[test]
+    fn resolve_cors_env_overrides_config() {
+        assert!(resolve_cors_enabled(false, Some("1")));
+        assert!(resolve_cors_enabled(false, Some("true")));
+        assert!(!resolve_cors_enabled(true, Some("0")));
+        assert!(!resolve_cors_enabled(false, Some("nope")));
+        assert!(!resolve_cors_enabled(false, None));
+        assert!(resolve_cors_enabled(true, None));
+        assert_eq!(
+            resolve_cors_origins(
+                vec!["https://from-file.example".into()],
+                Some("http://localhost:5173, https://ui.example")
+            ),
+            vec!["http://localhost:5173", "https://ui.example"]
+        );
+        assert_eq!(
+            resolve_cors_origins(vec!["https://from-file.example".into()], Some("*")),
+            vec!["*"]
+        );
+        assert!(
+            resolve_cors_origins(vec!["https://from-file.example".into()], Some("")).is_empty()
+        );
+        assert_eq!(
+            resolve_cors_origins(vec![" https://from-file.example ".into()], None),
+            vec!["https://from-file.example"]
+        );
+    }
+
+    #[test]
+    fn http_config_parses_cors_section_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[http]
+bind = "127.0.0.1:9090"
+
+[http.cors]
+enabled = true
+allowed_origins = ["http://localhost:5173", "https://app.example"]
+allowed_methods = ["GET", "POST"]
+allowed_headers = ["Authorization", "Content-Type"]
+expose_headers = ["X-Request-Id"]
+max_age_secs = 600
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(config.http.cors.enabled);
+        assert_eq!(
+            config.http.cors.allowed_origins,
+            vec!["http://localhost:5173", "https://app.example"]
+        );
+        assert_eq!(config.http.cors.allowed_methods, vec!["GET", "POST"]);
+        assert_eq!(
+            config.http.cors.allowed_headers,
+            vec!["Authorization", "Content-Type"]
+        );
+        assert_eq!(config.http.cors.expose_headers, vec!["X-Request-Id"]);
+        assert_eq!(config.http.cors.max_age_secs, Some(600));
+        let resolved = config.http.cors.resolved();
+        assert!(resolved.enabled);
+        assert!(!resolved.allows_any_origin());
+    }
+
+    #[test]
+    fn http_config_parses_missing_cors_from_json_as_disabled() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "http": {
+                "bind": "127.0.0.1:8080"
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(!config.http.cors.enabled);
+        assert!(config.http.cors.allowed_origins.is_empty());
+        assert!(!HttpCorsConfig::default().enabled);
     }
 
     #[test]

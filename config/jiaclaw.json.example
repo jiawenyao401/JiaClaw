@@ -23,7 +23,14 @@
   },
     "http": {
       "bind": "127.0.0.1:8080",
-      "cors_allow_origins": ["*"],
+      "cors": {
+        "enabled": false,
+        "allowed_origins": [],
+        "allowed_methods": ["GET", "POST", "DELETE", "OPTIONS"],
+        "allowed_headers": ["Authorization", "Content-Type", "X-Request-Id", "Accept"],
+        "expose_headers": ["X-Request-Id"],
+        "max_age_secs": null
+      },
       "persist": false,
       "persist_path": ".jiaclaw/sessions.json",
       "rate_limit_per_minute": null,
