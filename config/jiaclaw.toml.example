@@ -142,17 +142,14 @@ persist_path = ".jiaclaw/sessions.json"
 # keep_recent = 10
 
 [logging]
-# 日志级别: trace, debug, info, warn, error
-level = "info"
+# 日志格式: text（默认，与当前人类可读 tracing 一致）或 json（每行一条 JSON）
+# 环境变量 JIACLAW_LOG_FORMAT 优先（json / text；无法识别则回退配置）
+# format = "json"
+format = "text"
 
-# 日志格式: json, pretty, compact
-format = "pretty"
-
-# 日志输出: stdout, stderr, file
-output = "stdout"
-
-# 日志文件路径（当 output = "file" 时）
-# file_path = "/var/log/jiaclaw/jiaclaw.log"
+# 日志级别指令（可选，例如 info 或 jiaclaw=debug）
+# 优先级：JIACLAW_LOG_LEVEL > RUST_LOG > 本字段 > info
+# level = "info"
 
 [tools]
 # 启用的工具列表（示例，当前不驱动注册）

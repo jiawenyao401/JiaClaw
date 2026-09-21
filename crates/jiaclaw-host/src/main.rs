@@ -29,8 +29,9 @@ use jiaclaw::{
     inspect_memory_file, load_heartbeat_message, resolve_heartbeat_path, JiaClawAgent, Workspace,
 };
 use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpCorsConfig, MessageRole, ToolCall,
-    MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
+    parse_log_format, AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpCorsConfig,
+    LogFormat, LoggingConfig, MessageRole, ToolCall, DEFAULT_LOG_LEVEL, MAX_MAX_TOOL_ITERATIONS,
+    MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -305,15 +306,12 @@ enum IdentityFileCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+    // serve 在加载配置后再初始化 subscriber，以便 `[logging] format=json` 生效。
+    // 其它命令只读环境变量 / 默认 text，行为与原先 `fmt()` + EnvFilter 一致。
+    if !matches!(cli.command, Commands::Serve { .. }) {
+        init_tracing_from(&LoggingConfig::default());
+    }
 
     match cli.command {
         Commands::Init { path, force } => {
@@ -1700,6 +1698,68 @@ fn rate_limit_config_source() -> &'static str {
     }
 }
 
+fn log_format_config_source() -> &'static str {
+    match std::env::var("JIACLAW_LOG_FORMAT") {
+        Ok(raw) if parse_log_format(&raw).is_some() => "环境变量 JIACLAW_LOG_FORMAT",
+        _ => "配置文件",
+    }
+}
+
+fn log_level_config_source() -> &'static str {
+    match std::env::var("JIACLAW_LOG_LEVEL") {
+        Ok(raw) if !raw.trim().is_empty() => "环境变量 JIACLAW_LOG_LEVEL",
+        _ => match std::env::var("RUST_LOG") {
+            Ok(raw) if !raw.trim().is_empty() => "环境变量 RUST_LOG",
+            _ => "配置文件",
+        },
+    }
+}
+
+fn logging_status_line(logging: &LoggingConfig) -> String {
+    format!(
+        "{}（级别 {}，格式来自 {}，级别来自 {}）",
+        logging.effective_format(),
+        logging.effective_level_directive(),
+        log_format_config_source(),
+        log_level_config_source()
+    )
+}
+
+/// 与 `init_tracing_from` 使用同一套 layer 选择，便于单测断言而不启动 HTTP。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TracingFmtKind {
+    Text,
+    Json,
+}
+
+fn tracing_fmt_kind(format: LogFormat) -> TracingFmtKind {
+    match format {
+        LogFormat::Json => TracingFmtKind::Json,
+        LogFormat::Text => TracingFmtKind::Text,
+    }
+}
+
+fn env_filter_from_logging(logging: &LoggingConfig) -> tracing_subscriber::EnvFilter {
+    let directive = logging.effective_level_directive();
+    tracing_subscriber::EnvFilter::try_new(&directive)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_LEVEL))
+}
+
+fn init_tracing_from(logging: &LoggingConfig) {
+    let filter = env_filter_from_logging(logging);
+    match tracing_fmt_kind(logging.effective_format()) {
+        TracingFmtKind::Text => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+        TracingFmtKind::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        }
+    }
+}
+
 fn metrics_auth_config_source() -> &'static str {
     if std::env::var("JIACLAW_METRICS_REQUIRE_AUTH").is_ok() {
         "环境变量 JIACLAW_METRICS_REQUIRE_AUTH"
@@ -2218,8 +2278,14 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         config.http.bind = bind_addr;
     }
 
+    init_tracing_from(&config.logging);
     tracing::info!("正在启动 JiaClaw Agent 服务");
     tracing::info!("使用 Agent 配置: {}", config.name);
+    tracing::info!(
+        format = %config.logging.effective_format(),
+        source = log_format_config_source(),
+        "日志格式"
+    );
 
     // 创建 agent 与进程内指标（工具钩子在 Arc 包装前挂上）
     let metrics = Arc::new(Metrics::default());
@@ -2334,6 +2400,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
 
     // 启动日志
     tracing::info!("✅ HTTP 服务已启动于 http://{}", config.http.bind);
+    tracing::info!("   • 日志格式: {}", logging_status_line(&config.logging));
     tracing::info!("   • GET    /health              - 健康检查");
     tracing::info!("   • GET    /metrics             - Prometheus 文本指标");
     tracing::info!("   • POST   /api/chat            - 聊天端点（可选 SSE）");
@@ -2466,6 +2533,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     // 打印配置摘要（不打印 secret 明文）
     println!("\n📋 HTTP 配置摘要:");
     println!("   • 绑定地址: {}", config.http.bind);
+    println!("   • 日志格式: {}", logging_status_line(&config.logging));
 
     if api_token.is_some() {
         println!(
@@ -4877,6 +4945,10 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     // 4. HTTP 配置检查
     println!("\n🌐 HTTP 配置");
     println!("   绑定地址: {}", config.http.bind);
+    println!(
+        "   日志格式: {}（不打印日志正文或 secret）",
+        logging_status_line(&config.logging)
+    );
 
     // 检查 API token（环境变量优先）
     let api_token = std::env::var("JIACLAW_API_TOKEN")
@@ -5102,6 +5174,7 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
     println!("   • 已发现技能: {skills_count} 个");
     println!("   • 已注册工具: {tools_count} 个");
     println!("   • HTTP 绑定: {}", config.http.bind);
+    println!("   • 日志格式: {}", config.logging.effective_format());
     println!(
         "   • API 鉴权: {}",
         if api_token.is_some() {
@@ -5247,9 +5320,10 @@ mod tests {
     };
     use jiaclaw::SESSION_SUMMARY_PREFIX;
     use jiaclaw_core::{
-        ChatMessage, ChatRequest, HeartbeatConfig, ListDirToolConfig, MemorySearchToolConfig,
-        MemoryWriteToolConfig, MessageRole, ReadFileToolConfig, SessionConfig, ToolsConfig,
-        WebFetchToolConfig, WebSearchToolConfig, WriteFileToolConfig,
+        resolve_log_format, ChatMessage, ChatRequest, HeartbeatConfig, ListDirToolConfig,
+        LogFormat, LoggingConfig, MemorySearchToolConfig, MemoryWriteToolConfig, MessageRole,
+        ReadFileToolConfig, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+        WriteFileToolConfig,
     };
     use tower::ServiceExt;
 
@@ -8174,6 +8248,83 @@ mod tests {
             "doctor must not print api key: {joined}"
         );
         assert!(joined.contains("已配置"), "{joined}");
+    }
+
+    #[test]
+    fn tracing_fmt_kind_selects_text_by_default_and_json_when_configured() {
+        assert_eq!(
+            tracing_fmt_kind(LoggingConfig::default().format),
+            TracingFmtKind::Text
+        );
+        assert_eq!(tracing_fmt_kind(LogFormat::Text), TracingFmtKind::Text);
+        assert_eq!(tracing_fmt_kind(LogFormat::Json), TracingFmtKind::Json);
+        let json = LoggingConfig {
+            format: LogFormat::Json,
+            level: None,
+        };
+        assert_eq!(
+            tracing_fmt_kind(json.effective_format()),
+            TracingFmtKind::Json
+        );
+        let env_overridden = resolve_log_format(LogFormat::Text, Some("json"));
+        assert_eq!(tracing_fmt_kind(env_overridden), TracingFmtKind::Json);
+    }
+
+    #[test]
+    fn logging_status_line_prints_format_not_secrets() {
+        let logging = LoggingConfig {
+            format: LogFormat::Json,
+            level: Some("info".to_string()),
+        };
+        let line = logging_status_line(&logging);
+        assert!(line.contains("json"), "{line}");
+        assert!(!line.contains("token"), "{line}");
+        assert!(!line.contains("secret"), "{line}");
+    }
+
+    #[test]
+    fn json_tracing_layer_emits_one_parseable_line_with_request_id() {
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufferWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufferWriter {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(BufferWriter(buf.clone()))
+            .with_env_filter("info")
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(request_id = "req-1", "hello json");
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let line = output.lines().next().expect("one json line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse json log line");
+        assert_eq!(value["level"], "INFO");
+        assert!(value.get("timestamp").is_some(), "{value}");
+        assert!(value.get("target").is_some(), "{value}");
+        assert_eq!(value["fields"]["message"], "hello json");
+        assert_eq!(value["fields"]["request_id"], "req-1");
     }
 
     #[test]

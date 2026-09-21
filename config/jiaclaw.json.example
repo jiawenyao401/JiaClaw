@@ -19,6 +19,7 @@
     "timeout": 300
   },
   "logging": {
+    "format": "text",
     "level": "info"
   },
     "http": {

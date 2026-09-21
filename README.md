@@ -70,6 +70,11 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **可选 GET /metrics** - 进程内 Prometheus 文本（不引入 telemetry SDK）
   - 默认无需 API Bearer（便于 scrape）；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权
   - 计数：`jiaclaw_http_requests_total{path,method,status}`（路由族）、`jiaclaw_sessions_active`、`jiaclaw_tool_calls_total{tool,result}`、`jiaclaw_build_info{version}`
+- ✅ **可选 JSON 结构化日志** - `jiaclaw serve` 默认仍为人类可读 text；采集侧可切 JSON 行
+  - `[logging] format = "text" | "json"`（默认 `text`，与当前 tracing fmt 完全一致）；可选 `level`
+  - 环境变量优先：`JIACLAW_LOG_FORMAT=json`、`JIACLAW_LOG_LEVEL`（再回退 `RUST_LOG`）
+  - `format=json` 时每行一条 JSON（`timestamp` / `level` / `target` / `fields` / `message`；`request_id` 作为 tracing 字段），不另起日志系统
+  - `jiaclaw doctor` / `serve` 启动摘要打印生效 format（不打印 secret）
 - ✅ **可选 Session TTL** - 闲置超时自动清理内存会话（长时间 `serve` 防堆积）
   - 配置 `session_ttl_secs` 或环境变量 `JIACLAW_SESSION_TTL_SECS`（正整数才启用；`0`/非法=关闭）
   - create/chat/get/list 触达刷新；过期后 list 不返回，GET/DELETE/export 与不存在一致（404）
@@ -282,6 +287,13 @@ persist_path = ".jiaclaw/sessions.json"
 # 落盘开启时关闭路径会原子刷盘 sessions。
 # shutdown_timeout_secs = 15
 
+[logging]
+# 日志格式: text（默认，人类可读，与当前 tracing 一致）或 json（每行一条 JSON）
+# 环境变量 JIACLAW_LOG_FORMAT 优先
+# format = "json"
+# 日志级别指令（可选）。优先级：JIACLAW_LOG_LEVEL > RUST_LOG > 本字段 > info
+# level = "info"
+
 [session]
 # 接近消息条数上限（50）时是否摘要压缩（默认 false，保持硬截断）
 # 环境变量 JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true 可强制开启
@@ -363,6 +375,10 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 # 可选：GET /metrics 要求与 /api/* 相同鉴权（优先于 [http] metrics_public）
 # export JIACLAW_METRICS_REQUIRE_AUTH=1
+# 可选：serve 日志格式（text 默认；json 为每行一条 JSON，优先于 [logging] format）
+# export JIACLAW_LOG_FORMAT=json
+# 可选：日志级别指令（优先于 RUST_LOG 与 [logging] level）
+# export JIACLAW_LOG_LEVEL=info
 # 可选：Session 闲置 TTL（秒，优先于配置文件）
 # export JIACLAW_SESSION_TTL_SECS=3600
 # 可选：serve 优雅退出宽限期（秒，优先于 [http] shutdown_timeout_secs；正整数，非法/0 回退 15）
@@ -602,6 +618,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram`、`/hooks/slack`、`/hooks/discord` 超限返回 `429` + `Retry-After`；`GET /health` 与 `GET /metrics` 不限流
 - 可选 CORS：默认关闭、不发送 CORS 头。`[http.cors] enabled = true` 或 `JIACLAW_CORS_ENABLED=1` 后，匹配的 `Origin` 获得 `Access-Control-Allow-Origin`；`JIACLAW_CORS_ORIGINS` 逗号分隔覆盖 `allowed_origins`。`*` 仅在显式配置时允许所有来源。OPTIONS preflight 不要求 API Bearer，仍回写 `X-Request-Id`。未匹配 Origin 不回声
 - 可选 Prometheus 指标：`GET /metrics` 默认公开；`[http] metrics_public = false` 或 `JIACLAW_METRICS_REQUIRE_AUTH=1` 时与 `/api/*` 相同鉴权。进程内计数（HTTP 路由族、session 数、工具调用、build_info），不引入 telemetry SDK
+- 可选 JSON 结构化日志：默认 `[logging] format = "text"` 与当前人类可读 tracing 一致。`format = "json"` 或 `JIACLAW_LOG_FORMAT=json` 时每行一条 JSON（含 `timestamp` / `level` / `target` / `fields` / `message`，`request_id` 作为字段）。`JIACLAW_LOG_LEVEL` 优先于 `RUST_LOG`。doctor / serve 启动打印生效 format，不打印 secret
 - 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET/export 为 404
 - serve 优雅退出：`jiaclaw serve` 支持 SIGINT/SIGTERM；停止 accept 并等待进行中请求。`[http] shutdown_timeout_secs` 默认 15 秒，`JIACLAW_SHUTDOWN_TIMEOUT_SECS` 优先（正整数；非法回退默认）。落盘开启时关闭路径刷盘；Heartbeat 任务 abort
 - 技能热加载：`POST /api/skills/reload` 重扫 `skills/` 并替换进程内表，失败保留旧表。Unix `SIGHUP` 同样路径；Windows 仅 HTTP。`jiaclaw skills reload` 只扫描当前工作区，不通知 serve
@@ -717,6 +734,11 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Optional GET /metrics** - in-process Prometheus text (no telemetry SDK)
   - Public by default for scraping; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`
   - Series: `jiaclaw_http_requests_total{path,method,status}` (route family), `jiaclaw_sessions_active`, `jiaclaw_tool_calls_total{tool,result}`, `jiaclaw_build_info{version}`
+- ✅ **Optional JSON structured logs** - `jiaclaw serve` stays human-readable `text` by default; collectors can switch to JSON lines
+  - `[logging] format = "text" | "json"` (default `text`, identical to the current tracing fmt); optional `level`
+  - Env vars win: `JIACLAW_LOG_FORMAT=json`, `JIACLAW_LOG_LEVEL` (then `RUST_LOG`)
+  - `format=json` emits one JSON object per line (`timestamp` / `level` / `target` / `fields` / `message`; `request_id` is a tracing field) on the existing tracing subscriber
+  - `jiaclaw doctor` / `serve` startup prints the effective format (never secrets)
 - ✅ **Optional Session TTL** - idle sessions are expired to avoid unbounded memory growth during long `serve`
   - Configure `session_ttl_secs` or `JIACLAW_SESSION_TTL_SECS` (positive integer enables; `0`/invalid disables)
   - create/chat/get/list refresh last access; expired ids are omitted from list and GET/DELETE/export match not-found (404)
@@ -929,6 +951,13 @@ persist_path = ".jiaclaw/sessions.json"
 # When persist is on, the shutdown path flushes sessions with the same atomic write.
 # shutdown_timeout_secs = 15
 
+[logging]
+# Log format: text (default, human-readable, same as current tracing) or json (one JSON object per line)
+# JIACLAW_LOG_FORMAT overrides this
+# format = "json"
+# Optional level directive. Precedence: JIACLAW_LOG_LEVEL > RUST_LOG > this field > info
+# level = "info"
+
 [session]
 # When approaching the message cap (50), summarize older turns instead of dropping them (default false)
 # JIACLAW_SESSION_SUMMARIZE_ON_OVERFLOW=1/true force-enables this
@@ -1009,6 +1038,10 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
 # Optional: require /api/* auth for GET /metrics (overrides [http] metrics_public)
 # export JIACLAW_METRICS_REQUIRE_AUTH=1
+# Optional: serve log format (text default; json is one JSON object per line; overrides [logging] format)
+# export JIACLAW_LOG_FORMAT=json
+# Optional: log level directive (overrides RUST_LOG and [logging] level)
+# export JIACLAW_LOG_LEVEL=info
 # Optional: session idle TTL in seconds (overrides config file)
 # export JIACLAW_SESSION_TTL_SECS=3600
 # Optional: graceful shutdown timeout in seconds (overrides [http] shutdown_timeout_secs; invalid/0 falls back to 15)
@@ -1241,6 +1274,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*`, `/hooks/inbound`, `/hooks/telegram`, `/hooks/slack`, and `/hooks/discord` return `429` + `Retry-After` when exceeded; `GET /health` and `GET /metrics` are never limited
 - Optional CORS: off by default (no CORS headers). `[http.cors] enabled = true` or `JIACLAW_CORS_ENABLED=1` echoes `Access-Control-Allow-Origin` for matching origins; `JIACLAW_CORS_ORIGINS` (comma-separated) overrides `allowed_origins`. `*` allows all only when configured explicitly. OPTIONS preflight does not require an API Bearer and still writes `X-Request-Id`. Unmatched origins are never echoed
 - Optional Prometheus metrics: `GET /metrics` is public by default; `[http] metrics_public = false` or `JIACLAW_METRICS_REQUIRE_AUTH=1` uses the same auth as `/api/*`. In-process counters (HTTP route family, session gauge, tool calls, build_info); no telemetry SDK
+- Optional JSON structured logs: default `[logging] format = "text"` matches the current human-readable tracing fmt. `format = "json"` or `JIACLAW_LOG_FORMAT=json` emits one JSON object per line (`timestamp` / `level` / `target` / `fields` / `message`; `request_id` is a field). `JIACLAW_LOG_LEVEL` overrides `RUST_LOG`. doctor / serve startup prints the effective format and never prints secrets
 - Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET/export of an expired id returns 404
 - Graceful serve shutdown: `jiaclaw serve` handles SIGINT/SIGTERM; stops accepting and drains in-flight requests. `[http] shutdown_timeout_secs` defaults to 15s; `JIACLAW_SHUTDOWN_TIMEOUT_SECS` wins (positive integer; invalid falls back to default). Persist flush on shutdown; heartbeat tasks are aborted
 - Skill hot-reload: `POST /api/skills/reload` rescans `skills/` and replaces the in-process table; failures keep the old table. Unix `SIGHUP` uses the same path; Windows is HTTP-only. `jiaclaw skills reload` scans this process only and does not notify serve
