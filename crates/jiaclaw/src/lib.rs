@@ -10,8 +10,8 @@
 //! - 持久化运行（支持重启后恢复）
 
 pub use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, DeleteFileToolConfig, HeartbeatConfig,
-    HttpConfig, IdentityConfig, JiaClawError, ListDirToolConfig, MemoryConfig,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, DeleteFileToolConfig, GrepToolConfig,
+    HeartbeatConfig, HttpConfig, IdentityConfig, JiaClawError, ListDirToolConfig, MemoryConfig,
     MemorySearchToolConfig, MemoryWriteToolConfig, MessageRole, ProviderConfig, ReadFileToolConfig,
     RunStatus, SessionConfig, StrReplaceToolConfig, ToolCall, ToolsConfig, WebFetchToolConfig,
     WebSearchToolConfig, WriteFileToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
@@ -32,15 +32,16 @@ mod tools;
 mod workspace;
 
 pub use files::{
-    clamp_list_dir_max_entries, delete_workspace_regular_file, list_workspace_dir,
-    parse_delete_file_args, parse_list_dir_args, parse_read_file_args, parse_str_replace_args,
-    parse_write_file_args, read_workspace_file, str_replace_workspace_file,
-    write_workspace_regular_file, DeleteFileArgs, DeleteFileOutput, DirEntryInfo, ListDirArgs,
-    ListDirOutput, ReadFileArgs, ReadFileOutput, StrReplaceArgs, StrReplaceOutput,
-    WorkspaceDeleteFileTool, WorkspaceListDirTool, WorkspaceReadFileTool, WorkspaceStrReplaceTool,
+    clamp_grep_max_matches, clamp_list_dir_max_entries, delete_workspace_regular_file,
+    glob_matches, grep_workspace, list_workspace_dir, parse_delete_file_args, parse_grep_args,
+    parse_list_dir_args, parse_read_file_args, parse_str_replace_args, parse_write_file_args,
+    read_workspace_file, str_replace_workspace_file, write_workspace_regular_file, DeleteFileArgs,
+    DeleteFileOutput, DirEntryInfo, GrepArgs, GrepMatch, GrepOutput, ListDirArgs, ListDirOutput,
+    ReadFileArgs, ReadFileOutput, StrReplaceArgs, StrReplaceOutput, WorkspaceDeleteFileTool,
+    WorkspaceGrepTool, WorkspaceListDirTool, WorkspaceReadFileTool, WorkspaceStrReplaceTool,
     WorkspaceWriteFileTool, WriteFileArgs, WriteFileMode, WriteFileOutput,
-    LIST_DIR_DEFAULT_MAX_ENTRIES, LIST_DIR_MAX_ENTRIES, READ_FILE_MAX_BYTES, STR_REPLACE_MAX_BYTES,
-    WRITE_FILE_MAX_BYTES,
+    GREP_DEFAULT_MAX_MATCHES, GREP_FILE_MAX_BYTES, GREP_MAX_MATCHES, LIST_DIR_DEFAULT_MAX_ENTRIES,
+    LIST_DIR_MAX_ENTRIES, READ_FILE_MAX_BYTES, STR_REPLACE_MAX_BYTES, WRITE_FILE_MAX_BYTES,
 };
 pub use heartbeat::{inspect_heartbeat_file, load_heartbeat_message, resolve_heartbeat_path};
 pub use identity::{
@@ -180,6 +181,9 @@ impl JiaClawAgent {
             tools.register(Box::new(WorkspaceStrReplaceTool::new(
                 &config.workspace_path,
             )));
+        }
+        if config.tools.grep.enabled {
+            tools.register(Box::new(WorkspaceGrepTool::new(&config.workspace_path)));
         }
         tools.register(Box::new(IdentityWriteTool::soul(
             &config.workspace_path,
@@ -1791,6 +1795,81 @@ mod tests {
                     "old_str": "a",
                     "new_str": "b"
                 }),
+                result: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("工具不存在"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn grep_is_registered_by_default() {
+        let agent = JiaClawAgent::new(AgentConfig::default()).unwrap();
+        assert!(
+            agent.tools().get("grep").is_some(),
+            "grep should be in the default tool list"
+        );
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            prompt.contains("grep"),
+            "system prompt should describe grep"
+        );
+        assert!(
+            prompt.contains("字面量") || prompt.contains("非正则"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn grep_is_not_registered_when_disabled() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                grep: GrepToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        assert!(agent.tools().get("grep").is_none());
+        assert!(agent.tools().get("str_replace").is_some());
+        assert!(agent.tools().get("read_file").is_some());
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            !prompt.contains("### grep"),
+            "disabled grep must not appear in tool docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_execute_when_unregistered_returns_missing_tool() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                grep: GrepToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let err = agent
+            .tools()
+            .execute(&ToolCall {
+                tool_name: "grep".to_string(),
+                arguments: serde_json::json!({"pattern": "foo"}),
                 result: None,
             })
             .await

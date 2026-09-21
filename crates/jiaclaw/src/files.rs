@@ -1,7 +1,7 @@
 // Copyright 2026 JiaClaw contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace`。
+//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace` / `grep`。
 //!
 //! 路径解析复用 [`crate::memory::resolve_workspace_relative_path`]（禁 `..`、绝对路径、symlink 逃逸）。
 //! 不调用 LLM，不执行 shell。
@@ -27,6 +27,27 @@ pub const WRITE_FILE_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
 
 /// `str_replace` 读入与写出上限（字节）。与 [`READ_FILE_MAX_BYTES`] / [`WRITE_FILE_MAX_BYTES`] 对齐。
 pub const STR_REPLACE_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
+
+/// `grep` 单文件读取上限（字节）。超过则跳过该文件（单文件目标则报错）。与 [`READ_FILE_MAX_BYTES`] 对齐。
+pub const GREP_FILE_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
+
+/// `grep` 的 `max_matches` 缺省值
+pub const GREP_DEFAULT_MAX_MATCHES: usize = 50;
+
+/// `grep` 的 `max_matches` 上限（含）
+pub const GREP_MAX_MATCHES: usize = 200;
+
+/// `grep` 返回 snippet 的最大字符数（按 Unicode 标量，超出截断）
+pub const GREP_SNIPPET_MAX_CHARS: usize = 200;
+
+/// `grep` 一次扫描的最大常规文件数（含 glob 未命中的文件）
+pub const GREP_MAX_FILES_SCANNED: usize = 2000;
+
+/// `grep` 字面量 `pattern` 最大字节数
+pub const GREP_PATTERN_MAX_BYTES: usize = 512;
+
+/// `grep` `glob` 模式最大字节数
+pub const GREP_GLOB_MAX_BYTES: usize = 128;
 
 /// `list_dir` 的 `max_entries` 缺省值
 pub const LIST_DIR_DEFAULT_MAX_ENTRIES: usize = 200;
@@ -129,12 +150,35 @@ pub struct StrReplaceArgs {
     pub replace_all: bool,
 }
 
+/// 解析后的 `grep` 参数。`pattern` 为**字面量**子串，不是正则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepArgs {
+    /// 要查找的字面量子串（非空）
+    pub pattern: String,
+    /// 工作区相对目录或文件（缺省 `.`）
+    pub path: String,
+    /// 可选 glob（如 `*.rs`）；`None` 表示不过滤
+    pub glob: Option<String>,
+    /// 是否忽略大小写（默认 `false`）
+    pub case_insensitive: bool,
+    /// 最多返回的匹配条数（钳制 1..=200）
+    pub max_matches: usize,
+}
+
 /// 将 `max_entries` 钳制到 `1..=1000`。
 #[must_use]
 pub fn clamp_list_dir_max_entries(raw: u64) -> usize {
     usize::try_from(raw)
         .unwrap_or(LIST_DIR_MAX_ENTRIES)
         .clamp(1, LIST_DIR_MAX_ENTRIES)
+}
+
+/// 将 `max_matches` 钳制到 `1..=200`。
+#[must_use]
+pub fn clamp_grep_max_matches(raw: u64) -> usize {
+    usize::try_from(raw)
+        .unwrap_or(GREP_MAX_MATCHES)
+        .clamp(1, GREP_MAX_MATCHES)
 }
 
 fn parse_positive_usize(value: &Value, name: &str) -> Result<usize, JiaClawError> {
@@ -371,6 +415,110 @@ pub fn parse_str_replace_args(args: &Value) -> Result<StrReplaceArgs, JiaClawErr
         old_str,
         new_str,
         replace_all,
+    })
+}
+
+/// 解析 `grep` 参数：必填 `pattern`（字面量）；可选 `path`（默认 `.`）、`glob`、`case_insensitive`（默认 false）、`max_matches`（默认 50）。
+///
+/// # Errors
+///
+/// `pattern` 缺失/为空/过长，`path`/`glob` 不是字符串，`case_insensitive` 不是布尔值，或 `max_matches` 不是整数时返回错误。
+pub fn parse_grep_args(args: &Value) -> Result<GrepArgs, JiaClawError> {
+    let pattern = match args.get("pattern") {
+        Some(Value::String(text)) if !text.is_empty() => text.clone(),
+        Some(Value::String(_)) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'pattern' 不能为空".to_string(),
+            ));
+        }
+        None | Some(Value::Null) => {
+            return Err(JiaClawError::ToolExecution(
+                "缺少参数 'pattern'（字面量子串，非正则）".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'pattern' 必须是字符串".to_string(),
+            ));
+        }
+    };
+    if pattern.len() > GREP_PATTERN_MAX_BYTES {
+        return Err(JiaClawError::ToolExecution(format!(
+            "参数 'pattern' 超过上限 {GREP_PATTERN_MAX_BYTES} 字节"
+        )));
+    }
+
+    let path = match args.get("path") {
+        None | Some(Value::Null) => ".".to_string(),
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                JiaClawError::ToolExecution(
+                    "参数 'path' 必须是字符串（工作区相对目录或文件，默认 .）".to_string(),
+                )
+            })?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                ".".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+    };
+
+    let glob = match args.get("glob") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() > GREP_GLOB_MAX_BYTES {
+                return Err(JiaClawError::ToolExecution(format!(
+                    "参数 'glob' 超过上限 {GREP_GLOB_MAX_BYTES} 字节"
+                )));
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'glob' 必须是字符串（如 *.rs）".to_string(),
+            ));
+        }
+    };
+
+    let case_insensitive = match args.get("case_insensitive") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'case_insensitive' 必须是布尔值（默认 false）".to_string(),
+            ));
+        }
+    };
+
+    let max_matches = match args.get("max_matches") {
+        None | Some(Value::Null) => GREP_DEFAULT_MAX_MATCHES,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()));
+            match raw {
+                Some(n) => clamp_grep_max_matches(n),
+                None => {
+                    return Err(JiaClawError::ToolExecution(
+                        "参数 'max_matches' 必须是整数（将钳制到 1..=200）".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+
+    Ok(GrepArgs {
+        pattern,
+        path,
+        glob,
+        case_insensitive,
+        max_matches,
     })
 }
 
@@ -706,6 +854,363 @@ pub fn str_replace_workspace_file(
     })
 }
 
+/// 简单 glob：`*` 匹配单段内任意字符，`?` 匹配单字符，`**` 匹配跨目录。
+/// 不含 `/` 的模式只对文件名生效（`*.rs` 可匹配 `src/lib.rs`）。
+#[must_use]
+pub fn glob_matches(pattern: &str, rel_path: &str) -> bool {
+    let pattern = pattern.replace('\\', "/");
+    let rel_path = rel_path.replace('\\', "/");
+    if pattern.is_empty() {
+        return true;
+    }
+    let pattern = pattern.trim_start_matches("./");
+    let rel_path = rel_path.trim_start_matches("./");
+    if !pattern.contains('/') {
+        let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+        return glob_match_segment(pattern, name);
+    }
+    let glob_segs: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let file_segs: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+    glob_match_parts(&glob_segs, &file_segs)
+}
+
+fn glob_match_parts(glob_segs: &[&str], file_segs: &[&str]) -> bool {
+    match (glob_segs.split_first(), file_segs.split_first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some((&"**", rest)), None) => glob_match_parts(rest, file_segs),
+        (Some((&"**", rest)), Some((_, remaining))) => {
+            glob_match_parts(rest, file_segs) || glob_match_parts(glob_segs, remaining)
+        }
+        (Some((segment, rest)), Some((name, remaining))) => {
+            glob_match_segment(segment, name) && glob_match_parts(rest, remaining)
+        }
+        (Some((segment, rest)), None) => *segment == "**" && glob_match_parts(rest, file_segs),
+    }
+}
+
+fn glob_match_segment(glob: &str, text: &str) -> bool {
+    let glob_chars: Vec<char> = glob.chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    let mut glob_idx = 0;
+    let mut text_idx = 0;
+    let mut star_glob: Option<usize> = None;
+    let mut star_text = 0;
+    while text_idx < text_chars.len() {
+        if glob_idx < glob_chars.len()
+            && glob_chars[glob_idx] != '*'
+            && (glob_chars[glob_idx] == '?' || glob_chars[glob_idx] == text_chars[text_idx])
+        {
+            glob_idx += 1;
+            text_idx += 1;
+        } else if glob_idx < glob_chars.len() && glob_chars[glob_idx] == '*' {
+            star_glob = Some(glob_idx);
+            star_text = text_idx;
+            glob_idx += 1;
+        } else if let Some(star_at) = star_glob {
+            glob_idx = star_at + 1;
+            star_text += 1;
+            text_idx = star_text;
+        } else {
+            return false;
+        }
+    }
+    while glob_idx < glob_chars.len() && glob_chars[glob_idx] == '*' {
+        glob_idx += 1;
+    }
+    glob_idx == glob_chars.len()
+}
+
+fn workspace_rel_display(workspace: &Path, abs: &Path) -> String {
+    match abs.strip_prefix(workspace) {
+        Ok(rel) => {
+            let text = rel.to_string_lossy().replace('\\', "/");
+            if text.is_empty() {
+                ".".to_string()
+            } else {
+                text
+            }
+        }
+        Err(_) => ".".to_string(),
+    }
+}
+
+fn join_rel(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() || prefix == "." {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+fn truncate_snippet(line: &str) -> String {
+    let trimmed = line.trim_end();
+    let mut chars = trimmed.chars();
+    let taken: String = chars.by_ref().take(GREP_SNIPPET_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{taken}…")
+    } else {
+        taken
+    }
+}
+
+fn line_contains_literal(line: &str, pattern: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        line.to_lowercase().contains(&pattern.to_lowercase())
+    } else {
+        line.contains(pattern)
+    }
+}
+
+fn glob_allows(glob: Option<&str>, rel_path: &str) -> bool {
+    glob.is_none_or(|pattern| glob_matches(pattern, rel_path))
+}
+
+fn read_text_file_for_grep(
+    path: &Path,
+    rel_path: &str,
+    file_max_bytes: usize,
+    fail_on_skip: bool,
+) -> Result<Option<String>, JiaClawError> {
+    let size_bytes = fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法读取文件元数据 {rel_path}: {e}")))?;
+    let limit_bytes = u64::try_from(file_max_bytes).unwrap_or(u64::MAX);
+    if size_bytes > limit_bytes {
+        if fail_on_skip {
+            return Err(JiaClawError::ToolExecution(format!(
+                "文件超过上限 {file_max_bytes} 字节（实际 {size_bytes} 字节）: {rel_path}"
+            )));
+        }
+        return Ok(None);
+    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if fail_on_skip => {
+            return Err(JiaClawError::ToolExecution(format!(
+                "无法读取文件 {rel_path}: {err}"
+            )));
+        }
+        Err(_) => return Ok(None),
+    };
+    match String::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => Ok(Some(text)),
+        _ if fail_on_skip => Err(JiaClawError::ToolExecution(format!(
+            "二进制文件，跳过搜索: {rel_path}（检测到 NUL 或非 UTF-8）"
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn collect_line_matches(
+    rel_path: &str,
+    content: &str,
+    pattern: &str,
+    case_insensitive: bool,
+    remaining: usize,
+    out: &mut Vec<GrepMatch>,
+) -> bool {
+    if remaining == 0 {
+        return true;
+    }
+    let mut added = 0;
+    for (idx, line) in content.lines().enumerate() {
+        if line_contains_literal(line, pattern, case_insensitive) {
+            out.push(GrepMatch {
+                path: rel_path.to_string(),
+                line: idx + 1,
+                snippet: truncate_snippet(line),
+            });
+            added += 1;
+            if added >= remaining {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn grep_one_regular_file(
+    path: &Path,
+    rel_path: &str,
+    args: &GrepArgs,
+    file_max_bytes: usize,
+    fail_on_skip: bool,
+    files_scanned: &mut usize,
+    out: &mut Vec<GrepMatch>,
+) -> Result<bool, JiaClawError> {
+    if *files_scanned >= GREP_MAX_FILES_SCANNED {
+        return Ok(true);
+    }
+    *files_scanned += 1;
+    if !glob_allows(args.glob.as_deref(), rel_path) {
+        return Ok(false);
+    }
+    let Some(content) = read_text_file_for_grep(path, rel_path, file_max_bytes, fail_on_skip)?
+    else {
+        return Ok(false);
+    };
+    let remaining = args.max_matches.saturating_sub(out.len());
+    Ok(collect_line_matches(
+        rel_path,
+        &content,
+        &args.pattern,
+        args.case_insensitive,
+        remaining,
+        out,
+    ))
+}
+
+fn walk_grep_dir(
+    dir: &Path,
+    rel_prefix: &str,
+    args: &GrepArgs,
+    file_max_bytes: usize,
+    files_scanned: &mut usize,
+    out: &mut Vec<GrepMatch>,
+) -> Result<bool, JiaClawError> {
+    if out.len() >= args.max_matches || *files_scanned >= GREP_MAX_FILES_SCANNED {
+        return Ok(true);
+    }
+
+    let mut children: Vec<(String, PathBuf, fs::Metadata)> = Vec::new();
+    let iter = fs::read_dir(dir)
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法读取目录 {}: {e}", dir.display())))?;
+    for entry in iter {
+        let entry =
+            entry.map_err(|e| JiaClawError::ToolExecution(format!("无法读取目录条目: {e}")))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "." || name == ".." || name == ".git" {
+            continue;
+        }
+        let child_path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&child_path) else {
+            continue;
+        };
+        children.push((name.into_owned(), child_path, meta));
+    }
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut truncated = false;
+    for (name, child_path, meta) in children {
+        if out.len() >= args.max_matches || *files_scanned >= GREP_MAX_FILES_SCANNED {
+            truncated = true;
+            break;
+        }
+        let rel_name = join_rel(rel_prefix, &name);
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if walk_grep_dir(
+                &child_path,
+                &rel_name,
+                args,
+                file_max_bytes,
+                files_scanned,
+                out,
+            )? {
+                truncated = true;
+                break;
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        if grep_one_regular_file(
+            &child_path,
+            &rel_name,
+            args,
+            file_max_bytes,
+            false,
+            files_scanned,
+            out,
+        )? {
+            truncated = true;
+            break;
+        }
+    }
+    Ok(truncated || out.len() >= args.max_matches || *files_scanned >= GREP_MAX_FILES_SCANNED)
+}
+
+/// 在工作区内按**字面量**子串搜索文本（非正则，避免 `ReDoS`）。
+///
+/// `path` 可为相对目录或文件（默认 `.`）。目录默认递归；不跟随 symlink。
+/// 二进制与超过 `file_max_bytes` 的文件在目录扫描时跳过；若 `path` 指向单个此类文件则报错。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、symlink 逃逸、目标不存在，或无法读取搜索根时返回错误。
+pub fn grep_workspace(
+    workspace: &Path,
+    args: &GrepArgs,
+    file_max_bytes: usize,
+) -> Result<GrepOutput, JiaClawError> {
+    let path = resolve_workspace_relative_path(workspace, &args.path)?;
+    if !path.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不存在: {}",
+            args.path
+        )));
+    }
+    ensure_existing_within_workspace(workspace, &path)?;
+
+    let canon = path
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析路径 {}: {e}", args.path)))?;
+    let ws = canonicalize_existing_or_clone(workspace);
+    if !canon.starts_with(&ws) {
+        return Err(JiaClawError::ToolExecution(format!(
+            "安全错误: 路径 {} 指向工作空间外部",
+            args.path
+        )));
+    }
+
+    let mut matches = Vec::new();
+    let mut files_scanned = 0;
+    let truncated = if canon.is_file() {
+        let rel = workspace_rel_display(&ws, &canon);
+        grep_one_regular_file(
+            &canon,
+            &rel,
+            args,
+            file_max_bytes,
+            true,
+            &mut files_scanned,
+            &mut matches,
+        )?
+    } else if canon.is_dir() {
+        let rel = workspace_rel_display(&ws, &canon);
+        walk_grep_dir(
+            &canon,
+            &rel,
+            args,
+            file_max_bytes,
+            &mut files_scanned,
+            &mut matches,
+        )?
+    } else {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不是文件或目录: {}",
+            args.path
+        )));
+    };
+
+    Ok(GrepOutput {
+        pattern: args.pattern.clone(),
+        path: args.path.clone(),
+        glob: args.glob.clone(),
+        case_insensitive: args.case_insensitive,
+        max_matches: args.max_matches,
+        truncated,
+        match_count: matches.len(),
+        matches,
+    })
+}
+
 fn slice_lines(content: &str, offset: usize, limit: Option<usize>) -> (String, usize, usize, bool) {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -966,6 +1471,39 @@ pub struct StrReplaceOutput {
     pub replace_all: bool,
     /// 结果文件字节数
     pub bytes_written: usize,
+}
+
+/// `grep` 的一条匹配。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepMatch {
+    /// 工作区相对路径
+    pub path: String,
+    /// 1-indexed 行号
+    pub line: usize,
+    /// 截断后的行文本
+    pub snippet: String,
+}
+
+/// `grep` 的 JSON 返回体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepOutput {
+    /// 字面量搜索串
+    pub pattern: String,
+    /// 调用方传入的工作区相对路径
+    pub path: String,
+    /// 可选 glob 过滤
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glob: Option<String>,
+    /// 是否忽略大小写
+    pub case_insensitive: bool,
+    /// 生效的匹配上限
+    pub max_matches: usize,
+    /// 是否因 `max_matches` 或扫描文件数上限截断
+    pub truncated: bool,
+    /// 本次返回的匹配条数
+    pub match_count: usize,
+    /// 匹配列表
+    pub matches: Vec<GrepMatch>,
 }
 
 /// `read_file` 工具：读取工作区相对路径下的文本文件（路径沙箱，不调用 LLM）。
@@ -1298,6 +1836,83 @@ impl Tool for WorkspaceStrReplaceTool {
         )?;
         serde_json::to_string_pretty(&output)
             .map_err(|e| JiaClawError::ToolExecution(format!("序列化替换结果失败: {e}")))
+    }
+}
+
+/// `grep` 工具：在工作区内按字面量搜索文本（路径沙箱，不调用 LLM）。
+pub struct WorkspaceGrepTool {
+    workspace_path: PathBuf,
+    file_max_bytes: usize,
+}
+
+impl WorkspaceGrepTool {
+    /// 创建工具；单文件上限为 [`GREP_FILE_MAX_BYTES`]（与 read 对齐，256KiB）。
+    #[must_use]
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+            file_max_bytes: GREP_FILE_MAX_BYTES,
+        }
+    }
+
+    /// 测试或自定义单文件上限。
+    #[must_use]
+    pub fn with_max_bytes(workspace_path: &Path, file_max_bytes: usize) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+            file_max_bytes,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WorkspaceGrepTool {
+    fn name(&self) -> &str {
+        "grep"
+    }
+
+    fn description(&self) -> &str {
+        "在工作区内按字面量搜索文本（非正则，避免 ReDoS）。pattern 必填；可选 path（相对目录或文件，默认 .）、glob（如 *.rs）、case_insensitive（默认 false）、max_matches（默认 50，钳制 1..=200）。禁止 .. / 绝对路径 / symlink 逃逸。不跟随 symlink；跳过二进制与超过 256KiB 的文件。返回 {path, line, snippet} 列表。不执行 shell，不调用 LLM。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "要查找的字面量子串（必填，非正则）"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "相对目录或文件（相对于工作区根，默认 .）",
+                    "default": "."
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "可选文件名/路径 glob（如 *.rs；不含 / 时匹配文件名）"
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "是否忽略大小写（默认 false）",
+                    "default": false
+                },
+                "max_matches": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "最多返回的匹配条数（默认 50，钳制 1..=200）",
+                    "default": 50
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let parsed = parse_grep_args(&args)?;
+        let output = grep_workspace(&self.workspace_path, &parsed, self.file_max_bytes)?;
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化搜索结果失败: {e}")))
     }
 }
 
@@ -2124,6 +2739,299 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("二进制"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn glob_matches_filename_and_path() {
+        assert!(glob_matches("*.rs", "src/lib.rs"));
+        assert!(glob_matches("*.rs", "lib.rs"));
+        assert!(!glob_matches("*.rs", "lib.toml"));
+        assert!(glob_matches("src/*.rs", "src/lib.rs"));
+        assert!(!glob_matches("src/*.rs", "src/foo/lib.rs"));
+        assert!(glob_matches("**/*.rs", "src/foo/lib.rs"));
+        assert!(glob_matches("**/*.rs", "lib.rs"));
+        assert!(glob_matches("test_*.rs", "test_files.rs"));
+        assert!(glob_matches("notes/*.md", "notes/a.md"));
+        assert!(!glob_matches("notes/*.md", "src/a.md"));
+        assert!(glob_matches("?", "a"));
+        assert!(!glob_matches("?", "ab"));
+    }
+
+    #[test]
+    fn clamp_grep_max_matches_bounds() {
+        assert_eq!(clamp_grep_max_matches(0), 1);
+        assert_eq!(clamp_grep_max_matches(50), 50);
+        assert_eq!(clamp_grep_max_matches(200), 200);
+        assert_eq!(clamp_grep_max_matches(201), 200);
+    }
+
+    #[test]
+    fn parse_grep_args_requires_pattern_and_defaults() {
+        let err = parse_grep_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pattern"), "{err}");
+
+        let err = parse_grep_args(&serde_json::json!({"pattern": ""}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pattern"), "{err}");
+
+        let parsed = parse_grep_args(&serde_json::json!({"pattern": "foo"})).unwrap();
+        assert_eq!(parsed.pattern, "foo");
+        assert_eq!(parsed.path, ".");
+        assert!(parsed.glob.is_none());
+        assert!(!parsed.case_insensitive);
+        assert_eq!(parsed.max_matches, GREP_DEFAULT_MAX_MATCHES);
+
+        let parsed = parse_grep_args(&serde_json::json!({
+            "pattern": "Foo",
+            "path": " notes ",
+            "glob": " *.md ",
+            "case_insensitive": true,
+            "max_matches": 0
+        }))
+        .unwrap();
+        assert_eq!(parsed.path, "notes");
+        assert_eq!(parsed.glob.as_deref(), Some("*.md"));
+        assert!(parsed.case_insensitive);
+        assert_eq!(parsed.max_matches, 1);
+
+        let parsed = parse_grep_args(&serde_json::json!({
+            "pattern": "x",
+            "max_matches": 9999
+        }))
+        .unwrap();
+        assert_eq!(parsed.max_matches, GREP_MAX_MATCHES);
+
+        let err = parse_grep_args(&serde_json::json!({
+            "pattern": "x",
+            "case_insensitive": "yes"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("case_insensitive"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn grep_finds_literal_matches_across_files() {
+        let ws = unique_temp("jiaclaw_grep_ok");
+        fs::write(ws.join("MEMORY.md"), "alpha beta\ngamma\n").unwrap();
+        fs::create_dir_all(ws.join("notes")).unwrap();
+        fs::write(ws.join("notes").join("a.md"), "hello beta world\n").unwrap();
+        fs::write(ws.join("notes").join("b.rs"), "fn beta() {}\n").unwrap();
+        let tool = WorkspaceGrepTool::new(&ws);
+        assert_eq!(tool.name(), "grep");
+
+        let result = tool
+            .execute(serde_json::json!({"pattern": "beta"}))
+            .await
+            .unwrap();
+        let parsed: GrepOutput = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.match_count, 3);
+        assert!(!parsed.truncated);
+        let paths: Vec<_> = parsed.matches.iter().map(|m| m.path.as_str()).collect();
+        assert!(paths.contains(&"MEMORY.md"), "{paths:?}");
+        assert!(paths.contains(&"notes/a.md"), "{paths:?}");
+        assert!(paths.contains(&"notes/b.rs"), "{paths:?}");
+        assert!(parsed.matches.iter().all(|m| m.line >= 1));
+        assert!(parsed.matches.iter().any(|m| m.snippet.contains("beta")));
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn grep_glob_and_case_insensitive_and_max_matches() {
+        let ws = unique_temp("jiaclaw_grep_filters");
+        fs::write(ws.join("keep.md"), "Needle here\n").unwrap();
+        fs::write(ws.join("skip.rs"), "Needle here too\n").unwrap();
+        fs::write(ws.join("other.md"), "needle again\nsecond needle\n").unwrap();
+        let tool = WorkspaceGrepTool::new(&ws);
+
+        let globbed = tool
+            .execute(serde_json::json!({
+                "pattern": "Needle",
+                "glob": "*.md"
+            }))
+            .await
+            .unwrap();
+        let parsed: GrepOutput = serde_json::from_str(&globbed).unwrap();
+        assert_eq!(parsed.match_count, 1);
+        assert_eq!(parsed.matches[0].path, "keep.md");
+
+        let insensitive = tool
+            .execute(serde_json::json!({
+                "pattern": "needle",
+                "case_insensitive": true,
+                "glob": "*.md"
+            }))
+            .await
+            .unwrap();
+        let parsed: GrepOutput = serde_json::from_str(&insensitive).unwrap();
+        assert_eq!(parsed.match_count, 3);
+
+        let limited = tool
+            .execute(serde_json::json!({
+                "pattern": "needle",
+                "case_insensitive": true,
+                "max_matches": 1
+            }))
+            .await
+            .unwrap();
+        let parsed: GrepOutput = serde_json::from_str(&limited).unwrap();
+        assert_eq!(parsed.match_count, 1);
+        assert!(parsed.truncated);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn grep_single_file_and_truncates_long_snippet() {
+        let ws = unique_temp("jiaclaw_grep_file");
+        let long = format!("{}FOUND{}", "x".repeat(180), "y".repeat(80));
+        fs::write(ws.join("notes.md"), format!("{long}\nnope\n")).unwrap();
+        let tool = WorkspaceGrepTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "FOUND",
+                "path": "notes.md"
+            }))
+            .await
+            .unwrap();
+        let parsed: GrepOutput = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.match_count, 1);
+        assert_eq!(parsed.matches[0].line, 1);
+        assert!(parsed.matches[0].snippet.contains("FOUND"));
+        assert!(parsed.matches[0].snippet.ends_with('…'));
+        assert!(parsed.matches[0].snippet.chars().count() <= GREP_SNIPPET_MAX_CHARS + 1);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_binary_in_tree_and_errors_on_single_binary() {
+        let ws = unique_temp("jiaclaw_grep_bin");
+        fs::write(ws.join("ok.md"), "needle\n").unwrap();
+        fs::write(ws.join("bin.dat"), [0_u8, 1, 2, 3, 255]).unwrap();
+        let tool = WorkspaceGrepTool::new(&ws);
+
+        let tree = tool
+            .execute(serde_json::json!({"pattern": "needle"}))
+            .await
+            .unwrap();
+        let parsed: GrepOutput = serde_json::from_str(&tree).unwrap();
+        assert_eq!(parsed.match_count, 1);
+        assert_eq!(parsed.matches[0].path, "ok.md");
+
+        let err = tool
+            .execute(serde_json::json!({
+                "pattern": "needle",
+                "path": "bin.dat"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("二进制"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_traversal_and_absolute() {
+        let ws = unique_temp("jiaclaw_grep_trav");
+        fs::write(ws.join("ok.md"), "inside").unwrap();
+        let tool = WorkspaceGrepTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({
+                "pattern": "inside",
+                "path": "../secret.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+
+        let err = tool
+            .execute(serde_json::json!({
+                "pattern": "root",
+                "path": "/etc/passwd"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_rejects_symlink_escape_and_skips_symlink_files() {
+        let ws = unique_temp("jiaclaw_grep_symlink");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_grep_outside_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret-outside needle").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("leak.md")).unwrap();
+        fs::write(ws.join("ok.md"), "needle inside").unwrap();
+
+        let tool = WorkspaceGrepTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "needle",
+                "path": "leak.md"
+            }))
+            .await;
+        assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("安全") || err.contains("工作空间"), "{err}");
+
+        let tree = tool
+            .execute(serde_json::json!({"pattern": "needle"}))
+            .await
+            .unwrap();
+        let parsed: GrepOutput = serde_json::from_str(&tree).unwrap();
+        assert_eq!(parsed.match_count, 1);
+        assert_eq!(parsed.matches[0].path, "ok.md");
+        assert!(
+            parsed.matches.iter().all(|m| m.path != "leak.md"),
+            "不得跟随逃逸 symlink 文件: {parsed:?}"
+        );
+
+        let outside_dir = ws.parent().unwrap().join(format!(
+            "jiaclaw_grep_outside_dir_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("secret.txt"), "needle-dir").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, ws.join("escape")).unwrap();
+        let dir_result = tool
+            .execute(serde_json::json!({
+                "pattern": "needle",
+                "path": "escape"
+            }))
+            .await;
+        assert!(
+            dir_result.is_err(),
+            "symlink 目录逃逸应被拒绝: {dir_result:?}"
+        );
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn grep_missing_path_is_explicit_error() {
+        let ws = unique_temp("jiaclaw_grep_missing");
+        let tool = WorkspaceGrepTool::new(&ws);
+        let err = tool
+            .execute(serde_json::json!({
+                "pattern": "x",
+                "path": "no-such.md"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不存在"), "{err}");
         let _ = fs::remove_dir_all(&ws);
     }
 }
