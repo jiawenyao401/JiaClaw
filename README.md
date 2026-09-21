@@ -87,6 +87,11 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - GET 页面；HTML 会去掉 script/style 与标签，返回纯文本（含最终 URL / 标题）；超长注明 `[truncated]`
   - 最多跟随 5 次重定向，HTTP 总体超时约 15s，并遵守 `tool_timeout_secs`；User-Agent 标明 JiaClaw
   - `enabled = false` 时不注册；`GET /api/tools` / system prompt 只列出已注册工具
+- ✅ **可选 memory_search** - 默认注册的工作区记忆检索工具（`query` 必填，`max_results` 默认 5、钳制 1..=20）
+  - 配置 `[tools.memory_search] enabled`（默认 `true`）；默认扫描配置的 MEMORY / SOUL / USER
+  - 大小写不敏感子串 + 行窗匹配，返回 `{path, line, excerpt}`；单文件超过 512KiB 截断并 warn
+  - 可选 `paths` 指定工作区相对路径；复用现有 resolve，禁止 `..` / 绝对路径 / symlink 逃逸
+  - `enabled = false` 时不注册；**不引入向量数据库**
 - ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
   - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
@@ -113,7 +118,7 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **工作区 MEMORY.md** - 跨会话长期记忆注入系统提示
   - 默认 `{workspace}/MEMORY.md`，可用 `[memory] path` 覆盖
   - 每次 `chat` 重读；过大截断（32KiB）并 warn
-  - 本地工具 `memory_append` 追加/覆盖；`jiaclaw doctor` / `jiaclaw memory show`
+  - 本地工具 `memory_append` 追加/覆盖；`memory_search` 按关键词检索片段；`jiaclaw doctor` / `jiaclaw memory show`
 - ✅ **工作区 SOUL.md / USER.md** - 可选人格与用户画像注入系统提示
   - 默认 `{workspace}/SOUL.md`、`USER.md`，可用 `[identity] soul_path` / `user_path` 覆盖
   - 每次 `chat` 重读；存在且非空则注入独立区块；各文件独立 32KiB 截断并 warn
@@ -268,6 +273,11 @@ enabled = true
 # 默认拒绝 localhost / 私网；内网调试可设 allow_private = true。
 enabled = true
 # allow_private = false
+
+[tools.memory_search]
+# 可选工作区记忆检索（默认启用并注册）。按关键词在 MEMORY / SOUL / USER 中找片段。
+# 返回 {path, line, excerpt}；单文件超过 512KiB 截断。禁止路径穿越。不引入向量库。
+enabled = true
 ```
 
 或使用环境变量：
@@ -495,6 +505,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 HEARTBEAT.md：`[heartbeat] enabled = true` 后仅 `jiaclaw serve` 按间隔读取约定文件全文并跑一轮 chat（固定 session，默认 `heartbeat`）。`JIACLAW_HEARTBEAT_INTERVAL_SECS` 可覆盖间隔。文件缺失/空则跳过；CLI `chat` 不跑心跳
 - 可选 web_search：默认注册。设置 `JIACLAW_BRAVE_API_KEY` 或 `[tools.web_search] brave_api_key` 后调用 Brave Search；未配置 key 时返回友好错误。`enabled = false` 不注册。doctor 不打印 key
 - 可选 web_fetch：默认注册。GET `http`/`https` URL，HTML 转为可读文本；默认拒绝 localhost/私网（`[tools.web_fetch] allow_private = true` 可放开）。`enabled = false` 不注册
+- 可选 memory_search：默认注册。在 MEMORY / SOUL / USER（或安全相对路径）中按关键词检索行窗片段；`enabled = false` 不注册。不引入向量数据库
 
 ## 项目结构
 
@@ -606,6 +617,11 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - GET the page; HTML is stripped of script/style/tags into plain text (final URL / title included); oversize results note `[truncated]`
   - Follows at most 5 redirects, ~15s HTTP timeout, still honors `tool_timeout_secs`; User-Agent identifies JiaClaw
   - `enabled = false` skips registration; `GET /api/tools` and the system prompt only list registered tools
+- ✅ **Optional memory_search** - registered by default (`query` required; `max_results` defaults to 5, clamped to 1..=20)
+  - Configure `[tools.memory_search] enabled` (default `true`); default scan is the configured MEMORY / SOUL / USER files
+  - Case-insensitive substring + line-window matching; returns `{path, line, excerpt}`; files over 512KiB are truncated with a warning
+  - Optional `paths` for workspace-relative files; reuses existing resolve (no `..` / absolute / symlink escape)
+  - `enabled = false` skips registration; **no vector database**
 - ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
   - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
   - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
@@ -632,7 +648,7 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Workspace MEMORY.md** - cross-session facts injected into the system prompt
   - Default `{workspace}/MEMORY.md`, overridable via `[memory] path`
   - Re-read on every `chat`; truncate at 32KiB with a warning
-  - Local tool `memory_append`; `jiaclaw doctor` / `jiaclaw memory show`
+  - Local tool `memory_append` plus `memory_search` for keyword snippets; `jiaclaw doctor` / `jiaclaw memory show`
 - ✅ **Workspace SOUL.md / USER.md** - optional persona and user-profile injection
   - Default `{workspace}/SOUL.md` and `USER.md`, overridable via `[identity] soul_path` / `user_path`
   - Re-read on every `chat`; independent 32KiB truncation per file
@@ -786,6 +802,11 @@ enabled = true
 # Localhost / private ranges are blocked by default; set allow_private = true for intranet use.
 enabled = true
 # allow_private = false
+
+[tools.memory_search]
+# Optional workspace memory search (registered by default). Keyword/substring scan of MEMORY / SOUL / USER.
+# Returns {path, line, excerpt}; files over 512KiB are truncated. Path traversal is rejected. No vector DB.
+enabled = true
 ```
 
 Or use environment variable:
@@ -1001,6 +1022,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional HEARTBEAT.md: with `[heartbeat] enabled = true`, only `jiaclaw serve` reads the file on an interval and runs one chat turn (fixed session, default `heartbeat`). `JIACLAW_HEARTBEAT_INTERVAL_SECS` overrides the interval. Missing/empty files skip the tick; CLI `chat` does not run heartbeats
 - Optional web_search: registered by default. Set `JIACLAW_BRAVE_API_KEY` or `[tools.web_search] brave_api_key` to call Brave Search; without a key the tool returns a friendly error. `enabled = false` skips registration. Doctor never prints the key
 - Optional web_fetch: registered by default. GET `http`/`https` URLs and convert HTML to readable text; localhost/private ranges are blocked unless `[tools.web_fetch] allow_private = true`. `enabled = false` skips registration
+- Optional memory_search: registered by default. Keyword/line-window search over MEMORY / SOUL / USER (or safe relative paths); `enabled = false` skips registration. No vector database
 
 ### Documentation
 

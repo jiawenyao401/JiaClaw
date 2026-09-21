@@ -134,6 +134,7 @@
   - 加载和管理 `AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`；可选 `HEARTBEAT.md` 供 serve 定时自检
   - 每次对话重读 `SOUL.md` / `USER.md` / `MEMORY.md`（或 `[identity]` / `[memory]` 路径）并注入系统提示；各文件独立过大截断
   - 工具 `soul_write` / `user_write` / `memory_append` 只能写约定路径（禁止穿越）
+  - 工具 `memory_search` 在 MEMORY / SOUL / USER（或安全相对路径）中按关键词检索行窗片段
 
 #### 3. `jiaclaw-host` - 可执行宿主
 
@@ -142,7 +143,7 @@
 - **CLI 接口**
   - `jiaclaw serve` - 启动 HTTP 服务
   - `jiaclaw chat <message>` - 单次聊天
-  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔；工具循环上限生效值）
+  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔；工具循环上限生效值；web_search / web_fetch / memory_search 是否启用）
   - `jiaclaw memory show` - 显示工作区长期记忆
   - `jiaclaw soul show` / `jiaclaw user show` - 显示人格与用户画像
   - `jiaclaw version` - 版本信息

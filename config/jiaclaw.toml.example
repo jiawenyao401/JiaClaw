@@ -168,6 +168,12 @@ enabled = true
 enabled = true
 # allow_private = false
 
+[tools.memory_search]
+# 可选工作区记忆检索（默认启用并注册）。按关键词/子串在 MEMORY / SOUL / USER 中找片段。
+# 大小写不敏感；返回 {path, line, excerpt}。单文件超过 512KiB 截断并 warn。
+# 可选参数 paths 指定工作区相对路径；禁止 .. / 绝对路径 / symlink 逃逸。不引入向量数据库。
+enabled = true
+
 [skills]
 # 启用的技能列表（示例）
 enabled = [
@@ -185,7 +191,7 @@ enabled = [
 [memory]
 # 工作区长期记忆文件（相对于 workspace，默认 MEMORY.md）
 # 每次对话开始时若文件存在且非空则注入系统提示；过大时截断到 32KiB。
-# 可用工具 memory_append 追加或覆盖。缺省本段不影响现有配置。
+# 可用工具 memory_append 追加或覆盖；变长后可用 memory_search 按关键词检索。缺省本段不影响现有配置。
 path = "MEMORY.md"
 
 [identity]

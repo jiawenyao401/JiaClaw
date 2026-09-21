@@ -11,12 +11,12 @@
 
 pub use jiaclaw_core::{
     AgentConfig, ChatMessage, ChatRequest, ChatResponse, HeartbeatConfig, HttpConfig,
-    IdentityConfig, JiaClawError, MemoryConfig, MessageRole, ProviderConfig, RunStatus,
-    SessionConfig, ToolCall, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
-    DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-    DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
-    DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
-    MEMORY_PROMPT_MAX_BYTES, MIN_MAX_TOOL_ITERATIONS,
+    IdentityConfig, JiaClawError, MemoryConfig, MemorySearchToolConfig, MessageRole,
+    ProviderConfig, RunStatus, SessionConfig, ToolCall, ToolsConfig, WebFetchToolConfig,
+    WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
+    DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
+    DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
+    MAX_SESSION_MESSAGES, MEMORY_PROMPT_MAX_BYTES, MIN_MAX_TOOL_ITERATIONS,
 };
 
 mod heartbeat;
@@ -34,9 +34,12 @@ pub use identity::{
     IdentityKind, IdentityWriteTool,
 };
 pub use memory::{
-    inspect_memory_file, inspect_workspace_file, load_memory_for_prompt, load_prompt_file,
-    resolve_memory_path, resolve_workspace_relative_path, write_memory, write_workspace_file,
-    MemoryAppendTool, MemoryFileStatus,
+    clamp_memory_search_max_results, inspect_memory_file, inspect_workspace_file,
+    load_memory_for_prompt, load_prompt_file, parse_memory_search_args, resolve_memory_path,
+    resolve_workspace_relative_path, search_memory_windows, write_memory, write_workspace_file,
+    MemoryAppendTool, MemoryFileStatus, MemorySearchHit, MemorySearchTool,
+    MEMORY_SEARCH_DEFAULT_MAX_RESULTS, MEMORY_SEARCH_FILE_MAX_BYTES, MEMORY_SEARCH_LINE_RADIUS,
+    MEMORY_SEARCH_MAX_RESULTS,
 };
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
 pub use session::{
@@ -120,6 +123,16 @@ impl JiaClawAgent {
             &config.workspace_path,
             config.memory.path.clone(),
         )));
+        if config.tools.memory_search.enabled {
+            tools.register(Box::new(MemorySearchTool::new(
+                &config.workspace_path,
+                [
+                    config.memory.path.clone(),
+                    config.identity.soul_path.clone(),
+                    config.identity.user_path.clone(),
+                ],
+            )));
+        }
         tools.register(Box::new(IdentityWriteTool::soul(
             &config.workspace_path,
             config.identity.soul_path.clone(),
@@ -1173,6 +1186,78 @@ mod tests {
             .execute(&ToolCall {
                 tool_name: "web_fetch".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
+                result: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("工具不存在"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn memory_search_is_registered_by_default() {
+        let agent = JiaClawAgent::new(AgentConfig::default()).unwrap();
+        assert!(
+            agent.tools().get("memory_search").is_some(),
+            "memory_search should be in the default tool list"
+        );
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            prompt.contains("memory_search"),
+            "system prompt should describe memory_search"
+        );
+        assert!(prompt.contains("max_results"), "{prompt}");
+    }
+
+    #[test]
+    fn memory_search_is_not_registered_when_disabled() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                memory_search: MemorySearchToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        assert!(agent.tools().get("memory_search").is_none());
+        assert!(agent.tools().get("web_search").is_some());
+        assert!(agent.tools().get("web_fetch").is_some());
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            !prompt.contains("### memory_search"),
+            "disabled memory_search must not appear in tool docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_search_execute_when_unregistered_returns_missing_tool() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                memory_search: MemorySearchToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let err = agent
+            .tools()
+            .execute(&ToolCall {
+                tool_name: "memory_search".to_string(),
+                arguments: serde_json::json!({"query": "hello"}),
                 result: None,
             })
             .await

@@ -187,7 +187,7 @@ pub struct AgentConfig {
     #[serde(default = "default_max_tool_iterations")]
     pub max_tool_iterations: usize,
 
-    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` 默认启用）
+    /// 本地工具配置（缺省本段不影响现有配置；`web_search` / `web_fetch` / `memory_search` 默认启用）
     #[serde(default)]
     pub tools: ToolsConfig,
 }
@@ -473,10 +473,14 @@ fn default_web_fetch_enabled() -> bool {
     true
 }
 
+fn default_memory_search_enabled() -> bool {
+    true
+}
+
 /// 本地工具总配置（缺省本段不影响现有 `[http]` / `[memory]` 等段）
 ///
 /// 历史示例里的 `[tools] enabled = [...]` 列表仍可出现在文件中（未知字段忽略），
-/// 当前真正生效的是嵌套表 `[tools.web_search]` 与 `[tools.web_fetch]`。
+/// 当前真正生效的是嵌套表 `[tools.web_search]`、`[tools.web_fetch]` 与 `[tools.memory_search]`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
     /// `web_search` 工具配置
@@ -486,6 +490,10 @@ pub struct ToolsConfig {
     /// `web_fetch` 工具配置
     #[serde(default)]
     pub web_fetch: WebFetchToolConfig,
+
+    /// `memory_search` 工具配置
+    #[serde(default)]
+    pub memory_search: MemorySearchToolConfig,
 }
 
 /// 可选 `web_search` 联网检索配置
@@ -544,6 +552,22 @@ impl Default for WebFetchToolConfig {
         Self {
             enabled: default_web_fetch_enabled(),
             allow_private: false,
+        }
+    }
+}
+
+/// 可选 `memory_search` 工作区记忆检索配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySearchToolConfig {
+    /// 是否注册 `memory_search` 工具（默认 `true`）
+    #[serde(default = "default_memory_search_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for MemorySearchToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_memory_search_enabled(),
         }
     }
 }
@@ -1095,11 +1119,11 @@ mod tests {
         resolve_max_tool_iterations, resolve_optional_secret, resolve_rate_limit_per_minute,
         resolve_session_keep_recent, resolve_session_summarize_on_overflow,
         resolve_session_ttl_secs, resolve_tool_timeout_secs, AgentConfig, HeartbeatConfig,
-        HttpConfig, SessionConfig, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
-        DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
-        DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
-        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES,
-        MIN_MAX_TOOL_ITERATIONS,
+        HttpConfig, MemorySearchToolConfig, SessionConfig, ToolsConfig, WebFetchToolConfig,
+        WebSearchToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
+        DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH,
+        DEFAULT_SESSION_KEEP_RECENT, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MAX_MAX_TOOL_ITERATIONS,
+        MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
     };
 
     #[test]
@@ -1840,6 +1864,7 @@ bind = "127.0.0.1:8080"
         assert_eq!(config.tools.web_search.brave_api_key, None);
         assert!(config.tools.web_fetch.enabled);
         assert!(!config.tools.web_fetch.allow_private);
+        assert!(config.tools.memory_search.enabled);
         assert_eq!(config.http.bind, "127.0.0.1:8080");
     }
 
@@ -1876,6 +1901,10 @@ path = "MEMORY.md"
             "omitted [tools.web_fetch] should keep default enabled"
         );
         assert!(!config.tools.web_fetch.allow_private);
+        assert!(
+            config.tools.memory_search.enabled,
+            "omitted [tools.memory_search] should keep default enabled"
+        );
         assert_eq!(config.http.bind, "127.0.0.1:9090");
         assert_eq!(config.memory.path, "MEMORY.md");
     }
@@ -1925,6 +1954,7 @@ brave_api_key = "BSA-test-key"
         );
         assert!(config.tools.web_fetch.enabled);
         assert!(!config.tools.web_fetch.allow_private);
+        assert!(config.tools.memory_search.enabled);
     }
 
     #[test]
@@ -1969,6 +1999,60 @@ allow_private = true
         assert!(!config.tools.web_fetch.enabled);
         assert!(config.tools.web_fetch.allow_private);
         assert!(config.tools.web_search.enabled);
+        assert!(config.tools.memory_search.enabled);
+    }
+
+    #[test]
+    fn memory_search_config_defaults_to_enabled() {
+        let config = MemorySearchToolConfig::default();
+        assert!(config.enabled);
+        assert!(ToolsConfig::default().memory_search.enabled);
+        assert!(AgentConfig::default().tools.memory_search.enabled);
+    }
+
+    #[test]
+    fn tools_memory_search_parses_from_toml() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[tools.memory_search]
+enabled = false
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(!config.tools.memory_search.enabled);
+        assert!(
+            config.tools.web_search.enabled,
+            "omitted [tools.web_search] should keep default enabled"
+        );
+        assert!(
+            config.tools.web_fetch.enabled,
+            "omitted [tools.web_fetch] should keep default enabled"
+        );
+    }
+
+    #[test]
+    fn tools_memory_search_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "tools": {
+                "memory_search": {
+                    "enabled": false
+                }
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(!config.tools.memory_search.enabled);
+        assert!(config.tools.web_search.enabled);
+        assert!(config.tools.web_fetch.enabled);
     }
 
     #[test]

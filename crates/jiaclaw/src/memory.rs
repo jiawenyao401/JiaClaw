@@ -8,7 +8,10 @@
 use crate::tools::Tool;
 use async_trait::async_trait;
 use jiaclaw_core::{JiaClawError, MEMORY_PROMPT_MAX_BYTES};
+use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// 工作区约定文件在磁盘上的状态（MEMORY / SOUL / USER，供 `doctor` / CLI 使用）
@@ -428,10 +431,331 @@ impl Tool for MemoryAppendTool {
     }
 }
 
+/// `max_results` 缺省值
+pub const MEMORY_SEARCH_DEFAULT_MAX_RESULTS: usize = 5;
+
+/// `max_results` 上限（含）
+pub const MEMORY_SEARCH_MAX_RESULTS: usize = 20;
+
+/// 单文件读取上限（字节）；超过则截断并 warn
+pub const MEMORY_SEARCH_FILE_MAX_BYTES: usize = 512 * 1024;
+
+/// 命中行前后各保留的上下文行数
+pub const MEMORY_SEARCH_LINE_RADIUS: usize = 2;
+
+/// 将 `max_results` 钳制到 `1..=20`。
+#[must_use]
+pub fn clamp_memory_search_max_results(raw: u64) -> usize {
+    usize::try_from(raw)
+        .unwrap_or(MEMORY_SEARCH_MAX_RESULTS)
+        .clamp(1, MEMORY_SEARCH_MAX_RESULTS)
+}
+
+/// 解析 `memory_search` 参数：必填 `query`，可选 `max_results`（默认 5，钳制 1..=20），可选 `paths`。
+///
+/// `paths` 缺省、为 `null` 或空数组时返回 `None`，调用方应使用配置的 MEMORY / SOUL / USER 路径。
+///
+/// # Errors
+///
+/// `query` 缺失/空白，`max_results` 不是整数，或 `paths` 不是字符串数组时返回错误。
+pub fn parse_memory_search_args(
+    args: &Value,
+) -> Result<(String, usize, Option<Vec<String>>), JiaClawError> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| JiaClawError::ToolExecution("缺少参数 'query'（非空字符串）".to_string()))?;
+
+    let max_results = match args.get("max_results") {
+        None => MEMORY_SEARCH_DEFAULT_MAX_RESULTS,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()));
+            match raw {
+                Some(n) => clamp_memory_search_max_results(n),
+                None => {
+                    return Err(JiaClawError::ToolExecution(
+                        "参数 'max_results' 必须是整数（将钳制到 1..=20）".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+
+    let paths = match args.get("paths") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let raw = item.as_str().ok_or_else(|| {
+                    JiaClawError::ToolExecution(
+                        "参数 'paths' 必须是字符串数组（工作区相对路径）".to_string(),
+                    )
+                })?;
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(JiaClawError::ToolExecution(
+                        "参数 'paths' 中的路径不能为空".to_string(),
+                    ));
+                }
+                out.push(trimmed.to_string());
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'paths' 必须是字符串数组（工作区相对路径）".to_string(),
+            ));
+        }
+    };
+
+    Ok((query.to_string(), max_results, paths))
+}
+
+/// 一条记忆检索命中（相对路径、1-indexed 行号、行窗摘录）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemorySearchHit {
+    /// 工作区相对路径（调用方传入或默认约定路径）
+    pub path: String,
+    /// 命中行号（从 1 起）
+    pub line: usize,
+    /// 命中行及其前后上下文
+    pub excerpt: String,
+}
+
+/// 在文本中做大小写不敏感子串匹配，返回最多 `max_results` 条行窗。
+#[must_use]
+pub fn search_memory_windows(
+    rel_path: &str,
+    content: &str,
+    query: &str,
+    max_results: usize,
+) -> Vec<MemorySearchHit> {
+    if query.is_empty() || max_results == 0 {
+        return Vec::new();
+    }
+    let needle = query.to_lowercase();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut hits = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if !line.to_lowercase().contains(&needle) {
+            continue;
+        }
+        let start = idx.saturating_sub(MEMORY_SEARCH_LINE_RADIUS);
+        let end = (idx + MEMORY_SEARCH_LINE_RADIUS).min(lines.len().saturating_sub(1));
+        let excerpt = lines[start..=end].join("\n");
+        hits.push(MemorySearchHit {
+            path: rel_path.to_string(),
+            line: idx + 1,
+            excerpt,
+        });
+        if hits.len() >= max_results {
+            break;
+        }
+    }
+    hits
+}
+
+fn unique_relative_paths(paths: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn read_search_file_limited(path: &Path) -> Result<(String, bool), JiaClawError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        JiaClawError::ToolExecution(format!("无法读取文件 {}: {e}", path.display()))
+    })?;
+    let mut buf = Vec::new();
+    let limit = u64::try_from(MEMORY_SEARCH_FILE_MAX_BYTES).unwrap_or(u64::MAX);
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| {
+            JiaClawError::ToolExecution(format!("无法读取文件 {}: {e}", path.display()))
+        })?;
+
+    let truncated = buf.len() > MEMORY_SEARCH_FILE_MAX_BYTES;
+    if truncated {
+        buf.truncate(MEMORY_SEARCH_FILE_MAX_BYTES);
+        tracing::warn!(
+            path = %path.display(),
+            size_limit_bytes = MEMORY_SEARCH_FILE_MAX_BYTES,
+            "memory_search 单文件过大，截断后检索"
+        );
+    }
+
+    let text = match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(err) => String::from_utf8_lossy(&err.into_bytes()).into_owned(),
+    };
+    if truncated {
+        Ok((
+            truncate_utf8(&text, MEMORY_SEARCH_FILE_MAX_BYTES).to_string(),
+            true,
+        ))
+    } else {
+        Ok((text, false))
+    }
+}
+
+enum SearchTarget {
+    Missing,
+    NotFile,
+    File(PathBuf),
+}
+
+fn open_search_target(workspace: &Path, configured: &str) -> Result<SearchTarget, JiaClawError> {
+    let path = resolve_workspace_relative_path(workspace, configured)?;
+    if !path.exists() {
+        return Ok(SearchTarget::Missing);
+    }
+    ensure_existing_within_workspace(workspace, &path)?;
+    if path.is_file() {
+        Ok(SearchTarget::File(path))
+    } else {
+        Ok(SearchTarget::NotFile)
+    }
+}
+
+#[derive(Serialize)]
+struct MemorySearchOutput {
+    query: String,
+    matches: Vec<MemorySearchHit>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+/// `memory_search` 工具：在工作区记忆类文件中按关键词检索片段。
+pub struct MemorySearchTool {
+    workspace_path: PathBuf,
+    default_paths: Vec<String>,
+}
+
+impl MemorySearchTool {
+    /// 创建工具；`default_paths` 为配置的 MEMORY / SOUL / USER 相对路径。
+    #[must_use]
+    pub fn new(
+        workspace_path: &Path,
+        default_paths: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let canonical_workspace = canonicalize_existing_or_clone(workspace_path);
+        Self {
+            workspace_path: canonical_workspace,
+            default_paths: unique_relative_paths(
+                default_paths
+                    .into_iter()
+                    .map(Into::into)
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty()),
+            ),
+        }
+    }
+
+    fn search_targets(&self, override_paths: Option<Vec<String>>) -> Vec<String> {
+        match override_paths {
+            Some(paths) => unique_relative_paths(paths),
+            None => self.default_paths.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MemorySearchTool {
+    fn name(&self) -> &str {
+        "memory_search"
+    }
+
+    fn description(&self) -> &str {
+        "在工作区记忆类文件中按关键词检索相关片段（大小写不敏感子串 + 行窗）。默认扫描配置的 MEMORY / SOUL / USER；可选 paths 指定工作区相对路径。返回 {path, line, excerpt}。单文件超过 512KiB 截断。禁止路径穿越。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词或子串（必填）"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "返回条数（可选，默认 5，钳制到 1..=20）",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 5
+                },
+                "paths": {
+                    "type": "array",
+                    "description": "要扫描的工作区相对路径（可选；缺省为配置的 MEMORY / SOUL / USER）",
+                    "items": { "type": "string" }
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let (query, max_results, override_paths) = parse_memory_search_args(&args)?;
+        let targets = self.search_targets(override_paths);
+        if targets.is_empty() {
+            return Err(JiaClawError::ToolExecution(
+                "没有可扫描的记忆文件路径".to_string(),
+            ));
+        }
+
+        let mut matches = Vec::new();
+        let mut warnings = Vec::new();
+
+        for rel in targets {
+            if matches.len() >= max_results {
+                break;
+            }
+            match open_search_target(&self.workspace_path, &rel)? {
+                SearchTarget::Missing => {
+                    warnings.push(format!("{rel}: 文件不存在，已跳过"));
+                }
+                SearchTarget::NotFile => {
+                    warnings.push(format!("{rel}: 不是文件，已跳过"));
+                }
+                SearchTarget::File(path) => {
+                    let (content, truncated) = read_search_file_limited(&path)?;
+                    if truncated {
+                        warnings.push(format!(
+                            "{rel}: 超过 {MEMORY_SEARCH_FILE_MAX_BYTES} 字节，已截断后检索"
+                        ));
+                    }
+                    let remaining = max_results.saturating_sub(matches.len());
+                    matches.extend(search_memory_windows(&rel, &content, &query, remaining));
+                }
+            }
+        }
+
+        let output = MemorySearchOutput {
+            query,
+            matches,
+            warnings,
+        };
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化检索结果失败: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jiaclaw_core::DEFAULT_MEMORY_PATH;
+    use jiaclaw_core::{DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -614,6 +938,242 @@ mod tests {
 
         let result = load_memory_for_prompt(&ws, DEFAULT_MEMORY_PATH);
         assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    fn default_search_tool(ws: &Path) -> MemorySearchTool {
+        MemorySearchTool::new(
+            ws,
+            [DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH],
+        )
+    }
+
+    #[test]
+    fn parse_memory_search_args_requires_non_empty_query() {
+        let err = parse_memory_search_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query"), "{err}");
+
+        let err = parse_memory_search_args(&serde_json::json!({"query": "   "}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query"), "{err}");
+    }
+
+    #[test]
+    fn parse_memory_search_args_defaults_and_clamps_max_results() {
+        let (query, max_results, paths) =
+            parse_memory_search_args(&serde_json::json!({"query": " rust "})).unwrap();
+        assert_eq!(query, "rust");
+        assert_eq!(max_results, MEMORY_SEARCH_DEFAULT_MAX_RESULTS);
+        assert!(paths.is_none());
+
+        let (_, max_results, _) =
+            parse_memory_search_args(&serde_json::json!({"query": "q", "max_results": 1})).unwrap();
+        assert_eq!(max_results, 1);
+
+        let (_, max_results, _) =
+            parse_memory_search_args(&serde_json::json!({"query": "q", "max_results": 0})).unwrap();
+        assert_eq!(max_results, 1);
+
+        let (_, max_results, _) =
+            parse_memory_search_args(&serde_json::json!({"query": "q", "max_results": 99}))
+                .unwrap();
+        assert_eq!(max_results, MEMORY_SEARCH_MAX_RESULTS);
+
+        let (_, _, paths) = parse_memory_search_args(&serde_json::json!({
+            "query": "q",
+            "paths": []
+        }))
+        .unwrap();
+        assert!(paths.is_none());
+
+        let err = parse_memory_search_args(&serde_json::json!({
+            "query": "q",
+            "max_results": "nope"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_results"), "{err}");
+    }
+
+    #[test]
+    fn clamp_memory_search_max_results_bounds() {
+        assert_eq!(clamp_memory_search_max_results(0), 1);
+        assert_eq!(clamp_memory_search_max_results(5), 5);
+        assert_eq!(clamp_memory_search_max_results(20), 20);
+        assert_eq!(clamp_memory_search_max_results(21), 20);
+    }
+
+    #[test]
+    fn search_memory_windows_is_case_insensitive_with_line_window() {
+        let content = "alpha\nUser likes TEA\nbeta\n";
+        let hits = search_memory_windows("MEMORY.md", content, "tea", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "MEMORY.md");
+        assert_eq!(hits[0].line, 2);
+        assert!(hits[0].excerpt.contains("User likes TEA"));
+        assert!(hits[0].excerpt.contains("alpha"));
+        assert!(hits[0].excerpt.contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn memory_search_hits_and_misses() {
+        let ws = unique_temp("jiaclaw_mem_search_hit");
+        fs::write(
+            ws.join("MEMORY.md"),
+            "# Memory\nUser prefers Rust tea.\nAnother line.\n",
+        )
+        .unwrap();
+        fs::write(ws.join("SOUL.md"), "Be helpful.\n").unwrap();
+        let tool = default_search_tool(&ws);
+        assert_eq!(tool.name(), "memory_search");
+
+        let hit = tool
+            .execute(serde_json::json!({"query": "rust"}))
+            .await
+            .unwrap();
+        assert!(hit.contains("MEMORY.md"), "{hit}");
+        assert!(hit.contains("prefers Rust tea"), "{hit}");
+        assert!(
+            hit.contains("\"line\": 2") || hit.contains("\"line\":2"),
+            "{hit}"
+        );
+
+        let miss = tool
+            .execute(serde_json::json!({"query": "definitely-not-present-xyz"}))
+            .await
+            .unwrap();
+        assert!(
+            miss.contains("\"matches\": []") || miss.contains("\"matches\":[]"),
+            "{miss}"
+        );
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_search_defaults_to_scanning_memory() {
+        let ws = unique_temp("jiaclaw_mem_search_default");
+        fs::write(ws.join("MEMORY.md"), "stable-fact-UNIQUE_MEMORY_TOKEN\n").unwrap();
+        fs::write(ws.join("SOUL.md"), "persona only\n").unwrap();
+        fs::write(ws.join("USER.md"), "profile only\n").unwrap();
+        let tool = default_search_tool(&ws);
+
+        let result = tool
+            .execute(serde_json::json!({"query": "unique_memory_token"}))
+            .await
+            .unwrap();
+        assert!(result.contains("MEMORY.md"), "{result}");
+        assert!(result.contains("UNIQUE_MEMORY_TOKEN"), "{result}");
+        assert!(!result.contains("persona only"), "{result}");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_search_rejects_path_traversal_and_absolute() {
+        let ws = unique_temp("jiaclaw_mem_search_trav");
+        fs::write(ws.join("MEMORY.md"), "inside\n").unwrap();
+        let tool = default_search_tool(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({
+                "query": "secret",
+                "paths": ["../secret.md"]
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+
+        let err = tool
+            .execute(serde_json::json!({
+                "query": "secret",
+                "paths": ["/etc/passwd"]
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径") || err.contains("安全"), "{err}");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_search_clamps_max_results_on_execute() {
+        let ws = unique_temp("jiaclaw_mem_search_clamp");
+        let mut body = String::new();
+        for i in 0..30 {
+            body.push_str(&format!("match-line-{i} needle-here\n"));
+        }
+        fs::write(ws.join("MEMORY.md"), body).unwrap();
+        let tool = default_search_tool(&ws);
+
+        let result = tool
+            .execute(serde_json::json!({"query": "needle-here", "max_results": 99}))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let matches = parsed
+            .get("matches")
+            .and_then(Value::as_array)
+            .expect("matches array");
+        assert_eq!(matches.len(), MEMORY_SEARCH_MAX_RESULTS);
+
+        let result = tool
+            .execute(serde_json::json!({"query": "needle-here", "max_results": 0}))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let matches = parsed
+            .get("matches")
+            .and_then(Value::as_array)
+            .expect("matches array");
+        assert_eq!(matches.len(), 1);
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_search_truncates_oversize_file_and_warns() {
+        let ws = unique_temp("jiaclaw_mem_search_trunc");
+        let mut body = "NEEDLE-AT-START\n".to_string();
+        body.push_str(&"x".repeat(MEMORY_SEARCH_FILE_MAX_BYTES));
+        fs::write(ws.join("MEMORY.md"), body).unwrap();
+        let tool = default_search_tool(&ws);
+
+        let result = tool
+            .execute(serde_json::json!({"query": "NEEDLE-AT-START"}))
+            .await
+            .unwrap();
+        assert!(result.contains("NEEDLE-AT-START"), "{result}");
+        assert!(result.contains("截断"), "{result}");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_search_rejects_symlink_escape() {
+        let ws = unique_temp("jiaclaw_mem_search_symlink");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_mem_search_outside_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret-outside-token").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("MEMORY.md")).unwrap();
+
+        let tool = default_search_tool(&ws);
+        let result = tool
+            .execute(serde_json::json!({"query": "secret-outside-token"}))
+            .await;
+        assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("安全") || err.contains("工作空间"), "{err}");
 
         let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(&ws);
