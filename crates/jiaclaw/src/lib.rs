@@ -10,10 +10,10 @@
 //! - 持久化运行（支持重启后恢复）
 
 pub use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HeartbeatConfig, HttpConfig,
-    IdentityConfig, JiaClawError, ListDirToolConfig, MemoryConfig, MemorySearchToolConfig,
-    MemoryWriteToolConfig, MessageRole, ProviderConfig, ReadFileToolConfig, RunStatus,
-    SessionConfig, ToolCall, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, DeleteFileToolConfig, HeartbeatConfig,
+    HttpConfig, IdentityConfig, JiaClawError, ListDirToolConfig, MemoryConfig,
+    MemorySearchToolConfig, MemoryWriteToolConfig, MessageRole, ProviderConfig, ReadFileToolConfig,
+    RunStatus, SessionConfig, ToolCall, ToolsConfig, WebFetchToolConfig, WebSearchToolConfig,
     WriteFileToolConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH,
     DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_HTTP_MAX_BODY_BYTES, DEFAULT_HTTP_SHUTDOWN_TIMEOUT_SECS,
     DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_MEMORY_PATH, DEFAULT_SESSION_KEEP_RECENT,
@@ -32,11 +32,13 @@ mod tools;
 mod workspace;
 
 pub use files::{
-    clamp_list_dir_max_entries, list_workspace_dir, parse_list_dir_args, parse_read_file_args,
-    parse_write_file_args, read_workspace_file, write_workspace_regular_file, DirEntryInfo,
-    ListDirArgs, ListDirOutput, ReadFileArgs, ReadFileOutput, WorkspaceListDirTool,
-    WorkspaceReadFileTool, WorkspaceWriteFileTool, WriteFileArgs, WriteFileMode, WriteFileOutput,
-    LIST_DIR_DEFAULT_MAX_ENTRIES, LIST_DIR_MAX_ENTRIES, READ_FILE_MAX_BYTES, WRITE_FILE_MAX_BYTES,
+    clamp_list_dir_max_entries, delete_workspace_regular_file, list_workspace_dir,
+    parse_delete_file_args, parse_list_dir_args, parse_read_file_args, parse_write_file_args,
+    read_workspace_file, write_workspace_regular_file, DeleteFileArgs, DeleteFileOutput,
+    DirEntryInfo, ListDirArgs, ListDirOutput, ReadFileArgs, ReadFileOutput,
+    WorkspaceDeleteFileTool, WorkspaceListDirTool, WorkspaceReadFileTool, WorkspaceWriteFileTool,
+    WriteFileArgs, WriteFileMode, WriteFileOutput, LIST_DIR_DEFAULT_MAX_ENTRIES,
+    LIST_DIR_MAX_ENTRIES, READ_FILE_MAX_BYTES, WRITE_FILE_MAX_BYTES,
 };
 pub use heartbeat::{inspect_heartbeat_file, load_heartbeat_message, resolve_heartbeat_path};
 pub use identity::{
@@ -164,6 +166,11 @@ impl JiaClawAgent {
         }
         if config.tools.write_file.enabled {
             tools.register(Box::new(WorkspaceWriteFileTool::new(
+                &config.workspace_path,
+            )));
+        }
+        if config.tools.delete_file.enabled {
+            tools.register(Box::new(WorkspaceDeleteFileTool::new(
                 &config.workspace_path,
             )));
         }
@@ -1622,6 +1629,81 @@ mod tests {
             .execute(&ToolCall {
                 tool_name: "write_file".to_string(),
                 arguments: serde_json::json!({"path": "notes.md", "content": "x"}),
+                result: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("工具不存在"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_file_is_registered_by_default() {
+        let agent = JiaClawAgent::new(AgentConfig::default()).unwrap();
+        assert!(
+            agent.tools().get("delete_file").is_some(),
+            "delete_file should be in the default tool list"
+        );
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            prompt.contains("delete_file"),
+            "system prompt should describe delete_file"
+        );
+        assert!(
+            prompt.contains("拒绝删除目录") || prompt.contains("常规文件"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn delete_file_is_not_registered_when_disabled() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                delete_file: DeleteFileToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        assert!(agent.tools().get("delete_file").is_none());
+        assert!(agent.tools().get("write_file").is_some());
+        assert!(agent.tools().get("read_file").is_some());
+        let prompt = agent.build_system_prompt(&ChatRequest {
+            messages: vec![],
+            enabled_tools: vec![],
+            enabled_skills: vec![],
+            auto_skills: true,
+            session_id: None,
+        });
+        assert!(
+            !prompt.contains("### delete_file"),
+            "disabled delete_file must not appear in tool docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_file_execute_when_unregistered_returns_missing_tool() {
+        let config = AgentConfig {
+            tools: ToolsConfig {
+                delete_file: DeleteFileToolConfig { enabled: false },
+                ..ToolsConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).unwrap();
+        let err = agent
+            .tools()
+            .execute(&ToolCall {
+                tool_name: "delete_file".to_string(),
+                arguments: serde_json::json!({"path": "notes.md"}),
                 result: None,
             })
             .await

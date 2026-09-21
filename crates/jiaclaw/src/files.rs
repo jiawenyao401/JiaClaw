@@ -1,7 +1,7 @@
 // Copyright 2026 JiaClaw contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! 工作区文件工具：`read_file` / `list_dir` / `write_file`。
+//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file`。
 //!
 //! 路径解析复用 [`crate::memory::resolve_workspace_relative_path`]（禁 `..`、绝对路径、symlink 逃逸）。
 //! 不调用 LLM，不执行 shell。
@@ -104,6 +104,13 @@ pub struct WriteFileArgs {
     pub content: String,
     /// 写入模式（默认 overwrite）
     pub mode: WriteFileMode,
+}
+
+/// 解析后的 `delete_file` 参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteFileArgs {
+    /// 工作区相对路径
+    pub path: String,
 }
 
 /// 将 `max_entries` 钳制到 `1..=1000`。
@@ -262,6 +269,26 @@ pub fn parse_write_file_args(args: &Value) -> Result<WriteFileArgs, JiaClawError
         path: path.to_string(),
         content,
         mode,
+    })
+}
+
+/// 解析 `delete_file` 参数：必填 `path`。
+///
+/// # Errors
+///
+/// `path` 缺失或空白时返回错误。
+pub fn parse_delete_file_args(args: &Value) -> Result<DeleteFileArgs, JiaClawError> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            JiaClawError::ToolExecution("缺少参数 'path'（工作区相对路径）".to_string())
+        })?;
+
+    Ok(DeleteFileArgs {
+        path: path.to_string(),
     })
 }
 
@@ -433,6 +460,71 @@ pub fn write_workspace_regular_file(
         path: rel_path.to_string(),
         mode,
         bytes_written: new_bytes.len(),
+    })
+}
+
+/// 删除工作区相对路径下的常规文件。不递归、不删除目录、不调用 shell。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、symlink 逃逸、目标是目录、文件不存在，或 IO 失败时返回错误。
+/// 缺文件时明确报错，不静默成功。
+pub fn delete_workspace_regular_file(
+    workspace: &Path,
+    rel_path: &str,
+) -> Result<DeleteFileOutput, JiaClawError> {
+    let path = resolve_workspace_relative_path(workspace, rel_path)?;
+
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(JiaClawError::ToolExecution(format!(
+                "文件不存在: {rel_path}"
+            )));
+        }
+        Err(err) => {
+            return Err(JiaClawError::ToolExecution(format!(
+                "无法读取文件元数据 {rel_path}: {err}"
+            )));
+        }
+    };
+
+    if meta.file_type().is_dir() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不是文件（拒绝删除目录）: {rel_path}"
+        )));
+    }
+
+    // 跟随解析以拦截 symlink 逃逸；目标必须落在工作区内。
+    if !path.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "文件不存在: {rel_path}"
+        )));
+    }
+    ensure_existing_within_workspace(workspace, &path)?;
+    let canon = path
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析文件 {rel_path}: {e}")))?;
+    if !canon.is_file() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不是文件: {rel_path}"
+        )));
+    }
+
+    if !meta.file_type().is_file() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不是文件: {rel_path}"
+        )));
+    }
+
+    let size_bytes = meta.len();
+    fs::remove_file(&path)
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法删除文件 {rel_path}: {e}")))?;
+
+    Ok(DeleteFileOutput {
+        path: rel_path.to_string(),
+        deleted: true,
+        size_bytes,
     })
 }
 
@@ -674,6 +766,17 @@ pub struct WriteFileOutput {
     pub bytes_written: usize,
 }
 
+/// `delete_file` 的 JSON 返回体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteFileOutput {
+    /// 调用方传入的工作区相对路径
+    pub path: String,
+    /// 是否已删除（成功时为 `true`）
+    pub deleted: bool,
+    /// 删除前的文件字节数
+    pub size_bytes: u64,
+}
+
 /// `read_file` 工具：读取工作区相对路径下的文本文件（路径沙箱，不调用 LLM）。
 pub struct WorkspaceReadFileTool {
     workspace_path: PathBuf,
@@ -881,6 +984,52 @@ impl Tool for WorkspaceWriteFileTool {
         )?;
         serde_json::to_string_pretty(&output)
             .map_err(|e| JiaClawError::ToolExecution(format!("序列化写入结果失败: {e}")))
+    }
+}
+
+/// `delete_file` 工具：删除工作区相对路径下的常规文件（路径沙箱，不调用 LLM）。
+pub struct WorkspaceDeleteFileTool {
+    workspace_path: PathBuf,
+}
+
+impl WorkspaceDeleteFileTool {
+    /// 创建工具。
+    #[must_use]
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WorkspaceDeleteFileTool {
+    fn name(&self) -> &str {
+        "delete_file"
+    }
+
+    fn description(&self) -> &str {
+        "删除工作区相对路径下的常规文件。path 必填且相对于工作区根。禁止 .. / 绝对路径 / symlink 逃逸。只删常规文件，拒绝目录；文件不存在时明确报错（不静默成功）。不递归、不执行 shell、不调用 LLM。返回 {path, deleted, size_bytes}。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要删除的文件相对路径（相对于工作区根目录）"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let parsed = parse_delete_file_args(&args)?;
+        let output = delete_workspace_regular_file(&self.workspace_path, &parsed.path)?;
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化删除结果失败: {e}")))
     }
 }
 
@@ -1324,6 +1473,124 @@ mod tests {
             .to_string();
         assert!(err.contains("超过上限"), "{err}");
         assert_eq!(fs::read_to_string(ws.join("log.md")).unwrap(), "12345");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn parse_delete_file_args_requires_path() {
+        let err = parse_delete_file_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path"), "{err}");
+
+        let err = parse_delete_file_args(&serde_json::json!({"path": "   "}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path"), "{err}");
+
+        let parsed = parse_delete_file_args(&serde_json::json!({"path": " notes/a.md "})).unwrap();
+        assert_eq!(parsed.path, "notes/a.md");
+    }
+
+    #[tokio::test]
+    async fn delete_file_success_removes_regular_file() {
+        let ws = unique_temp("jiaclaw_delete_file_ok");
+        fs::write(ws.join("notes.md"), "delete-me").unwrap();
+        let tool = WorkspaceDeleteFileTool::new(&ws);
+        assert_eq!(tool.name(), "delete_file");
+
+        let result = tool
+            .execute(serde_json::json!({"path": "notes.md"}))
+            .await
+            .unwrap();
+        assert!(result.contains("notes.md"), "{result}");
+        assert!(result.contains("\"deleted\": true"), "{result}");
+        assert!(!ws.join("notes.md").exists());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn delete_file_rejects_traversal_and_absolute() {
+        let ws = unique_temp("jiaclaw_delete_file_trav");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_delete_secret_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "keep-me").unwrap();
+        let tool = WorkspaceDeleteFileTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({"path": "../jiaclaw_should_not_delete.md"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+
+        let err = tool
+            .execute(serde_json::json!({"path": "/etc/passwd"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep-me");
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_file_rejects_symlink_escape() {
+        let ws = unique_temp("jiaclaw_delete_file_symlink");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_delete_outside_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret-outside").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("leak.md")).unwrap();
+
+        let tool = WorkspaceDeleteFileTool::new(&ws);
+        let result = tool.execute(serde_json::json!({"path": "leak.md"})).await;
+        assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("安全") || err.contains("工作空间"), "{err}");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret-outside");
+        assert!(outside.exists(), "不得删除工作区外目标文件");
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn delete_file_rejects_directory() {
+        let ws = unique_temp("jiaclaw_delete_file_dir");
+        fs::create_dir_all(ws.join("notes")).unwrap();
+        fs::write(ws.join("notes").join("keep.md"), "stay").unwrap();
+        let tool = WorkspaceDeleteFileTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({"path": "notes"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("目录") || err.contains("不是文件"), "{err}");
+        assert!(ws.join("notes").is_dir());
+        assert_eq!(
+            fs::read_to_string(ws.join("notes").join("keep.md")).unwrap(),
+            "stay"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn delete_file_missing_file_is_explicit_error() {
+        let ws = unique_temp("jiaclaw_delete_file_missing");
+        let tool = WorkspaceDeleteFileTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({"path": "no-such.md"}))
+            .await;
+        assert!(result.is_err(), "缺文件不得静默成功: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("不存在"), "{err}");
         let _ = fs::remove_dir_all(&ws);
     }
 }

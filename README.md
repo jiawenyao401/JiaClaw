@@ -138,6 +138,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 配置 `[tools.write_file] enabled`（默认 `true`）；结果文件超过 **256KiB**（与 read_file 对齐）明确报错且不落盘
   - tmp + rename 原子写；路径安全与 MEMORY / read_file 对齐：禁止 `..` / 绝对路径 / symlink 逃逸；只写工作区内常规文件
   - `enabled = false` 时不注册；无 shell、不调用 LLM；**不做 exec**
+- ✅ **可选 delete_file** - 默认注册的工作区文件删除工具（`path` 必填，工作区相对路径）
+  - 配置 `[tools.delete_file] enabled`（默认 `true`）；**只删常规文件**，拒绝目录；文件不存在时明确报错（不静默成功）
+  - 路径安全与 MEMORY / read_file / write_file 对齐：禁止 `..` / 绝对路径 / symlink 逃逸
+  - 不递归、无 `rm -rf`、无 shell、不调用 LLM；`enabled = false` 时不注册；**不做 exec**
 - ✅ **Telegram Bot 入站** - `POST /hooks/telegram` 把 Bot API Update 映射到 session `telegram:{chat.id}`
   - 支持 `message.text` / `edited_message.text`；无文本 update 返回 200 并跳过
   - 可选 `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`，校验 `X-Telegram-Bot-Api-Secret-Token`
@@ -374,6 +378,11 @@ enabled = true
 [tools.write_file]
 # 可选工作区文件写入（默认启用并注册）。path / content 必填；mode=overwrite|append（默认 overwrite）。
 # 结果超过 256KiB（与 read_file 对齐）报错且不落盘。原子写。禁止穿越 / symlink 逃逸。enabled = false 不注册。
+enabled = true
+
+[tools.delete_file]
+# 可选工作区文件删除（默认启用并注册）。path 必填。只删常规文件，拒绝目录；缺文件明确报错。
+# 禁止穿越 / 绝对路径 / symlink 逃逸。不递归、无 shell。enabled = false 不注册。
 enabled = true
 ```
 
@@ -654,6 +663,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - 可选 read_file：默认注册。读取工作区相对路径文本文件；`offset`/`limit` 按行（1-indexed）；超过 256KiB 或二进制报错；禁穿越。`enabled = false` 不注册。无 shell
 - 可选 list_dir：默认注册。列出工作区目录（默认 `.`，不递归）；返回 name/type/size；禁穿越。`enabled = false` 不注册。无 shell
 - 可选 write_file：默认注册。写入工作区相对路径常规文件；`mode=overwrite|append`（默认 overwrite）；超过 256KiB 报错且不落盘；原子写；禁穿越。`enabled = false` 不注册。无 shell / exec
+- 可选 delete_file：默认注册。删除工作区相对路径常规文件；拒绝目录；缺文件明确报错；禁穿越 / symlink 逃逸。`enabled = false` 不注册。无递归 / shell / exec
 
 ## 项目结构
 
@@ -816,6 +826,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Configure `[tools.write_file] enabled` (default `true`); resulting file over **256KiB** (aligned with read_file) is rejected and not written
   - tmp + rename atomic write; same path policy as MEMORY / read_file: no `..` / absolute / symlink escape; regular in-workspace files only
   - `enabled = false` skips registration; no shell, no LLM; **no exec**
+- ✅ **Optional delete_file** - registered by default (`path` required, workspace-relative)
+  - Configure `[tools.delete_file] enabled` (default `true`); **regular files only**; directories are rejected; missing files return an explicit error (never silent success)
+  - Same path policy as MEMORY / read_file / write_file: no `..` / absolute / symlink escape
+  - No recursion, no `rm -rf`, no shell, no LLM; `enabled = false` skips registration; **no exec**
 - ✅ **Telegram Bot inbound** - `POST /hooks/telegram` maps Bot API Updates onto session `telegram:{chat.id}`
   - Supports `message.text` / `edited_message.text`; updates without text return 200 and are skipped
   - Optional `JIACLAW_TELEGRAM_SECRET` / `[http] telegram_secret`, checked via `X-Telegram-Bot-Api-Secret-Token`
@@ -1051,6 +1065,11 @@ enabled = true
 [tools.write_file]
 # Optional workspace file write (registered by default). path / content required; mode=overwrite|append (default overwrite).
 # Result over 256KiB (aligned with read_file) is rejected and not written. Atomic write. No traversal / symlink escape.
+enabled = true
+
+[tools.delete_file]
+# Optional workspace file delete (registered by default). path required. Regular files only; directories rejected; missing files error.
+# No traversal / absolute / symlink escape. No recursion / shell. enabled = false skips registration.
 enabled = true
 ```
 
@@ -1324,6 +1343,7 @@ export JIACLAW_DISCORD_BOT_TOKEN=your-discord-bot-token
 - Optional read_file: registered by default. Reads a workspace-relative text file; `offset`/`limit` are 1-indexed lines; over 256KiB or binary is rejected; no traversal. `enabled = false` skips registration. No shell
 - Optional list_dir: registered by default. Lists a workspace directory (default `.`, non-recursive); returns name/type/size; no traversal. `enabled = false` skips registration. No shell
 - Optional write_file: registered by default. Writes a workspace-relative regular file; `mode=overwrite|append` (default overwrite); over 256KiB is rejected and not written; atomic write; no traversal. `enabled = false` skips registration. No shell / exec
+- Optional delete_file: registered by default. Deletes a workspace-relative regular file; directories are rejected; missing files return an explicit error; no traversal / symlink escape. `enabled = false` skips registration. No recursion / shell / exec
 
 ### Documentation
 
