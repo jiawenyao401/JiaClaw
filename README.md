@@ -88,6 +88,10 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
   - 默认 `{workspace}/SOUL.md`、`USER.md`，可用 `[identity] soul_path` / `user_path` 覆盖
   - 每次 `chat` 重读；存在且非空则注入独立区块；各文件独立 32KiB 截断并 warn
   - 本地工具 `soul_write` / `user_write`（默认覆盖）；`jiaclaw doctor` / `jiaclaw soul show` / `jiaclaw user show`
+- ✅ **可选 HEARTBEAT.md 定时心跳** - 仅 `jiaclaw serve` 进程内按间隔注入一轮 chat
+  - 默认 `{workspace}/HEARTBEAT.md`，可用 `[heartbeat] path` 覆盖；`enabled = false` 默认关
+  - `interval_secs` 默认 3600，环境变量 `JIACLAW_HEARTBEAT_INTERVAL_SECS`（正整数）可覆盖
+  - 固定 `session_id`（默认 `heartbeat`）；文件缺失或为空则跳过本轮；CLI `chat` 不跑心跳
 
 ### 待实现
 
@@ -187,6 +191,13 @@ path = "MEMORY.md"
 # 人格 / 用户画像（相对于 workspace；缺省本段即为 SOUL.md / USER.md）
 soul_path = "SOUL.md"
 user_path = "USER.md"
+
+[heartbeat]
+# 可选定时心跳（仅 jiaclaw serve；默认关。CLI chat 不跑）
+# enabled = true
+# interval_secs = 3600
+# path = "HEARTBEAT.md"
+# session_id = "heartbeat"
 ```
 
 或使用环境变量：
@@ -199,6 +210,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_SESSION_TTL_SECS=3600
 # 可选：单次工具调用超时（秒，优先于配置文件）
 # export JIACLAW_TOOL_TIMEOUT_SECS=30
+# 可选：Heartbeat 间隔（秒，优先于 [heartbeat] interval_secs；需 enabled = true）
+# export JIACLAW_HEARTBEAT_INTERVAL_SECS=3600
 ```
 
 ### 运行示例
@@ -365,6 +378,7 @@ curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
 - 可选 SSE：`POST /api/chat` 在 `Accept: text/event-stream` 或 `"stream": true` 时返回 `text/event-stream`（`meta` / `token` / `tool` / `done` / `error`）。未请求流式时 JSON 不变。**当前为分块推送；Brokerrouter 真流式后续**
 - Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
 - Telegram Bot 入站：`POST /hooks/telegram` 解析 Bot API Update（`message.text` / `edited_message.text`），会话键 `telegram:{chat.id}`；无文本返回 200 + 跳过说明。可选 `JIACLAW_TELEGRAM_SECRET`。配置 `JIACLAW_TELEGRAM_BOT_TOKEN` 后会调用 `sendMessage` 出站（文本超 4096 截断）；出站失败仍返回 200 + 原 `reply`，避免 Telegram 重试。用 `setWebhook` 把公网 `https://…/hooks/telegram` 登记到 Bot，并可带 `secret_token`
+- 可选 HEARTBEAT.md：`[heartbeat] enabled = true` 后仅 `jiaclaw serve` 按间隔读取约定文件全文并跑一轮 chat（固定 session，默认 `heartbeat`）。`JIACLAW_HEARTBEAT_INTERVAL_SECS` 可覆盖间隔。文件缺失/空则跳过；CLI `chat` 不跑心跳
 
 ## 项目结构
 
@@ -378,7 +392,7 @@ JiaClaw/
 │   ├── architecture.md
 │   ├── stateknot-gaps.md
 │   └── roadmap.md
-├── examples/             # 示例工作空间（含 MEMORY.md / SOUL.md / USER.md 说明）
+├── examples/             # 示例工作空间（含 MEMORY.md / SOUL.md / USER.md / HEARTBEAT.md 说明）
 ├── Cargo.toml            # 工作空间清单
 └── README.md
 ```
@@ -477,6 +491,10 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
   - Default `{workspace}/SOUL.md` and `USER.md`, overridable via `[identity] soul_path` / `user_path`
   - Re-read on every `chat`; independent 32KiB truncation per file
   - Local tools `soul_write` / `user_write` (replace by default); `jiaclaw soul show` / `jiaclaw user show`
+- ✅ **Optional HEARTBEAT.md** - periodic self-check chat, only inside `jiaclaw serve`
+  - Default `{workspace}/HEARTBEAT.md`, overridable via `[heartbeat] path`; `enabled = false` by default
+  - `interval_secs` defaults to 3600; `JIACLAW_HEARTBEAT_INTERVAL_SECS` (positive integer) overrides
+  - Fixed `session_id` (default `heartbeat`); missing/empty file skips the tick; CLI `chat` does not run heartbeats
 
 #### Pending
 
@@ -576,6 +594,13 @@ path = "MEMORY.md"
 # Persona / user profile (relative to workspace; omit this section for SOUL.md / USER.md defaults)
 soul_path = "SOUL.md"
 user_path = "USER.md"
+
+[heartbeat]
+# Optional periodic heartbeat (jiaclaw serve only; off by default. CLI chat does not run it)
+# enabled = true
+# interval_secs = 3600
+# path = "HEARTBEAT.md"
+# session_id = "heartbeat"
 ```
 
 Or use environment variable:
@@ -588,6 +613,8 @@ export JIACLAW_API_KEY=brk_live_your_key_here
 # export JIACLAW_SESSION_TTL_SECS=3600
 # Optional: per-tool timeout in seconds (overrides config file)
 # export JIACLAW_TOOL_TIMEOUT_SECS=30
+# Optional: heartbeat interval in seconds (overrides [heartbeat] interval_secs; requires enabled = true)
+# export JIACLAW_HEARTBEAT_INTERVAL_SECS=3600
 ```
 
 #### Run Examples
@@ -742,6 +769,7 @@ curl "https://api.telegram.org/bot${JIACLAW_TELEGRAM_BOT_TOKEN}/setWebhook" \
 - Optional SSE: `POST /api/chat` returns `text/event-stream` when `Accept: text/event-stream` or `"stream": true` (`meta` / `token` / `tool` / `done` / `error`). JSON is unchanged when streaming is not requested. **Currently chunked after the full loop; Brokerrouter true streaming comes later**
 - Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)
 - Telegram Bot inbound: `POST /hooks/telegram` parses Bot API Updates (`message.text` / `edited_message.text`) into session `telegram:{chat.id}`; updates without text return 200 + a skip reason. Optional `JIACLAW_TELEGRAM_SECRET`. With `JIACLAW_TELEGRAM_BOT_TOKEN`, replies are also sent via `sendMessage` (text truncated at 4096); outbound failure still returns 200 + the original `reply` so Telegram does not retry. Point `setWebhook` at the public `https://…/hooks/telegram` URL, optionally with `secret_token`
+- Optional HEARTBEAT.md: with `[heartbeat] enabled = true`, only `jiaclaw serve` reads the file on an interval and runs one chat turn (fixed session, default `heartbeat`). `JIACLAW_HEARTBEAT_INTERVAL_SECS` overrides the interval. Missing/empty files skip the tick; CLI `chat` does not run heartbeats
 
 ### Documentation
 

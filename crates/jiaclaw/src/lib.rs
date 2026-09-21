@@ -10,11 +10,13 @@
 //! - 持久化运行（支持重启后恢复）
 
 pub use jiaclaw_core::{
-    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpConfig, IdentityConfig, JiaClawError,
-    MemoryConfig, MessageRole, ProviderConfig, RunStatus, ToolCall, DEFAULT_MEMORY_PATH,
-    DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MEMORY_PROMPT_MAX_BYTES,
+    AgentConfig, ChatMessage, ChatRequest, ChatResponse, HeartbeatConfig, HttpConfig,
+    IdentityConfig, JiaClawError, MemoryConfig, MessageRole, ProviderConfig, RunStatus, ToolCall,
+    DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID,
+    DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH, DEFAULT_USER_PATH, MEMORY_PROMPT_MAX_BYTES,
 };
 
+mod heartbeat;
 mod identity;
 mod memory;
 mod provider;
@@ -22,6 +24,7 @@ mod skills;
 mod tools;
 mod workspace;
 
+pub use heartbeat::{inspect_heartbeat_file, load_heartbeat_message, resolve_heartbeat_path};
 pub use identity::{
     inspect_identity_file, load_identity_for_prompt, resolve_identity_path, write_identity,
     IdentityKind, IdentityWriteTool,

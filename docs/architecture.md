@@ -130,7 +130,7 @@
   - `DirectProvider` - 临时直连模式（待废弃）
   
 - **Workspace** - 工作空间管理
-  - 加载和管理 `AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`
+  - 加载和管理 `AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`；可选 `HEARTBEAT.md` 供 serve 定时自检
   - 每次对话重读 `SOUL.md` / `USER.md` / `MEMORY.md`（或 `[identity]` / `[memory]` 路径）并注入系统提示；各文件独立过大截断
   - 工具 `soul_write` / `user_write` / `memory_append` 只能写约定路径（禁止穿越）
 
@@ -141,7 +141,7 @@
 - **CLI 接口**
   - `jiaclaw serve` - 启动 HTTP 服务
   - `jiaclaw chat <message>` - 单次聊天
-  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER 是否存在及大小）
+  - `jiaclaw doctor` - 配置诊断（含 MEMORY / SOUL / USER / HEARTBEAT 是否存在及大小；Heartbeat 是否启用与间隔）
   - `jiaclaw memory show` - 显示工作区长期记忆
   - `jiaclaw soul show` / `jiaclaw user show` - 显示人格与用户画像
   - `jiaclaw version` - 版本信息

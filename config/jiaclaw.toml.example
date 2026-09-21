@@ -148,6 +148,17 @@ path = "MEMORY.md"
 soul_path = "SOUL.md"
 user_path = "USER.md"
 
+[heartbeat]
+# 可选定时心跳（仅 jiaclaw serve 进程内；CLI chat 不跑）
+# 默认关闭。启用后按 interval_secs 读取约定文件全文，作为 user 消息跑一轮 chat，
+# 结果写入固定 session（默认 heartbeat），日志只打摘要。
+# 文件缺失或为空：跳过本轮（debug），不退出。路径相对于 workspace，禁止穿越。
+enabled = false
+interval_secs = 3600
+path = "HEARTBEAT.md"
+session_id = "heartbeat"
+# 环境变量 JIACLAW_HEARTBEAT_INTERVAL_SECS 可覆盖间隔（正整数）
+
 [limits]
 # 资源限制配置
 

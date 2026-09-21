@@ -22,7 +22,10 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-use jiaclaw::{inspect_identity_file, inspect_memory_file, JiaClawAgent, Workspace};
+use jiaclaw::{
+    inspect_heartbeat_file, inspect_identity_file, inspect_memory_file, load_heartbeat_message,
+    resolve_heartbeat_path, JiaClawAgent, Workspace,
+};
 use jiaclaw_core::{AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -273,6 +276,7 @@ fn init_command(path: Option<PathBuf>, force: bool) -> Result<()> {
 
     println!("\n💡 提示:");
     println!("   • 无 API key 时将使用存根模式（演示功能）");
+    println!("   • 可选 HEARTBEAT.md：仅 serve 进程可按间隔自检（默认关闭，见 [heartbeat]）");
     println!("   • 参见 config/jiaclaw.toml.example 了解完整配置选项");
 
     Ok(())
@@ -666,6 +670,112 @@ fn tool_timeout_config_source() -> &'static str {
     }
 }
 
+fn heartbeat_interval_config_source() -> &'static str {
+    if std::env::var("JIACLAW_HEARTBEAT_INTERVAL_SECS").is_ok() {
+        "环境变量 JIACLAW_HEARTBEAT_INTERVAL_SECS"
+    } else {
+        "配置文件"
+    }
+}
+
+fn heartbeat_file_status_label(config: &AgentConfig) -> String {
+    match inspect_heartbeat_file(&config.workspace_path, &config.heartbeat.path) {
+        Ok(status) if status.exists => format!("存在 ({} bytes)", status.size_bytes),
+        Ok(_) => "不存在".to_string(),
+        Err(e) => format!("路径无效 ({e})"),
+    }
+}
+
+/// 心跳一轮的结果（供测试断言；serve 循环忽略具体值）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeartbeatTickOutcome {
+    SkippedEmptyOrMissing,
+    Completed {
+        user_chars: usize,
+        reply_chars: usize,
+    },
+    Failed(String),
+}
+
+type HeartbeatTickHook = Arc<dyn Fn() + Send + Sync>;
+
+fn maybe_spawn_heartbeat(
+    state: AppState,
+    config: &AgentConfig,
+    on_tick: Option<HeartbeatTickHook>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.heartbeat.enabled {
+        return None;
+    }
+
+    let rel_path = config.heartbeat.path.clone();
+    if let Err(e) = resolve_heartbeat_path(&config.workspace_path, &rel_path) {
+        tracing::warn!("Heartbeat 已启用但路径无效，不启动后台任务: {e}");
+        return None;
+    }
+
+    let workspace = config.workspace_path.clone();
+    let session_id = config.heartbeat.effective_session_id().to_string();
+    let interval = Duration::from_secs(config.heartbeat.effective_interval_secs());
+
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let _ = run_heartbeat_tick(&state, &workspace, &rel_path, &session_id).await;
+            if let Some(hook) = &on_tick {
+                hook();
+            }
+        }
+    }))
+}
+
+async fn run_heartbeat_tick(
+    state: &AppState,
+    workspace: &std::path::Path,
+    rel_path: &str,
+    session_id: &str,
+) -> HeartbeatTickOutcome {
+    let content = match load_heartbeat_message(workspace, rel_path) {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            tracing::debug!(
+                session_id,
+                path = rel_path,
+                "Heartbeat 跳过本轮：文件缺失或为空"
+            );
+            return HeartbeatTickOutcome::SkippedEmptyOrMissing;
+        }
+        Err(e) => {
+            tracing::warn!(session_id, "Heartbeat 本轮跳过：无法读取文件: {e}");
+            return HeartbeatTickOutcome::Failed(e.to_string());
+        }
+    };
+
+    let user_chars = content.chars().count();
+    match run_session_user_chat(state, session_id, &content, "heartbeat", "heartbeat").await {
+        Ok(reply) => {
+            let reply_chars = reply.chars().count();
+            tracing::info!(session_id, user_chars, reply_chars, "Heartbeat 完成一轮");
+            HeartbeatTickOutcome::Completed {
+                user_chars,
+                reply_chars,
+            }
+        }
+        Err(e) => {
+            let message = match e {
+                AppError::Internal(msg) => msg,
+                AppError::Unauthorized => "Unauthorized".to_string(),
+                AppError::NotFound => "NotFound".to_string(),
+            };
+            tracing::warn!(session_id, "Heartbeat 本轮 chat 失败: {message}");
+            HeartbeatTickOutcome::Failed(message)
+        }
+    }
+}
+
 fn sessions_from_messages(
     raw: HashMap<String, Vec<ChatMessage>>,
 ) -> HashMap<String, SessionRecord> {
@@ -829,6 +939,21 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         spawn_session_ttl_sweeper(state.clone());
     }
 
+    let heartbeat_interval_secs = config.heartbeat.effective_interval_secs();
+    if maybe_spawn_heartbeat(state.clone(), &config, None).is_some() {
+        tracing::info!(
+            interval_secs = heartbeat_interval_secs,
+            session_id = config.heartbeat.effective_session_id(),
+            path = %config.heartbeat.path,
+            file = %heartbeat_file_status_label(&config),
+            "Heartbeat 已启用"
+        );
+    } else if config.heartbeat.enabled {
+        tracing::warn!("Heartbeat 配置为启用，但未能启动后台任务");
+    } else {
+        tracing::info!("Heartbeat 未启用");
+    }
+
     // 配置 CORS
     let cors = if config.http.cors_allow_origins.is_empty()
         || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
@@ -895,6 +1020,15 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         tracing::info!("   • 工具超时: 已启用（每调用 {secs} 秒）");
     } else {
         tracing::info!("   • 工具超时: 未启用（不限制）");
+    }
+    if config.heartbeat.enabled {
+        tracing::info!(
+            "   • Heartbeat: 已启用（间隔 {heartbeat_interval_secs} 秒，session={}, 文件 {}）",
+            config.heartbeat.effective_session_id(),
+            heartbeat_file_status_label(&config)
+        );
+    } else {
+        tracing::info!("   • Heartbeat: 未启用");
     }
 
     // 打印配置摘要（不打印 secret 明文）
@@ -974,6 +1108,17 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
         );
     } else {
         println!("   • 工具超时: ⚠️  未启用（不限制单次工具执行时间）");
+    }
+
+    if config.heartbeat.enabled {
+        println!(
+            "   • Heartbeat: ✅ 已启用（间隔 {heartbeat_interval_secs} 秒，session={}, 文件 {}，间隔来自 {}）",
+            config.heartbeat.effective_session_id(),
+            heartbeat_file_status_label(&config),
+            heartbeat_interval_config_source()
+        );
+    } else {
+        println!("   • Heartbeat: ⚠️  未启用（仅 serve 进程可挂后台任务；CLI chat 不跑心跳）");
     }
 
     if config.http.cors_allow_origins.is_empty()
@@ -2409,6 +2554,27 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
                     }
                 }
 
+                match inspect_heartbeat_file(&config.workspace_path, &config.heartbeat.path) {
+                    Ok(status) => {
+                        println!(
+                            "   HEARTBEAT: {} （配置路径: {}）",
+                            status.path.display(),
+                            config.heartbeat.path
+                        );
+                        if status.exists {
+                            println!("           ✅ 存在 ({} bytes)", status.size_bytes);
+                        } else {
+                            println!("           ⚠️  不存在");
+                            println!(
+                                "           💡 启用 [heartbeat] 后，缺失或空文件会跳过本轮（不退出）"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!("   HEARTBEAT: ❌ 无法解析约定路径: {e}");
+                    }
+                }
+
                 // 检查技能
                 let skills_dir = config.workspace_path.join("skills");
                 if skills_dir.exists() {
@@ -2613,6 +2779,21 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
         println!("   💡 设置环境变量: export JIACLAW_SESSION_TTL_SECS=3600");
     }
 
+    let heartbeat_interval_secs = config.heartbeat.effective_interval_secs();
+    if config.heartbeat.enabled {
+        println!(
+            "   Heartbeat: ✅ 已启用（间隔 {heartbeat_interval_secs} 秒，session={}, 文件 {}，间隔来自 {}）",
+            config.heartbeat.effective_session_id(),
+            heartbeat_file_status_label(&config),
+            heartbeat_interval_config_source()
+        );
+    } else {
+        println!("   Heartbeat: ⚠️  未启用（默认关闭；仅 jiaclaw serve 会挂后台任务）");
+        println!(
+            "   💡 在配置中设置 [heartbeat] enabled = true，可选 JIACLAW_HEARTBEAT_INTERVAL_SECS"
+        );
+    }
+
     // CORS 配置
     if config.http.cors_allow_origins.is_empty()
         || (config.http.cors_allow_origins.len() == 1 && config.http.cors_allow_origins[0] == "*")
@@ -2694,6 +2875,17 @@ fn doctor_command(config_path: Option<PathBuf>) -> Result<()> {
             "未启用".to_string()
         }
     );
+    println!(
+        "   • Heartbeat: {}",
+        if config.heartbeat.enabled {
+            format!(
+                "已启用（间隔 {heartbeat_interval_secs} 秒，文件 {}）",
+                heartbeat_file_status_label(&config)
+            )
+        } else {
+            "未启用".to_string()
+        }
+    );
 
     if !has_key {
         println!("\n   ⚠️  运行模式: Stub（存根模式）");
@@ -2719,7 +2911,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use jiaclaw_core::{ChatMessage, ChatRequest, MessageRole};
+    use jiaclaw_core::{ChatMessage, ChatRequest, HeartbeatConfig, MessageRole};
     use tower::ServiceExt;
 
     fn create_test_app() -> Router {
@@ -3632,6 +3824,188 @@ mod tests {
         );
 
         std::fs::remove_file(&persist_path).ok();
+    }
+
+    fn unique_workspace(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_state_for_workspace(workspace: PathBuf) -> AppState {
+        let config = AgentConfig {
+            workspace_path: workspace,
+            ..AgentConfig::default()
+        };
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-test-{}.json", uuid::Uuid::new_v4()));
+        AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            persist_enabled: false,
+            persist_path: Arc::new(persist_path),
+            rate_limiter: None,
+            session_ttl: None,
+        }
+    }
+
+    fn heartbeat_config(enabled: bool, interval_secs: u64, path: &str) -> AgentConfig {
+        AgentConfig {
+            workspace_path: unique_workspace("jiaclaw-hb-cfg"),
+            heartbeat: HeartbeatConfig {
+                enabled,
+                interval_secs,
+                path: path.to_string(),
+                ..HeartbeatConfig::default()
+            },
+            ..AgentConfig::default()
+        }
+    }
+
+    struct CountdownLatch {
+        remaining: std::sync::atomic::AtomicUsize,
+        notify: tokio::sync::Notify,
+    }
+
+    impl CountdownLatch {
+        fn new(count: usize) -> Arc<Self> {
+            Arc::new(Self {
+                remaining: std::sync::atomic::AtomicUsize::new(count),
+                notify: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn count_down(&self) {
+            let prev = self
+                .remaining
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if prev == 1 {
+                self.notify.notify_waiters();
+            }
+        }
+
+        async fn wait(&self) {
+            loop {
+                if self.remaining.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return;
+                }
+                let notified = self.notify.notified();
+                if self.remaining.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    #[test]
+    fn heartbeat_disabled_does_not_spawn() {
+        let config = heartbeat_config(false, 1, "HEARTBEAT.md");
+        let state = test_state_for_workspace(config.workspace_path.clone());
+        assert!(
+            maybe_spawn_heartbeat(state, &config, None).is_none(),
+            "enabled=false 不得启动心跳任务"
+        );
+        let _ = std::fs::remove_dir_all(&config.workspace_path);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_empty_file_skips_without_session() {
+        let ws = unique_workspace("jiaclaw-hb-empty");
+        std::fs::write(ws.join("HEARTBEAT.md"), "  \n").unwrap();
+        let state = test_state_for_workspace(ws.clone());
+        let outcome = run_heartbeat_tick(&state, &ws, "HEARTBEAT.md", "heartbeat").await;
+        assert_eq!(outcome, HeartbeatTickOutcome::SkippedEmptyOrMissing);
+        assert!(
+            state.sessions.lock().unwrap().is_empty(),
+            "空文件跳过时不应写入 session"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_missing_file_skips_without_session() {
+        let ws = unique_workspace("jiaclaw-hb-missing");
+        let state = test_state_for_workspace(ws.clone());
+        let outcome = run_heartbeat_tick(&state, &ws, "HEARTBEAT.md", "heartbeat").await;
+        assert_eq!(outcome, HeartbeatTickOutcome::SkippedEmptyOrMissing);
+        assert!(state.sessions.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_short_interval_fires_at_least_once() {
+        let ws = unique_workspace("jiaclaw-hb-fire");
+        std::fs::write(ws.join("HEARTBEAT.md"), "periodic self-check: stretch").unwrap();
+        let config = AgentConfig {
+            workspace_path: ws.clone(),
+            heartbeat: HeartbeatConfig {
+                enabled: true,
+                interval_secs: 1,
+                path: "HEARTBEAT.md".to_string(),
+                session_id: "heartbeat".to_string(),
+            },
+            ..AgentConfig::default()
+        };
+
+        let state = test_state_for_workspace(ws.clone());
+        let latch = CountdownLatch::new(1);
+        let latch_hook = latch.clone();
+        let handle = maybe_spawn_heartbeat(
+            state.clone(),
+            &config,
+            Some(Arc::new(move || latch_hook.count_down())),
+        )
+        .expect("enabled=true 应启动心跳任务");
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        latch.wait().await;
+
+        let sessions = state.sessions.lock().unwrap();
+        let rec = sessions.get("heartbeat").expect("心跳应写入固定 session");
+        assert!(rec
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content.contains("periodic self-check")));
+        assert!(rec
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant));
+        drop(sessions);
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_tick_writes_user_and_assistant_to_session() {
+        let ws = unique_workspace("jiaclaw-hb-once");
+        std::fs::write(ws.join("HEARTBEAT.md"), "remind me to drink water").unwrap();
+        let state = test_state_for_workspace(ws.clone());
+        let outcome = run_heartbeat_tick(&state, &ws, "HEARTBEAT.md", "heartbeat").await;
+        match outcome {
+            HeartbeatTickOutcome::Completed { user_chars, .. } => {
+                assert!(user_chars > 0);
+            }
+            other => panic!("expected completed tick, got {other:?}"),
+        }
+        let sessions = state.sessions.lock().unwrap();
+        let rec = sessions.get("heartbeat").expect("session");
+        assert_eq!(rec.messages[0].role, MessageRole::User);
+        assert!(rec.messages[0].content.contains("drink water"));
+        assert!(rec
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant));
+        drop(sessions);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[tokio::test]

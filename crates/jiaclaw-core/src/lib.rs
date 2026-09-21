@@ -166,6 +166,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub identity: IdentityConfig,
 
+    /// 工作区心跳配置（缺省关闭；约定文件 `{workspace}/HEARTBEAT.md`）
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
+
     /// 单次工具调用超时（秒，可选，环境变量 `JIACLAW_TOOL_TIMEOUT_SECS` 优先）
     ///
     /// `None` 或非正整数表示不限制，保持现有行为。
@@ -188,6 +192,15 @@ pub const DEFAULT_SOUL_PATH: &str = "SOUL.md";
 
 /// 默认用户画像文件名（相对于 `workspace_path`）
 pub const DEFAULT_USER_PATH: &str = "USER.md";
+
+/// 默认心跳文件名（相对于 `workspace_path`）
+pub const DEFAULT_HEARTBEAT_PATH: &str = "HEARTBEAT.md";
+
+/// 默认心跳会话 ID（固定会话，便于追踪）
+pub const DEFAULT_HEARTBEAT_SESSION_ID: &str = "heartbeat";
+
+/// 默认心跳间隔（秒）
+pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 3600;
 
 /// 注入系统提示时的最大字节数（32 KiB）；MEMORY / SOUL / USER 各自独立截断
 pub const MEMORY_PROMPT_MAX_BYTES: usize = 32 * 1024;
@@ -238,6 +251,102 @@ impl Default for IdentityConfig {
             soul_path: default_soul_path(),
             user_path: default_user_path(),
         }
+    }
+}
+
+fn default_heartbeat_path() -> String {
+    DEFAULT_HEARTBEAT_PATH.to_string()
+}
+
+fn default_heartbeat_session_id() -> String {
+    DEFAULT_HEARTBEAT_SESSION_ID.to_string()
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    DEFAULT_HEARTBEAT_INTERVAL_SECS
+}
+
+/// 工作区心跳配置（仅 `jiaclaw serve` 进程内生效；默认关闭）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatConfig {
+    /// 是否启用定时心跳（默认 `false`）
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 心跳间隔（秒，默认 3600）；环境变量 `JIACLAW_HEARTBEAT_INTERVAL_SECS` 可覆盖（正整数）
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub interval_secs: u64,
+
+    /// 心跳文件路径（相对于 `workspace_path`，默认 `HEARTBEAT.md`）
+    #[serde(default = "default_heartbeat_path")]
+    pub path: String,
+
+    /// 固定会话 ID（默认 `heartbeat`），便于追踪
+    #[serde(default = "default_heartbeat_session_id")]
+    pub session_id: String,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_heartbeat_interval_secs(),
+            path: default_heartbeat_path(),
+            session_id: default_heartbeat_session_id(),
+        }
+    }
+}
+
+impl HeartbeatConfig {
+    /// 解析生效的心跳间隔（秒）。
+    ///
+    /// 环境变量 `JIACLAW_HEARTBEAT_INTERVAL_SECS` 优先于配置文件；仅正整数生效。
+    /// 未设置、`0` 或无法解析时回退到配置值；配置值非正则使用默认 3600。
+    #[must_use]
+    pub fn effective_interval_secs(&self) -> u64 {
+        resolve_heartbeat_interval_secs(
+            self.interval_secs,
+            std::env::var("JIACLAW_HEARTBEAT_INTERVAL_SECS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// 生效的固定会话 ID；空白时回退到 [`DEFAULT_HEARTBEAT_SESSION_ID`]。
+    #[must_use]
+    pub fn effective_session_id(&self) -> &str {
+        let trimmed = self.session_id.trim();
+        if trimmed.is_empty() {
+            DEFAULT_HEARTBEAT_SESSION_ID
+        } else {
+            trimmed
+        }
+    }
+}
+
+/// 解析正整数心跳间隔（秒）；`0` 或无法解析时返回 `None`。
+#[must_use]
+pub fn parse_positive_heartbeat_interval(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+/// 根据配置文件值与可选环境变量解析心跳间隔（秒）。
+///
+/// 环境变量优先（仅正整数）；否则使用正整数配置值；再否则默认 3600。
+#[must_use]
+pub fn resolve_heartbeat_interval_secs(configured: u64, env_value: Option<&str>) -> u64 {
+    match env_value {
+        Some(raw) => parse_positive_heartbeat_interval(raw)
+            .unwrap_or_else(|| fallback_heartbeat_interval(configured)),
+        None => fallback_heartbeat_interval(configured),
+    }
+}
+
+fn fallback_heartbeat_interval(configured: u64) -> u64 {
+    if configured > 0 {
+        configured
+    } else {
+        DEFAULT_HEARTBEAT_INTERVAL_SECS
     }
 }
 
@@ -506,6 +615,7 @@ impl Default for AgentConfig {
             http: HttpConfig::default(),
             memory: MemoryConfig::default(),
             identity: IdentityConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
             tool_timeout_secs: None,
         }
     }
@@ -552,12 +662,14 @@ impl AgentConfig {
             memory: Option<MemoryConfig>,
             #[serde(default)]
             identity: Option<IdentityConfig>,
+            #[serde(default)]
+            heartbeat: Option<HeartbeatConfig>,
         }
 
         let mut config_file: ConfigFile = toml::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 TOML 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory / identity 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity / heartbeat 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -569,6 +681,9 @@ impl AgentConfig {
         }
         if let Some(identity) = config_file.identity {
             config_file.agent.identity = identity;
+        }
+        if let Some(heartbeat) = config_file.heartbeat {
+            config_file.agent.heartbeat = heartbeat;
         }
 
         Ok(config_file.agent)
@@ -602,12 +717,14 @@ impl AgentConfig {
             memory: Option<MemoryConfig>,
             #[serde(default)]
             identity: Option<IdentityConfig>,
+            #[serde(default)]
+            heartbeat: Option<HeartbeatConfig>,
         }
 
         let mut config_file: ConfigFile = serde_json::from_str(content)
             .map_err(|e| JiaClawError::Configuration(format!("无法解析 JSON 配置: {e}")))?;
 
-        // 如果顶层有 provider / http / memory / identity 配置，覆盖 agent 中的配置
+        // 如果顶层有 provider / http / memory / identity / heartbeat 配置，覆盖 agent 中的配置
         if let Some(provider) = config_file.provider {
             config_file.agent.provider = provider;
         }
@@ -620,6 +737,9 @@ impl AgentConfig {
         if let Some(identity) = config_file.identity {
             config_file.agent.identity = identity;
         }
+        if let Some(heartbeat) = config_file.heartbeat {
+            config_file.agent.heartbeat = heartbeat;
+        }
 
         Ok(config_file.agent)
     }
@@ -628,10 +748,12 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_positive_rate_limit, parse_positive_session_ttl, parse_positive_tool_timeout,
-        resolve_optional_secret, resolve_rate_limit_per_minute, resolve_session_ttl_secs,
-        resolve_tool_timeout_secs, AgentConfig, HttpConfig, DEFAULT_MEMORY_PATH, DEFAULT_SOUL_PATH,
-        DEFAULT_USER_PATH,
+        parse_positive_heartbeat_interval, parse_positive_rate_limit, parse_positive_session_ttl,
+        parse_positive_tool_timeout, resolve_heartbeat_interval_secs, resolve_optional_secret,
+        resolve_rate_limit_per_minute, resolve_session_ttl_secs, resolve_tool_timeout_secs,
+        AgentConfig, HeartbeatConfig, HttpConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS,
+        DEFAULT_HEARTBEAT_PATH, DEFAULT_HEARTBEAT_SESSION_ID, DEFAULT_MEMORY_PATH,
+        DEFAULT_SOUL_PATH, DEFAULT_USER_PATH,
     };
 
     #[test]
@@ -867,6 +989,13 @@ tool_timeout_secs = 30
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
         assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
         assert_eq!(config.identity.user_path, DEFAULT_USER_PATH);
+        assert_eq!(config.heartbeat.path, DEFAULT_HEARTBEAT_PATH);
+        assert!(!config.heartbeat.enabled);
+        assert_eq!(
+            config.heartbeat.interval_secs,
+            DEFAULT_HEARTBEAT_INTERVAL_SECS
+        );
+        assert_eq!(config.heartbeat.session_id, DEFAULT_HEARTBEAT_SESSION_ID);
         assert_eq!(config.tool_timeout_secs, None);
     }
 
@@ -883,6 +1012,13 @@ max_turns = 10
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
         assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
         assert_eq!(config.identity.user_path, DEFAULT_USER_PATH);
+        assert!(!config.heartbeat.enabled);
+        assert_eq!(config.heartbeat.path, DEFAULT_HEARTBEAT_PATH);
+        assert_eq!(
+            config.heartbeat.interval_secs,
+            DEFAULT_HEARTBEAT_INTERVAL_SECS
+        );
+        assert_eq!(config.heartbeat.session_id, DEFAULT_HEARTBEAT_SESSION_ID);
     }
 
     #[test]
@@ -968,5 +1104,100 @@ user_path = "persona/USER.md"
         assert_eq!(config.identity.soul_path, "soul.md");
         assert_eq!(config.identity.user_path, "user.md");
         assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
+        assert!(!config.heartbeat.enabled);
+        assert_eq!(config.heartbeat.path, DEFAULT_HEARTBEAT_PATH);
+    }
+
+    #[test]
+    fn heartbeat_config_defaults_are_disabled() {
+        let cfg = HeartbeatConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.interval_secs, DEFAULT_HEARTBEAT_INTERVAL_SECS);
+        assert_eq!(cfg.path, DEFAULT_HEARTBEAT_PATH);
+        assert_eq!(cfg.session_id, DEFAULT_HEARTBEAT_SESSION_ID);
+        assert_eq!(cfg.effective_session_id(), DEFAULT_HEARTBEAT_SESSION_ID);
+    }
+
+    #[test]
+    fn parse_positive_heartbeat_interval_accepts_only_positive_integers() {
+        assert_eq!(parse_positive_heartbeat_interval("3600"), Some(3600));
+        assert_eq!(parse_positive_heartbeat_interval(" 1 "), Some(1));
+        assert_eq!(parse_positive_heartbeat_interval("0"), None);
+        assert_eq!(parse_positive_heartbeat_interval(""), None);
+        assert_eq!(parse_positive_heartbeat_interval("abc"), None);
+        assert_eq!(parse_positive_heartbeat_interval("-1"), None);
+    }
+
+    #[test]
+    fn resolve_heartbeat_interval_env_overrides_config() {
+        assert_eq!(resolve_heartbeat_interval_secs(30, Some("120")), 120);
+        assert_eq!(resolve_heartbeat_interval_secs(30, Some("0")), 30);
+        assert_eq!(resolve_heartbeat_interval_secs(30, Some("nope")), 30);
+        assert_eq!(resolve_heartbeat_interval_secs(30, None), 30);
+        assert_eq!(
+            resolve_heartbeat_interval_secs(0, None),
+            DEFAULT_HEARTBEAT_INTERVAL_SECS
+        );
+        assert_eq!(
+            resolve_heartbeat_interval_secs(0, Some("abc")),
+            DEFAULT_HEARTBEAT_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn heartbeat_config_parses_top_level_section() {
+        let toml = r#"
+[agent]
+name = "JiaClaw"
+description = "test"
+system_instructions = "be helpful"
+max_turns = 10
+
+[heartbeat]
+enabled = true
+interval_secs = 15
+path = "ops/HEARTBEAT.md"
+session_id = "nightly"
+"#;
+        let config = AgentConfig::from_toml_str(toml).expect("parse toml");
+        assert!(config.heartbeat.enabled);
+        assert_eq!(config.heartbeat.interval_secs, 15);
+        assert_eq!(config.heartbeat.path, "ops/HEARTBEAT.md");
+        assert_eq!(config.heartbeat.session_id, "nightly");
+        assert_eq!(config.heartbeat.effective_session_id(), "nightly");
+        assert_eq!(config.memory.path, DEFAULT_MEMORY_PATH);
+    }
+
+    #[test]
+    fn heartbeat_config_parses_from_json() {
+        let json = r#"{
+            "agent": {
+                "name": "JiaClaw",
+                "description": "test",
+                "system_instructions": "be helpful",
+                "max_turns": 10
+            },
+            "heartbeat": {
+                "enabled": true,
+                "interval_secs": 90,
+                "path": "pulse.md",
+                "session_id": "pulse"
+            }
+        }"#;
+        let config = AgentConfig::from_json_str(json).expect("parse json");
+        assert!(config.heartbeat.enabled);
+        assert_eq!(config.heartbeat.interval_secs, 90);
+        assert_eq!(config.heartbeat.path, "pulse.md");
+        assert_eq!(config.heartbeat.session_id, "pulse");
+        assert_eq!(config.identity.soul_path, DEFAULT_SOUL_PATH);
+    }
+
+    #[test]
+    fn heartbeat_blank_session_id_falls_back() {
+        let cfg = HeartbeatConfig {
+            session_id: "  ".to_string(),
+            ..HeartbeatConfig::default()
+        };
+        assert_eq!(cfg.effective_session_id(), DEFAULT_HEARTBEAT_SESSION_ID);
     }
 }
