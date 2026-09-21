@@ -89,6 +89,9 @@
       },
       "delete_file": {
         "enabled": true
+      },
+      "str_replace": {
+        "enabled": true
       }
     }
 }

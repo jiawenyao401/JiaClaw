@@ -1,7 +1,7 @@
 // Copyright 2026 JiaClaw contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file`。
+//! 工作区文件工具：`read_file` / `list_dir` / `write_file` / `delete_file` / `str_replace`。
 //!
 //! 路径解析复用 [`crate::memory::resolve_workspace_relative_path`]（禁 `..`、绝对路径、symlink 逃逸）。
 //! 不调用 LLM，不执行 shell。
@@ -24,6 +24,9 @@ pub const READ_FILE_MAX_BYTES: usize = 256 * 1024;
 
 /// `write_file` 结果文件上限（字节）。与 [`READ_FILE_MAX_BYTES`] 对齐。超过则报错且不落盘。
 pub const WRITE_FILE_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
+
+/// `str_replace` 读入与写出上限（字节）。与 [`READ_FILE_MAX_BYTES`] / [`WRITE_FILE_MAX_BYTES`] 对齐。
+pub const STR_REPLACE_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
 
 /// `list_dir` 的 `max_entries` 缺省值
 pub const LIST_DIR_DEFAULT_MAX_ENTRIES: usize = 200;
@@ -111,6 +114,19 @@ pub struct WriteFileArgs {
 pub struct DeleteFileArgs {
     /// 工作区相对路径
     pub path: String,
+}
+
+/// 解析后的 `str_replace` 参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrReplaceArgs {
+    /// 工作区相对路径
+    pub path: String,
+    /// 要查找的精确子串（非空）
+    pub old_str: String,
+    /// 替换后的文本（可为空，表示删除匹配）
+    pub new_str: String,
+    /// 是否替换全部匹配（默认 `false`：必须恰好 1 次）
+    pub replace_all: bool,
 }
 
 /// 将 `max_entries` 钳制到 `1..=1000`。
@@ -289,6 +305,72 @@ pub fn parse_delete_file_args(args: &Value) -> Result<DeleteFileArgs, JiaClawErr
 
     Ok(DeleteFileArgs {
         path: path.to_string(),
+    })
+}
+
+/// 解析 `str_replace` 参数：必填 `path` / `old_str` / `new_str`；可选 `replace_all`（默认 `false`）。
+///
+/// # Errors
+///
+/// `path` 缺失/空白、`old_str` 缺失或为空、`new_str` 缺失或不是字符串、或 `replace_all` 不是布尔值时返回错误。
+pub fn parse_str_replace_args(args: &Value) -> Result<StrReplaceArgs, JiaClawError> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            JiaClawError::ToolExecution("缺少参数 'path'（工作区相对路径）".to_string())
+        })?;
+
+    let old_str = match args.get("old_str") {
+        Some(Value::String(text)) if !text.is_empty() => text.clone(),
+        Some(Value::String(_)) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'old_str' 不能为空".to_string(),
+            ));
+        }
+        None | Some(Value::Null) => {
+            return Err(JiaClawError::ToolExecution(
+                "缺少参数 'old_str'".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'old_str' 必须是字符串".to_string(),
+            ));
+        }
+    };
+
+    let new_str = match args.get("new_str") {
+        Some(Value::String(text)) => text.clone(),
+        None | Some(Value::Null) => {
+            return Err(JiaClawError::ToolExecution(
+                "缺少参数 'new_str'".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'new_str' 必须是字符串".to_string(),
+            ));
+        }
+    };
+
+    let replace_all = match args.get("replace_all") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => {
+            return Err(JiaClawError::ToolExecution(
+                "参数 'replace_all' 必须是布尔值（默认 false）".to_string(),
+            ));
+        }
+    };
+
+    Ok(StrReplaceArgs {
+        path: path.to_string(),
+        old_str,
+        new_str,
+        replace_all,
     })
 }
 
@@ -525,6 +607,102 @@ pub fn delete_workspace_regular_file(
         path: rel_path.to_string(),
         deleted: true,
         size_bytes,
+    })
+}
+
+/// 在工作区相对路径的常规文本文件内做精确字符串替换。
+///
+/// `replace_all = false`（默认）时 `old_str` 必须恰好出现 1 次；`true` 时替换全部非重叠匹配。
+/// 0 次匹配始终报错。读入或写出超过 `max_bytes` 时报错且不落盘。
+///
+/// # Errors
+///
+/// 路径非法、越出工作空间、symlink 逃逸、不是常规文本文件、二进制、匹配次数不符合、超过大小上限，或 IO 失败时返回错误。
+pub fn str_replace_workspace_file(
+    workspace: &Path,
+    rel_path: &str,
+    old_str: &str,
+    new_str: &str,
+    replace_all: bool,
+    max_bytes: usize,
+) -> Result<StrReplaceOutput, JiaClawError> {
+    if old_str.is_empty() {
+        return Err(JiaClawError::ToolExecution(
+            "参数 'old_str' 不能为空".to_string(),
+        ));
+    }
+
+    let path = resolve_workspace_relative_path(workspace, rel_path)?;
+    if !path.exists() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "文件不存在: {rel_path}"
+        )));
+    }
+    ensure_existing_within_workspace(workspace, &path)?;
+
+    let canon = path
+        .canonicalize()
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法解析文件 {rel_path}: {e}")))?;
+    if !canon.is_file() {
+        return Err(JiaClawError::ToolExecution(format!(
+            "路径不是文件: {rel_path}"
+        )));
+    }
+
+    let size_bytes = fs::metadata(&canon)
+        .map(|m| m.len())
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法读取文件元数据 {rel_path}: {e}")))?;
+    let limit_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if size_bytes > limit_bytes {
+        return Err(JiaClawError::ToolExecution(format!(
+            "文件超过上限 {max_bytes} 字节（实际 {size_bytes} 字节）: {rel_path}"
+        )));
+    }
+
+    let bytes = fs::read(&canon)
+        .map_err(|e| JiaClawError::ToolExecution(format!("无法读取文件 {rel_path}: {e}")))?;
+    let content = match String::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => text,
+        _ => {
+            return Err(JiaClawError::ToolExecution(format!(
+                "二进制文件，拒绝替换: {rel_path}（检测到 NUL 或非 UTF-8）"
+            )));
+        }
+    };
+
+    let match_count = content.matches(old_str).count();
+    if match_count == 0 {
+        return Err(JiaClawError::ToolExecution(format!(
+            "old_str 在文件中未找到（匹配 0 次）: {rel_path}"
+        )));
+    }
+    if !replace_all && match_count != 1 {
+        return Err(JiaClawError::ToolExecution(format!(
+            "old_str 在文件中匹配 {match_count} 次，默认必须恰好 1 次（或设置 replace_all=true）: {rel_path}"
+        )));
+    }
+
+    let replacements = if replace_all { match_count } else { 1 };
+    let updated = if replace_all {
+        content.replace(old_str, new_str)
+    } else {
+        content.replacen(old_str, new_str, 1)
+    };
+
+    if updated.len() > max_bytes {
+        return Err(JiaClawError::ToolExecution(format!(
+            "文件超过上限 {max_bytes} 字节（将写入 {} 字节）: {rel_path}",
+            updated.len()
+        )));
+    }
+
+    atomic_write_regular_file(workspace, &canon, rel_path, updated.as_bytes())?;
+
+    Ok(StrReplaceOutput {
+        path: rel_path.to_string(),
+        replacements,
+        replace_all,
+        bytes_written: updated.len(),
     })
 }
 
@@ -775,6 +953,19 @@ pub struct DeleteFileOutput {
     pub deleted: bool,
     /// 删除前的文件字节数
     pub size_bytes: u64,
+}
+
+/// `str_replace` 的 JSON 返回体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrReplaceOutput {
+    /// 调用方传入的工作区相对路径
+    pub path: String,
+    /// 实际替换次数
+    pub replacements: usize,
+    /// 是否按 `replace_all` 替换全部匹配
+    pub replace_all: bool,
+    /// 结果文件字节数
+    pub bytes_written: usize,
 }
 
 /// `read_file` 工具：读取工作区相对路径下的文本文件（路径沙箱，不调用 LLM）。
@@ -1030,6 +1221,83 @@ impl Tool for WorkspaceDeleteFileTool {
         let output = delete_workspace_regular_file(&self.workspace_path, &parsed.path)?;
         serde_json::to_string_pretty(&output)
             .map_err(|e| JiaClawError::ToolExecution(format!("序列化删除结果失败: {e}")))
+    }
+}
+
+/// `str_replace` 工具：在工作区相对路径的常规文本文件内做精确字符串替换（路径沙箱，不调用 LLM）。
+pub struct WorkspaceStrReplaceTool {
+    workspace_path: PathBuf,
+    max_bytes: usize,
+}
+
+impl WorkspaceStrReplaceTool {
+    /// 创建工具；读入/写出上限为 [`STR_REPLACE_MAX_BYTES`]（与 read/write 对齐，256KiB）。
+    #[must_use]
+    pub fn new(workspace_path: &Path) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+            max_bytes: STR_REPLACE_MAX_BYTES,
+        }
+    }
+
+    /// 测试或自定义上限。
+    #[must_use]
+    pub fn with_max_bytes(workspace_path: &Path, max_bytes: usize) -> Self {
+        Self {
+            workspace_path: canonicalize_existing_or_clone(workspace_path),
+            max_bytes,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WorkspaceStrReplaceTool {
+    fn name(&self) -> &str {
+        "str_replace"
+    }
+
+    fn description(&self) -> &str {
+        "在工作区相对路径的常规文本文件内做精确字符串替换。path / old_str / new_str 必填；可选 replace_all（默认 false：必须恰好匹配 1 次，否则报错）。禁止 .. / 绝对路径 / symlink 逃逸。只操作常规文本文件；拒绝二进制。读入或写出超过 256KiB 则报错且不落盘。tmp + rename 原子写。返回 {path, replacements, replace_all, bytes_written}。不执行 shell，不调用 LLM。"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "文件相对路径（相对于工作区根目录）"
+                },
+                "old_str": {
+                    "type": "string",
+                    "description": "要查找的精确子串（必填，非空）"
+                },
+                "new_str": {
+                    "type": "string",
+                    "description": "替换后的文本（必填，可为空表示删除匹配）"
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "是否替换全部非重叠匹配（默认 false：必须恰好 1 次）",
+                    "default": false
+                }
+            },
+            "required": ["path", "old_str", "new_str"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, JiaClawError> {
+        let parsed = parse_str_replace_args(&args)?;
+        let output = str_replace_workspace_file(
+            &self.workspace_path,
+            &parsed.path,
+            &parsed.old_str,
+            &parsed.new_str,
+            parsed.replace_all,
+            self.max_bytes,
+        )?;
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| JiaClawError::ToolExecution(format!("序列化替换结果失败: {e}")))
     }
 }
 
@@ -1591,6 +1859,271 @@ mod tests {
         assert!(result.is_err(), "缺文件不得静默成功: {result:?}");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("不存在"), "{err}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn parse_str_replace_args_requires_path_old_and_new() {
+        let err = parse_str_replace_args(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path"), "{err}");
+
+        let err = parse_str_replace_args(&serde_json::json!({"path": "a.md"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("old_str"), "{err}");
+
+        let err = parse_str_replace_args(&serde_json::json!({
+            "path": "a.md",
+            "old_str": "foo"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("new_str"), "{err}");
+
+        let err = parse_str_replace_args(&serde_json::json!({
+            "path": "a.md",
+            "old_str": "",
+            "new_str": "bar"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("old_str"), "{err}");
+
+        let parsed = parse_str_replace_args(&serde_json::json!({
+            "path": " notes/a.md ",
+            "old_str": "foo",
+            "new_str": "bar"
+        }))
+        .unwrap();
+        assert_eq!(parsed.path, "notes/a.md");
+        assert_eq!(parsed.old_str, "foo");
+        assert_eq!(parsed.new_str, "bar");
+        assert!(!parsed.replace_all);
+
+        let parsed = parse_str_replace_args(&serde_json::json!({
+            "path": "a.md",
+            "old_str": "foo",
+            "new_str": "",
+            "replace_all": true
+        }))
+        .unwrap();
+        assert_eq!(parsed.new_str, "");
+        assert!(parsed.replace_all);
+
+        let err = parse_str_replace_args(&serde_json::json!({
+            "path": "a.md",
+            "old_str": "foo",
+            "new_str": "bar",
+            "replace_all": "yes"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("replace_all"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn str_replace_single_occurrence() {
+        let ws = unique_temp("jiaclaw_str_replace_once");
+        fs::write(ws.join("notes.md"), "alpha beta gamma").unwrap();
+        let tool = WorkspaceStrReplaceTool::new(&ws);
+        assert_eq!(tool.name(), "str_replace");
+
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "notes.md",
+                "old_str": "beta",
+                "new_str": "BETA"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("notes.md"), "{result}");
+        assert!(result.contains("\"replacements\": 1"), "{result}");
+        assert!(result.contains("\"replace_all\": false"), "{result}");
+        assert_eq!(
+            fs::read_to_string(ws.join("notes.md")).unwrap(),
+            "alpha BETA gamma"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn str_replace_all_occurrences() {
+        let ws = unique_temp("jiaclaw_str_replace_all");
+        fs::write(ws.join("notes.md"), "foo bar foo baz foo").unwrap();
+        let tool = WorkspaceStrReplaceTool::new(&ws);
+
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "notes.md",
+                "old_str": "foo",
+                "new_str": "qux",
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("\"replacements\": 3"), "{result}");
+        assert!(result.contains("\"replace_all\": true"), "{result}");
+        assert_eq!(
+            fs::read_to_string(ws.join("notes.md")).unwrap(),
+            "qux bar qux baz qux"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn str_replace_zero_or_multiple_matches_fail_without_writing() {
+        let ws = unique_temp("jiaclaw_str_replace_count");
+        fs::write(ws.join("notes.md"), "one two two three").unwrap();
+        let tool = WorkspaceStrReplaceTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "notes.md",
+                "old_str": "missing",
+                "new_str": "x"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0 次") || err.contains("未找到"), "{err}");
+        assert_eq!(
+            fs::read_to_string(ws.join("notes.md")).unwrap(),
+            "one two two three"
+        );
+
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "notes.md",
+                "old_str": "two",
+                "new_str": "TWO"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 次") || err.contains("恰好 1 次"), "{err}");
+        assert_eq!(
+            fs::read_to_string(ws.join("notes.md")).unwrap(),
+            "one two two three"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn str_replace_rejects_traversal_and_absolute() {
+        let ws = unique_temp("jiaclaw_str_replace_trav");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_str_replace_secret_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "keep-me").unwrap();
+        fs::write(ws.join("ok.md"), "inside").unwrap();
+        let tool = WorkspaceStrReplaceTool::new(&ws);
+
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "../secret.md",
+                "old_str": "keep",
+                "new_str": "pwned"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("穿越") || err.contains("安全"), "{err}");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep-me");
+
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "/etc/passwd",
+                "old_str": "root",
+                "new_str": "pwned"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn str_replace_rejects_symlink_escape() {
+        let ws = unique_temp("jiaclaw_str_replace_symlink");
+        let outside = ws.parent().unwrap().join(format!(
+            "jiaclaw_str_replace_outside_{}",
+            ws.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret-outside").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("leak.md")).unwrap();
+
+        let tool = WorkspaceStrReplaceTool::new(&ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "leak.md",
+                "old_str": "secret",
+                "new_str": "pwned"
+            }))
+            .await;
+        assert!(result.is_err(), "symlink 逃逸应被拒绝: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("安全") || err.contains("工作空间"), "{err}");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret-outside");
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn str_replace_rejects_oversize_read_and_write_without_writing() {
+        let ws = unique_temp("jiaclaw_str_replace_limits");
+        let tool = WorkspaceStrReplaceTool::with_max_bytes(&ws, 8);
+        fs::write(ws.join("big.md"), "abcdefghijk").unwrap();
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "big.md",
+                "old_str": "abc",
+                "new_str": "xyz"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("超过上限"), "{err}");
+        assert_eq!(
+            fs::read_to_string(ws.join("big.md")).unwrap(),
+            "abcdefghijk"
+        );
+
+        fs::write(ws.join("keep.md"), "ab").unwrap();
+        let err = tool
+            .execute(serde_json::json!({
+                "path": "keep.md",
+                "old_str": "ab",
+                "new_str": "abcdefghijk"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("超过上限"), "{err}");
+        assert_eq!(fs::read_to_string(ws.join("keep.md")).unwrap(), "ab");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn str_replace_rejects_binary() {
+        let ws = unique_temp("jiaclaw_str_replace_bin");
+        fs::write(ws.join("bin.dat"), [0_u8, 1, 2, 3, 255]).unwrap();
+        let err = WorkspaceStrReplaceTool::new(&ws)
+            .execute(serde_json::json!({
+                "path": "bin.dat",
+                "old_str": "\u{0}",
+                "new_str": "x"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("二进制"), "{err}");
         let _ = fs::remove_dir_all(&ws);
     }
 }
