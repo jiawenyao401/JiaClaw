@@ -8905,6 +8905,7 @@ mod tests {
         let paths = spec["paths"].as_object().expect("应包含 paths");
         for required in [
             "/health",
+            "/metrics",
             "/api/chat",
             "/api/sessions",
             "/api/sessions/{id}",

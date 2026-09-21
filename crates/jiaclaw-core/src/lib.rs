@@ -463,8 +463,7 @@ pub fn parse_metrics_require_auth(raw: &str) -> Option<bool> {
 pub fn resolve_metrics_public(configured_public: bool, env_require_auth: Option<&str>) -> bool {
     match env_require_auth {
         Some(raw) => parse_metrics_require_auth(raw)
-            .map(|require_auth| !require_auth)
-            .unwrap_or(configured_public),
+            .map_or(configured_public, |require_auth| !require_auth),
         None => configured_public,
     }
 }
