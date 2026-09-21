@@ -3436,11 +3436,11 @@ mod tests {
             ]
         );
 
-        let toml = tool
+        let nested_toml = tool
             .execute(serde_json::json!({"pattern": "src/**/*.toml"}))
             .await
             .unwrap();
-        let parsed: GlobOutput = serde_json::from_str(&toml).unwrap();
+        let parsed: GlobOutput = serde_json::from_str(&nested_toml).unwrap();
         assert_eq!(parsed.match_count, 0);
 
         let by_name = tool
