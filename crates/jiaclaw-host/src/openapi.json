@@ -3,7 +3,7 @@
   "info": {
     "title": "JiaClaw HTTP API",
     "version": "0.1.0",
-    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。"
+    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。"
   },
   "servers": [
     {
@@ -76,7 +76,7 @@
         "tags": ["chat"],
         "summary": "列出会话",
         "operationId": "listSessions",
-        "description": "返回内存中当前会话摘要（id 与 message_count）。落盘开启时也以内存 store 为准，与 chat/delete 一致。",
+        "description": "返回内存中当前未过期会话摘要（id 与 message_count）。启用 Session TTL 时会先清理过期项。落盘开启时也以内存 store 为准，与 chat/delete 一致。",
         "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
         "responses": {
           "200": {
@@ -121,7 +121,7 @@
         "tags": ["chat"],
         "summary": "读取会话历史",
         "operationId": "getSession",
-        "description": "返回内存中该会话的消息列表。不存在返回 404。落盘开启时也以内存 store 为准。",
+        "description": "返回内存中该会话的消息列表。不存在或已过期返回 404。落盘开启时也以内存 store 为准。",
         "security": [{ "bearerAuth": [] }, { "apiToken": [] }],
         "parameters": [
           {
@@ -333,7 +333,7 @@
         }
       },
       "NotFound": {
-        "description": "会话不存在。JSON `error` 为 `session_not_found`。",
+        "description": "会话不存在或已过期。JSON `error` 为 `session_not_found`。",
         "headers": {
           "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
         },

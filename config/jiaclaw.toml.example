@@ -69,6 +69,11 @@ persist_path = ".jiaclaw/sessions.json"
 # 超限返回 429 并带 Retry-After。
 # rate_limit_per_minute = 60
 
+# Session 闲置 TTL（可选，环境变量 JIACLAW_SESSION_TTL_SECS 优先）
+# 正整数：闲置超过该秒数后从内存 store 删除；落盘开启时同步 save
+# 未设置或 0：不启用。create/chat/get/list 触达会刷新 last_accessed。
+# session_ttl_secs = 3600
+
 [logging]
 # 日志级别: trace, debug, info, warn, error
 level = "info"

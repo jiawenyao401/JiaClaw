@@ -63,6 +63,9 @@ JiaClaw 目前处于早期脚手架阶段。StateKnot 本身也处于 pre-alpha 
 - ✅ **可选 HTTP 限流** - 进程内全局限流保护 `/api/*` 与 `/hooks/inbound`
   - 配置 `rate_limit_per_minute` 或环境变量 `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - 超限返回 429 + `Retry-After`；`GET /health` 始终不限流
+- ✅ **可选 Session TTL** - 闲置超时自动清理内存会话（长时间 `serve` 防堆积）
+  - 配置 `session_ttl_secs` 或环境变量 `JIACLAW_SESSION_TTL_SECS`（正整数才启用；`0`/非法=关闭）
+  - create/chat/get/list 触达刷新；过期后 list 不返回，GET/DELETE 与不存在一致（404）
 - ✅ **请求追踪** - 所有 HTTP 响应回写 `X-Request-Id`（请求未带则生成 UUID）
 - ✅ **OpenAPI 草图** - `GET /api/openapi.json`（鉴权与 `/api/tools` 一致）
 - ✅ **Session 查询 API** - `GET /api/sessions` 列表、`GET /api/sessions/:id` 读取历史（不存在 404）
@@ -143,6 +146,11 @@ persist_path = ".jiaclaw/sessions.json"
 # 未设置或 0：不限流。GET /health 始终不限流；超限返回 429 + Retry-After。
 # rate_limit_per_minute = 60
 
+# Session 闲置 TTL（可选，环境变量 JIACLAW_SESSION_TTL_SECS 优先）
+# 正整数：闲置超过该秒数后从内存 store 删除（落盘开启时同步 save）
+# 未设置或 0：不启用。create/chat/get/list 触达会刷新。
+# session_ttl_secs = 3600
+
 [memory]
 # 工作区长期记忆（相对于 workspace，默认 MEMORY.md；缺省本段即可）
 path = "MEMORY.md"
@@ -154,6 +162,8 @@ path = "MEMORY.md"
 export JIACLAW_API_KEY=brk_live_your_key_here
 # 可选：HTTP 限流（次/分钟，优先于配置文件）
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
+# 可选：Session 闲置 TTL（秒，优先于配置文件）
+# export JIACLAW_SESSION_TTL_SECS=3600
 ```
 
 ### 运行示例
@@ -278,6 +288,7 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - 无 API key 时自动回退到存根模式（演示功能）
 - StateKnot 持久化功能尚未集成
 - 可选 HTTP 限流：设置 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http] rate_limit_per_minute` 后，`/api/*` 与 `/hooks/inbound` 超限返回 `429` + `Retry-After`；`GET /health` 不限流
+- 可选 Session TTL：设置 `JIACLAW_SESSION_TTL_SECS` 或 `[http] session_ttl_secs`（正整数）后，闲置超时的会话会从 store 删除；`GET /api/sessions` 只返回未过期项，过期 id 的 GET 为 404
 - 请求追踪：所有响应回写 `X-Request-Id`；请求未携带时服务端生成 UUID。chat/webhook 日志带上该 ID
 - OpenAPI 草图：`GET /api/openapi.json`（鉴权与 `GET /api/tools` 一致）
 - Session 查询：`GET /api/sessions` 列出 `{id, message_count}`；`GET /api/sessions/:id` 返回消息；不存在 404。读接口反映内存当前状态（落盘开启时与 store 一致）
@@ -368,6 +379,9 @@ JiaClaw is currently in early scaffolding stage. StateKnot itself is also pre-al
 - ✅ **Optional HTTP rate limiting** - process-wide limit for `/api/*` and `/hooks/inbound`
   - Configure `rate_limit_per_minute` or `JIACLAW_RATE_LIMIT_PER_MINUTE`
   - Over-limit returns 429 + `Retry-After`; `GET /health` is never limited
+- ✅ **Optional Session TTL** - idle sessions are expired to avoid unbounded memory growth during long `serve`
+  - Configure `session_ttl_secs` or `JIACLAW_SESSION_TTL_SECS` (positive integer enables; `0`/invalid disables)
+  - create/chat/get/list refresh last access; expired ids are omitted from list and GET/DELETE match not-found (404)
 - ✅ **Request tracing** - every HTTP response writes `X-Request-Id` (generated UUID if missing)
 - ✅ **OpenAPI sketch** - `GET /api/openapi.json` (auth matches `/api/tools`)
 - ✅ **Session query API** - `GET /api/sessions` list, `GET /api/sessions/:id` history (404 if missing)
@@ -448,6 +462,11 @@ persist_path = ".jiaclaw/sessions.json"
 # Unset or 0: disabled. GET /health is never limited; over-limit returns 429 + Retry-After.
 # rate_limit_per_minute = 60
 
+# Optional session idle TTL (JIACLAW_SESSION_TTL_SECS env var takes priority)
+# Positive integer: expire idle sessions after this many seconds (saved to disk when persist is on)
+# Unset or 0: disabled. create/chat/get/list refresh last access.
+# session_ttl_secs = 3600
+
 [memory]
 # Workspace long-term memory (relative to workspace, default MEMORY.md)
 path = "MEMORY.md"
@@ -459,6 +478,8 @@ Or use environment variable:
 export JIACLAW_API_KEY=brk_live_your_key_here
 # Optional: HTTP rate limit (requests/minute, overrides config file)
 # export JIACLAW_RATE_LIMIT_PER_MINUTE=60
+# Optional: session idle TTL in seconds (overrides config file)
+# export JIACLAW_SESSION_TTL_SECS=3600
 ```
 
 #### Run Examples
@@ -571,6 +592,7 @@ curl -X POST http://127.0.0.1:8080/hooks/inbound \
 - Falls back to stub mode without API key (demo functionality)
 - StateKnot persistence features not yet integrated
 - Optional HTTP rate limiting: set `JIACLAW_RATE_LIMIT_PER_MINUTE` or `[http] rate_limit_per_minute`; `/api/*` and `/hooks/inbound` return `429` + `Retry-After` when exceeded; `GET /health` is never limited
+- Optional Session TTL: set `JIACLAW_SESSION_TTL_SECS` or `[http] session_ttl_secs` (positive integer); idle sessions are removed from the store; `GET /api/sessions` omits expired ids; GET of an expired id returns 404
 - Request tracing: every response writes `X-Request-Id`; a UUID is generated when the request omits it. chat/webhook logs include the id
 - OpenAPI sketch: `GET /api/openapi.json` (auth matches `GET /api/tools`)
 - Session query: `GET /api/sessions` lists `{id, message_count}`; `GET /api/sessions/:id` returns messages (404 if missing). Reads reflect in-memory state (same store when disk persistence is on)
