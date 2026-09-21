@@ -31,9 +31,12 @@ use jiaclaw::{
 };
 use jiaclaw_core::{
     parse_log_format, AgentConfig, ChatMessage, ChatRequest, ChatResponse, HttpCorsConfig,
-    LogFormat, LoggingConfig, MessageRole, ToolCall, DEFAULT_HTTP_MAX_BODY_BYTES,
-    DEFAULT_LOG_LEVEL, MAX_MAX_TOOL_ITERATIONS, MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
+    LogFormat, LoggingConfig, MessageRole, ToolCall, DEFAULT_LOG_LEVEL, MAX_MAX_TOOL_ITERATIONS,
+    MAX_SESSION_MESSAGES, MIN_MAX_TOOL_ITERATIONS,
 };
+
+#[cfg(test)]
+use jiaclaw_core::DEFAULT_HTTP_MAX_BODY_BYTES;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
@@ -1711,6 +1714,7 @@ fn build_router(state: AppState) -> Router {
     build_router_with_cors(state, None)
 }
 
+#[cfg(test)]
 fn build_router_with_cors(state: AppState, cors: Option<CorsLayer>) -> Router {
     build_router_with_body_limit(state, cors, DEFAULT_HTTP_MAX_BODY_BYTES)
 }
