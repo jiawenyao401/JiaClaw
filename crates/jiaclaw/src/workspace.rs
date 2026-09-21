@@ -217,7 +217,7 @@ Add any relevant background information that helps JiaClaw understand your needs
     fn default_memory_content() -> &'static str {
         r"# Long-term Memory / 长期记忆
 
-此文件在每次对话开始时注入系统提示（内容原样）。可手动编辑，或让 Agent 调用 `memory_append` 追加跨会话稳定事实。
+此文件在每次对话开始时注入系统提示（内容原样）。可手动编辑，或让 Agent 调用 `memory_append` 追加跨会话稳定事实。文件变长后可用 `memory_search` 按关键词检索片段。
 
 - 只记录可复用的事实（偏好、约定、长期项目），不要写临时任务状态。
 - 默认路径：`{workspace}/MEMORY.md`（可通过配置 `[memory] path` 覆盖）。
