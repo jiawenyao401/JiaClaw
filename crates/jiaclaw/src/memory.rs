@@ -365,7 +365,11 @@ pub(crate) fn ensure_existing_within_workspace(
     Ok(())
 }
 
-fn atomic_write(path: &Path, contents: &str) -> Result<(), JiaClawError> {
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), JiaClawError> {
+    atomic_write_bytes(path, contents.as_bytes())
+}
+
+pub(crate) fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<(), JiaClawError> {
     let parent = path.parent().ok_or_else(|| {
         JiaClawError::ToolExecution(format!("无效的文件路径: {}", path.display()))
     })?;
