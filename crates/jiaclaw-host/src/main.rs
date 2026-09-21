@@ -25,8 +25,8 @@ use governor::{
 };
 use hmac::{Hmac, Mac};
 use jiaclaw::{
-    inspect_heartbeat_file, inspect_identity_file, inspect_memory_file, load_heartbeat_message,
-    resolve_heartbeat_path, JiaClawAgent, Workspace,
+    compact_imported_session_messages, inspect_heartbeat_file, inspect_identity_file,
+    inspect_memory_file, load_heartbeat_message, resolve_heartbeat_path, JiaClawAgent, Workspace,
 };
 use jiaclaw_core::{
     AgentConfig, ChatMessage, ChatRequest, ChatResponse, MessageRole, ToolCall,
@@ -228,7 +228,7 @@ enum Commands {
         action: IdentityFileCommands,
     },
 
-    /// 会话（只读导出；不触发摘要、不改写 store）
+    /// 会话（导出 JSONL；导入 JSONL/JSON，不调用 LLM）
     Session {
         #[command(subcommand)]
         action: SessionCommands,
@@ -246,6 +246,24 @@ enum SessionCommands {
         /// 输出文件（省略则写 stdout）
         #[arg(short = 'o', long = "output", value_name = "FILE")]
         output: Option<PathBuf>,
+
+        /// 配置文件路径
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
+
+    /// 从 JSONL 或 `{id?, messages}` JSON 文件导入会话（不调用 LLM）
+    Import {
+        /// 输入文件
+        file: PathBuf,
+
+        /// 会话 ID（省略则用文件内 id 或新建 UUID）
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+
+        /// 若会话已存在则替换消息
+        #[arg(long)]
+        overwrite: bool,
 
         /// 配置文件路径
         #[arg(short, long, value_name = "FILE")]
@@ -330,6 +348,14 @@ async fn main() -> Result<()> {
         Commands::Session { action } => match action {
             SessionCommands::Export { id, output, config } => {
                 session_export_command(config, &id, output.as_deref())?;
+            }
+            SessionCommands::Import {
+                file,
+                id,
+                overwrite,
+                config,
+            } => {
+                session_import_command(config, &file, id.as_deref(), overwrite).await?;
             }
         },
     }
@@ -1526,6 +1552,7 @@ fn build_router(state: AppState) -> Router {
             "/api/sessions",
             get(list_sessions_handler).post(create_session_handler),
         )
+        .route("/api/sessions/import", post(import_session_handler))
         .route(
             "/api/sessions/:id",
             get(get_session_handler).delete(delete_session_handler),
@@ -1763,9 +1790,10 @@ async fn run_heartbeat_tick(
         }
         Err(e) => {
             let message = match e {
-                AppError::Internal(msg) => msg,
+                AppError::Internal(msg) | AppError::BadRequest(msg) => msg,
                 AppError::Unauthorized => "Unauthorized".to_string(),
                 AppError::NotFound => "NotFound".to_string(),
+                AppError::Conflict => "Conflict".to_string(),
             };
             tracing::warn!(session_id, "Heartbeat 本轮 chat 失败: {message}");
             HeartbeatTickOutcome::Failed(message)
@@ -2181,6 +2209,7 @@ async fn serve_command(config_path: Option<PathBuf>, bind: Option<String>) -> Re
     tracing::info!("   • POST   /api/sessions        - 创建会话");
     tracing::info!("   • GET    /api/sessions/:id    - 读取会话历史");
     tracing::info!("   • GET    /api/sessions/:id/export - 导出会话（JSONL / JSON）");
+    tracing::info!("   • POST   /api/sessions/import - 导入会话（JSONL / JSON）");
     tracing::info!("   • DELETE /api/sessions/:id    - 删除会话");
     tracing::info!("   • GET    /api/tools           - 列出已注册工具");
     tracing::info!("   • GET    /api/skills          - 列出已发现技能");
@@ -2990,6 +3019,150 @@ async fn export_session_handler(
         .into_response())
 }
 
+/// 导入会话查询参数。默认 NDJSON；`format=json` 或 `Content-Type: application/json` 接受整包。
+#[derive(Debug, Default, Deserialize)]
+struct ImportSessionQuery {
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// JSON 导入整包：与 GET/export `format=json` 对称。
+#[derive(Debug, Deserialize)]
+struct ImportSessionJsonBody {
+    #[serde(default)]
+    id: Option<String>,
+    messages: Vec<ChatMessage>,
+}
+
+fn content_type_is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn wants_json_import(format: Option<&str>, headers: &HeaderMap) -> bool {
+    wants_json_export(format) || content_type_is_json(headers)
+}
+
+fn first_nonempty_id(id: Option<&str>) -> Option<String> {
+    id.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_import_session_id(query_id: Option<&str>, body_id: Option<&str>) -> String {
+    first_nonempty_id(query_id)
+        .or_else(|| first_nonempty_id(body_id))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn parse_session_import_jsonl(body: &str) -> Result<Vec<ChatMessage>, String> {
+    let mut messages = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let message: ChatMessage = serde_json::from_str(trimmed).map_err(|e| {
+            format!(
+                "invalid_session_import: line {}: {e}",
+                idx.saturating_add(1)
+            )
+        })?;
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
+fn parse_session_import_json(body: &str) -> Result<(Option<String>, Vec<ChatMessage>), String> {
+    let parsed: ImportSessionJsonBody =
+        serde_json::from_str(body.trim()).map_err(|e| format!("invalid_session_import: {e}"))?;
+    Ok((parsed.id, parsed.messages))
+}
+
+fn parse_session_import_file(body: &str) -> Result<(Option<String>, Vec<ChatMessage>), String> {
+    if let Ok((id, messages)) = parse_session_import_json(body) {
+        return Ok((id, messages));
+    }
+    Ok((None, parse_session_import_jsonl(body)?))
+}
+
+/// 导入会话历史。不存在则新建；已存在默认 409，`overwrite=true` 替换消息并刷新 `last_accessed`。
+/// 不调用 LLM；超长走现有硬截断/本地摘要策略。
+async fn import_session_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ImportSessionQuery>,
+    body: Bytes,
+) -> Result<Json<GetSessionResponse>, AppError> {
+    if !check_api_auth(&state, &headers) {
+        tracing::warn!(
+            request_id = request_id_log_value(&headers),
+            "API 鉴权失败: token 不匹配或缺失"
+        );
+        return Err(AppError::Unauthorized);
+    }
+
+    let body_text = std::str::from_utf8(&body)
+        .map_err(|e| AppError::BadRequest(format!("invalid_session_import: {e}")))?;
+
+    let (body_id, messages) = if wants_json_import(query.format.as_deref(), &headers) {
+        parse_session_import_json(body_text).map_err(AppError::BadRequest)?
+    } else {
+        (
+            None,
+            parse_session_import_jsonl(body_text).map_err(AppError::BadRequest)?,
+        )
+    };
+
+    let session_id = resolve_import_session_id(query.id.as_deref(), body_id.as_deref());
+    let request_id = request_id_log_value(&headers).to_string();
+
+    purge_expired_sessions(&state);
+
+    let compacted = compact_imported_session_messages(
+        messages,
+        state
+            .agent
+            .config()
+            .session
+            .effective_summarize_on_overflow(),
+        state.agent.config().session.effective_keep_recent(),
+    )
+    .await;
+
+    {
+        let mut sessions = state.sessions.lock().unwrap();
+        if sessions.contains_key(&session_id) && !query.overwrite {
+            tracing::info!(
+                request_id = %request_id,
+                "导入 session 冲突: {}",
+                session_id
+            );
+            return Err(AppError::Conflict);
+        }
+        let message_count = compacted.len();
+        sessions.insert(session_id.clone(), SessionRecord::new(compacted.clone()));
+        tracing::info!(
+            request_id = %request_id,
+            overwrite = query.overwrite,
+            "导入 session {session_id}，消息数: {message_count}"
+        );
+        persist_session_map(&state, &sessions);
+    }
+
+    Ok(Json(GetSessionResponse {
+        id: session_id,
+        messages: compacted,
+    }))
+}
+
 /// 创建会话处理器
 async fn create_session_handler(
     State(state): State<AppState>,
@@ -3493,6 +3666,8 @@ enum AppError {
     Internal(String),
     Unauthorized,
     NotFound,
+    BadRequest(String),
+    Conflict,
 }
 
 impl IntoResponse for AppError {
@@ -3501,6 +3676,8 @@ impl IntoResponse for AppError {
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
             Self::NotFound => (StatusCode::NOT_FOUND, "session_not_found".to_string()),
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            Self::Conflict => (StatusCode::CONFLICT, "session_already_exists".to_string()),
         };
 
         let body = serde_json::json!({
@@ -3955,6 +4132,52 @@ fn write_session_jsonl(messages: &[ChatMessage], output: Option<&std::path::Path
         print!("{body}");
     }
     Ok(())
+}
+
+/// 从 JSONL/JSON 文件导入到落盘 session store。不调用 LLM。
+async fn session_import_command(
+    config_path: Option<PathBuf>,
+    file: &std::path::Path,
+    id: Option<&str>,
+    overwrite: bool,
+) -> Result<()> {
+    let config = load_agent_config(config_path)?;
+    let persist_path = persist_path_from_config(&config);
+    let session_id = import_session_into_persist_file(
+        &persist_path,
+        file,
+        id,
+        overwrite,
+        config.session.effective_summarize_on_overflow(),
+        config.session.effective_keep_recent(),
+    )
+    .await?;
+    println!("✅ 已导入 session {session_id}");
+    Ok(())
+}
+
+async fn import_session_into_persist_file(
+    persist_path: &std::path::Path,
+    file: &std::path::Path,
+    id: Option<&str>,
+    overwrite: bool,
+    summarize_on_overflow: bool,
+    keep_recent: usize,
+) -> Result<String> {
+    let body =
+        std::fs::read_to_string(file).with_context(|| format!("无法读取 {}", file.display()))?;
+    let (body_id, messages) = parse_session_import_file(&body).map_err(anyhow::Error::msg)?;
+    let session_id = resolve_import_session_id(id, body_id.as_deref());
+    let compacted =
+        compact_imported_session_messages(messages, summarize_on_overflow, keep_recent).await;
+
+    let mut sessions = load_sessions(persist_path);
+    if sessions.contains_key(&session_id) && !overwrite {
+        anyhow::bail!("session_already_exists");
+    }
+    sessions.insert(session_id.clone(), compacted);
+    save_sessions(&persist_path.to_path_buf(), &sessions)?;
+    Ok(session_id)
 }
 
 fn memory_show_command(config_path: Option<PathBuf>) -> Result<()> {
@@ -5923,6 +6146,309 @@ mod tests {
             StatusCode::NOT_FOUND,
             "export 不应刷新 last_accessed"
         );
+    }
+
+    fn sample_import_messages() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: "你好".to_string(),
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: "你好！我是 JiaClaw。".to_string(),
+            },
+        ]
+    }
+
+    fn sample_import_jsonl() -> String {
+        encode_messages_jsonl(&sample_import_messages()).expect("编码 jsonl")
+    }
+
+    async fn http_import_session(
+        app: &Router,
+        uri: &str,
+        content_type: Option<&str>,
+        body: impl Into<Body>,
+        auth: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let mut builder = Request::builder().method("POST").uri(uri);
+        if let Some(content_type) = content_type {
+            builder = builder.header("content-type", content_type);
+        }
+        if let Some(token) = auth {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        app.clone()
+            .oneshot(builder.body(body.into()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_import_session_jsonl_roundtrip_matches_get_and_export() {
+        let app = create_test_app();
+        let session_id = "import-roundtrip";
+        let jsonl = sample_import_jsonl();
+
+        let import_response = http_import_session(
+            &app,
+            &format!("/api/sessions/import?id={session_id}"),
+            Some(SESSION_EXPORT_NDJSON),
+            jsonl.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(import_response.status(), StatusCode::OK);
+        assert!(!request_id_header(&import_response).is_empty());
+        let imported: GetSessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(import_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(imported.id, session_id);
+        assert_eq!(imported.messages, sample_import_messages());
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let got: GetSessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(get_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got.messages, imported.messages);
+
+        let export_response = http_export_session(&app, session_id, None).await;
+        assert_eq!(export_response.status(), StatusCode::OK);
+        let exported = parse_jsonl_messages(&body_text(export_response).await);
+        assert_eq!(exported, imported.messages);
+    }
+
+    #[tokio::test]
+    async fn test_import_session_conflict_without_overwrite() {
+        let app = create_test_app();
+        let session_id = "import-conflict";
+        let first = http_import_session(
+            &app,
+            &format!("/api/sessions/import?id={session_id}"),
+            Some(SESSION_EXPORT_NDJSON),
+            sample_import_jsonl(),
+            None,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = http_import_session(
+            &app,
+            &format!("/api/sessions/import?id={session_id}"),
+            Some(SESSION_EXPORT_NDJSON),
+            sample_import_jsonl(),
+            None,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert!(!request_id_header(&second).is_empty());
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"], "session_already_exists");
+    }
+
+    #[tokio::test]
+    async fn test_import_session_overwrite_replaces_messages() {
+        let app = create_test_app();
+        let session_id = "import-overwrite";
+        let first = http_import_session(
+            &app,
+            &format!("/api/sessions/import?id={session_id}"),
+            Some(SESSION_EXPORT_NDJSON),
+            sample_import_jsonl(),
+            None,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let replacement = ChatMessage {
+            role: MessageRole::User,
+            content: "覆盖后的消息".to_string(),
+        };
+        let jsonl = encode_messages_jsonl(std::slice::from_ref(&replacement)).unwrap();
+        let overwrite = http_import_session(
+            &app,
+            &format!("/api/sessions/import?id={session_id}&overwrite=true"),
+            Some(SESSION_EXPORT_NDJSON),
+            jsonl,
+            None,
+        )
+        .await;
+        assert_eq!(overwrite.status(), StatusCode::OK);
+        let imported: GetSessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(overwrite.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(imported.messages, vec![replacement.clone()]);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let got: GetSessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(get_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got.messages, vec![replacement]);
+    }
+
+    #[tokio::test]
+    async fn test_import_session_bad_line_is_400() {
+        let app = create_test_app();
+        let body = "{\"role\":\"user\",\"content\":\"ok\"}\n{not-json}\n";
+        let response = http_import_session(
+            &app,
+            "/api/sessions/import?id=bad-line",
+            Some(SESSION_EXPORT_NDJSON),
+            body,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!request_id_header(&response).is_empty());
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let error = payload["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("invalid_session_import"),
+            "400 应标明非法导入，实际: {error}"
+        );
+        assert!(error.contains("line 2"), "应指出坏行号，实际: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_import_session_json_format_and_body_id() {
+        let app = create_test_app();
+        let body = serde_json::json!({
+            "id": "import-json-id",
+            "messages": sample_import_messages(),
+        });
+        let response = http_import_session(
+            &app,
+            "/api/sessions/import?format=json",
+            Some("application/json"),
+            body.to_string(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let imported: GetSessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(imported.id, "import-json-id");
+        assert_eq!(imported.messages, sample_import_messages());
+    }
+
+    #[tokio::test]
+    async fn test_import_session_truncates_overflow_without_llm() {
+        let app = create_test_app();
+        let messages: Vec<_> = (0..60)
+            .map(|n| ChatMessage {
+                role: MessageRole::User,
+                content: format!("消息 {n}"),
+            })
+            .collect();
+        let jsonl = encode_messages_jsonl(&messages).unwrap();
+        let response = http_import_session(
+            &app,
+            "/api/sessions/import?id=import-overflow",
+            Some(SESSION_EXPORT_NDJSON),
+            jsonl,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let imported: GetSessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(imported.messages.len(), MAX_SESSION_MESSAGES);
+        assert_eq!(imported.messages.last().unwrap().content, "消息 59");
+        assert!(imported.messages.iter().all(|m| m.content != "消息 0"));
+    }
+
+    #[tokio::test]
+    async fn test_import_session_persists_when_enabled() {
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-import-{}.json", uuid::Uuid::new_v4()));
+        let config = AgentConfig::default();
+        let agent = JiaClawAgent::new(config).expect("创建测试 agent 失败");
+        let state = AppState {
+            agent: Arc::new(agent),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_token: None,
+            webhook_secret: None,
+            telegram_secret: None,
+            telegram_bot_token: None,
+            telegram_api_base: TELEGRAM_API_BASE.to_string(),
+            slack_signing_secret: None,
+            slack_bot_token: None,
+            slack_api_base: SLACK_API_BASE.to_string(),
+            discord_public_key: None,
+            discord_bot_token: None,
+            discord_api_base: DISCORD_API_BASE.to_string(),
+            persist_enabled: true,
+            persist_path: Arc::new(persist_path.clone()),
+            rate_limiter: None,
+            session_ttl: None,
+            metrics: Arc::new(Metrics::default()),
+            metrics_require_auth: false,
+        };
+        let app = build_router(state);
+        let response = http_import_session(
+            &app,
+            "/api/sessions/import?id=persist-import",
+            Some(SESSION_EXPORT_NDJSON),
+            sample_import_jsonl(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let loaded = load_sessions(&persist_path);
+        assert_eq!(
+            loaded.get("persist-import").map(Vec::as_slice),
+            Some(sample_import_messages().as_slice())
+        );
+        std::fs::remove_file(&persist_path).ok();
     }
 
     #[tokio::test]
@@ -8868,6 +9394,21 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        // POST /api/sessions/import 无 token 应 401
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/import")
+                    .header("content-type", SESSION_EXPORT_NDJSON)
+                    .body(Body::from(sample_import_jsonl()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
         // 带正确 token 应该成功
         let response = app
             .clone()
@@ -8916,6 +9457,7 @@ mod tests {
         assert_eq!(get_response.status(), StatusCode::OK);
 
         let export_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/sessions/{session_id}/export"))
@@ -8930,6 +9472,20 @@ mod tests {
             response_content_type(&export_response),
             SESSION_EXPORT_NDJSON
         );
+
+        let import_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/import?id=auth-import")
+                    .header("authorization", "Bearer test-token-123")
+                    .header("content-type", SESSION_EXPORT_NDJSON)
+                    .body(Body::from(sample_import_jsonl()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -9224,6 +9780,7 @@ mod tests {
         assert!(is_rate_limited_path("/api/sessions"));
         assert!(is_rate_limited_path("/api/sessions/abc"));
         assert!(is_rate_limited_path("/api/sessions/abc/export"));
+        assert!(is_rate_limited_path("/api/sessions/import"));
         assert!(is_rate_limited_path("/api/openapi.json"));
         assert!(is_rate_limited_path("/hooks/inbound"));
         assert!(is_rate_limited_path("/hooks/telegram"));
@@ -9584,6 +10141,7 @@ mod tests {
             "/api/sessions",
             "/api/sessions/{id}",
             "/api/sessions/{id}/export",
+            "/api/sessions/import",
             "/api/tools",
             "/api/skills",
             "/hooks/inbound",
@@ -9601,6 +10159,7 @@ mod tests {
         assert!(paths["/api/sessions/{id}"].get("get").is_some());
         assert!(paths["/api/sessions/{id}"].get("delete").is_some());
         assert!(paths["/api/sessions/{id}/export"].get("get").is_some());
+        assert!(paths["/api/sessions/import"].get("post").is_some());
     }
 
     #[tokio::test]
@@ -9942,6 +10501,97 @@ mod tests {
 
         std::fs::remove_file(&persist_path).ok();
         std::fs::remove_file(&out_path).ok();
+    }
+
+    #[test]
+    fn test_cli_session_import_parses() {
+        let cli = Cli::try_parse_from([
+            "jiaclaw",
+            "session",
+            "import",
+            "in.jsonl",
+            "--id",
+            "abc-id",
+            "--overwrite",
+        ])
+        .expect("应解析 session import");
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionCommands::Import {
+                        file,
+                        id,
+                        overwrite,
+                        config,
+                    },
+            } => {
+                assert_eq!(file, std::path::PathBuf::from("in.jsonl"));
+                assert_eq!(id.as_deref(), Some("abc-id"));
+                assert!(overwrite);
+                assert!(config.is_none());
+            }
+            _ => panic!("应为 session import 子命令"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_session_import_writes_and_conflict() {
+        let persist_path =
+            std::env::temp_dir().join(format!("jiaclaw-import-{}.json", uuid::Uuid::new_v4()));
+        let in_path =
+            std::env::temp_dir().join(format!("jiaclaw-import-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&in_path, sample_import_jsonl()).expect("写入 jsonl");
+
+        let session_id = import_session_into_persist_file(
+            &persist_path,
+            &in_path,
+            Some("cli-import-id"),
+            false,
+            false,
+            10,
+        )
+        .await
+        .expect("导入应成功");
+        assert_eq!(session_id, "cli-import-id");
+        let loaded = load_sessions(&persist_path);
+        assert_eq!(
+            loaded.get("cli-import-id").map(Vec::as_slice),
+            Some(sample_import_messages().as_slice())
+        );
+
+        let err = import_session_into_persist_file(
+            &persist_path,
+            &in_path,
+            Some("cli-import-id"),
+            false,
+            false,
+            10,
+        )
+        .await
+        .expect_err("重复导入应冲突");
+        assert!(
+            err.to_string().contains("session_already_exists"),
+            "错误应为 session_already_exists，实际: {err}"
+        );
+
+        let replacement = "{\"role\":\"user\",\"content\":\"replaced\"}\n";
+        std::fs::write(&in_path, replacement).unwrap();
+        import_session_into_persist_file(
+            &persist_path,
+            &in_path,
+            Some("cli-import-id"),
+            true,
+            false,
+            10,
+        )
+        .await
+        .expect("overwrite 应成功");
+        let loaded = load_sessions(&persist_path);
+        assert_eq!(loaded["cli-import-id"].len(), 1);
+        assert_eq!(loaded["cli-import-id"][0].content, "replaced");
+
+        std::fs::remove_file(&persist_path).ok();
+        std::fs::remove_file(&in_path).ok();
     }
 
     #[test]

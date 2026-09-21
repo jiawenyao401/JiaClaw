@@ -44,10 +44,10 @@ pub use memory::{
 };
 use provider::{BrokerrouterProvider, OpenAICompatibleProvider};
 pub use session::{
-    compact_session_history, compact_session_history_default, format_messages_for_summary,
-    hard_truncate_session_messages, local_conversation_digest, ConversationSummarizer,
-    SESSION_SUMMARY_MAX_TOKENS, SESSION_SUMMARY_PREFIX, SESSION_SUMMARY_PROMPT,
-    SESSION_SUMMARY_TEMPERATURE,
+    compact_imported_session_messages, compact_session_history, compact_session_history_default,
+    format_messages_for_summary, hard_truncate_session_messages, local_conversation_digest,
+    ConversationSummarizer, SESSION_SUMMARY_MAX_TOKENS, SESSION_SUMMARY_PREFIX,
+    SESSION_SUMMARY_PROMPT, SESSION_SUMMARY_TEMPERATURE,
 };
 pub use skills::{Skill, SkillDiscovery};
 pub use tools::{
