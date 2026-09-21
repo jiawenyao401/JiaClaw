@@ -3,7 +3,7 @@
   "info": {
     "title": "JiaClaw HTTP API",
     "version": "0.1.0",
-    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。"
+    "description": "JiaClaw 个人持久化智能体运行时 HTTP 接口草图。\n\n鉴权：\n- Bearer：当配置了 `JIACLAW_API_TOKEN` 或 `[http].api_token` 时，`/api/*` 需要 `Authorization: Bearer <token>` 或 `X-Api-Token`。未配置时无需鉴权（本地开发友好）。\n- Webhook secret：当配置了 `JIACLAW_WEBHOOK_SECRET` 或 `[http].webhook_secret` 时，`POST /hooks/inbound` 需要 `X-Webhook-Secret`。\n- Telegram secret：当配置了 `JIACLAW_TELEGRAM_SECRET` 或 `[http].telegram_secret` 时，`POST /hooks/telegram` 需要 `X-Telegram-Bot-Api-Secret-Token`（Telegram 官方 secret token）。未配置则与本地 webhook 一样开放。\n\n限流：当配置了 `JIACLAW_RATE_LIMIT_PER_MINUTE` 或 `[http].rate_limit_per_minute`（正整数）时，`/api/*` 与 `/hooks/inbound`、`/hooks/telegram` 超限返回 429，并带 `Retry-After`。`GET /health` 不限流。\n\nSession TTL：当配置了 `JIACLAW_SESSION_TTL_SECS` 或 `[http].session_ttl_secs`（正整数）时，闲置超过该秒数的会话会从 store 删除。`GET /api/sessions` 只返回未过期项；对已过期 id 的 GET/DELETE 与不存在一致（GET 为 404）。create/chat/get/list 会刷新 last_accessed。\n\n请求追踪：所有响应回写 `X-Request-Id`。若请求未携带该头，服务端生成 UUID。"
   },
   "servers": [
     {
@@ -15,7 +15,7 @@
     { "name": "health", "description": "健康检查" },
     { "name": "chat", "description": "聊天与会话" },
     { "name": "catalog", "description": "工具与技能目录" },
-    { "name": "hooks", "description": "Webhook 入站" },
+    { "name": "hooks", "description": "Webhook / Telegram 入站" },
     { "name": "discovery", "description": "API 发现" }
   ],
   "paths": {
@@ -288,6 +288,48 @@
           "429": { "$ref": "#/components/responses/RateLimited" }
         }
       }
+    },
+    "/hooks/telegram": {
+      "post": {
+        "tags": ["hooks"],
+        "summary": "Telegram Bot 入站",
+        "operationId": "inboundTelegram",
+        "description": "接收 Telegram Bot API Update JSON，将 `message.text` / `edited_message.text` 映射到 session `telegram:{chat.id}` 并走现有 agent chat 路径。无文本的 update 返回 200 并带跳过说明。本切片同步回传 assistant 文本，不主动调用 sendMessage 出站。",
+        "security": [{ "telegramSecret": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TelegramUpdate" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "入站处理结果（含跳过）",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TelegramInboundResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Telegram secret token 不匹配",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WebhookUnauthorized" }
+              }
+            }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
     }
   },
   "components": {
@@ -308,6 +350,12 @@
         "in": "header",
         "name": "X-Webhook-Secret",
         "description": "Webhook 密钥。未配置 secret 时不需要。"
+      },
+      "telegramSecret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Telegram-Bot-Api-Secret-Token",
+        "description": "Telegram Bot API secret token。未配置 `JIACLAW_TELEGRAM_SECRET` / `[http].telegram_secret` 时不需要。"
       }
     },
     "headers": {
@@ -512,6 +560,59 @@
           "reply": { "type": "string" },
           "message": { "type": "string" },
           "error": { "type": "string" }
+        }
+      },
+      "TelegramChat": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {
+            "oneOf": [
+              { "type": "integer", "format": "int64" },
+              { "type": "string" }
+            ],
+            "description": "Telegram chat.id"
+          }
+        }
+      },
+      "TelegramMessage": {
+        "type": "object",
+        "required": ["chat"],
+        "properties": {
+          "chat": { "$ref": "#/components/schemas/TelegramChat" },
+          "text": { "type": "string" }
+        }
+      },
+      "TelegramUpdate": {
+        "type": "object",
+        "description": "Telegram Bot API Update 的最小子集；其余字段忽略。至少支持 message.text / edited_message.text。",
+        "properties": {
+          "update_id": { "type": "integer" },
+          "message": { "$ref": "#/components/schemas/TelegramMessage" },
+          "edited_message": { "$ref": "#/components/schemas/TelegramMessage" }
+        }
+      },
+      "TelegramInboundResponse": {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "reply": {
+            "type": "string",
+            "description": "同步回传的 assistant 文本（有文本的 update）"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "telegram:{chat.id}"
+          },
+          "skipped": {
+            "type": "boolean",
+            "description": "无文本 update 时为 true"
+          },
+          "reason": {
+            "type": "string",
+            "example": "no text in update"
+          }
         }
       },
       "WebhookUnauthorized": {
